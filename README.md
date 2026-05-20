@@ -353,6 +353,7 @@ Other tools get you part of the way. Dream Server gets you the whole way.
 |---|---|
 | [Quickstart](dream-server/QUICKSTART.md) | Step-by-step install guide with troubleshooting |
 | [Docs Index](dream-server/docs/README.md) | Maintained map for operators, contributors, and reviewers |
+| [Build On Dream Server](dream-server/docs/BUILD-ON-DREAM-SERVER.md) | Forking, custom editions, extension templates, and downstream validation |
 | [Headless Setup](dream-server/docs/HEADLESS-SETUP.md) | QR onboarding, first-boot setup, AP mode, mDNS, and local agent access |
 | [Support Matrix](dream-server/docs/SUPPORT-MATRIX.md) | Current platform and GPU support status |
 | [Model Management](dream-server/docs/MODEL-MANAGEMENT.md) | Dashboard model downloads, switching, and manual GGUF workflows |

@@ -426,6 +426,7 @@ dream mode status                        # Show current mode
 ## Documentation
 
 - [docs/README.md](docs/README.md) — **Full documentation index** (start here)
+- [BUILD-ON-DREAM-SERVER.md](docs/BUILD-ON-DREAM-SERVER.md) — Forking, custom editions, extension templates, and downstream validation
 - [QUICKSTART.md](QUICKSTART.md) — Detailed setup guide
 - [HEADLESS-SETUP.md](docs/HEADLESS-SETUP.md) — QR onboarding, first-boot setup, AP mode, mDNS, and local agent access
 - [MODEL-MANAGEMENT.md](docs/MODEL-MANAGEMENT.md) — Dashboard model downloads, switching, and manual GGUF use
