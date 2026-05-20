@@ -87,6 +87,9 @@ jobs:
       - name: Golden Path Contract Tests
         run: bash tests/test-golden-paths.sh
 
+      - name: Generated Config Contract Tests
+        run: bash tests/test-generated-config-contracts.sh
+
       - name: CPU-Only Path Tests
         run: bash tests/test-cpu-only-path.sh
 
