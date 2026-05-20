@@ -14,6 +14,8 @@ MACOS_DOCTOR_JSON="${OUT_DIR}/macos-doctor.json"
 DOCTOR_JSON="${OUT_DIR}/doctor.json"
 SUMMARY_JSON="${OUT_DIR}/summary.json"
 SUMMARY_MD="${OUT_DIR}/SUMMARY.md"
+GOLDEN_CONTRACT_JSON="${ROOT_DIR}/config/golden-paths.json"
+GOLDEN_EVIDENCE_JSON="${OUT_DIR}/golden-paths.json"
 
 FAKEBIN="$(mktemp -d)"
 trap 'rm -rf "$FAKEBIN"' EXIT
@@ -65,7 +67,7 @@ elif command -v python >/dev/null 2>&1; then
   PYTHON_CMD="python"
 fi
 
-"$PYTHON_CMD" - "$SUMMARY_JSON" "$SUMMARY_MD" "$LINUX_LOG" "$MACOS_LOG" "$WINDOWS_SIM_JSON" "$MACOS_PREFLIGHT_JSON" "$MACOS_DOCTOR_JSON" "$DOCTOR_JSON" "$LINUX_SUMMARY_JSON" "$LINUX_EXIT" "$MACOS_EXIT" "$DOCTOR_EXIT" <<'PY'
+"$PYTHON_CMD" - "$SUMMARY_JSON" "$SUMMARY_MD" "$GOLDEN_EVIDENCE_JSON" "$GOLDEN_CONTRACT_JSON" "$LINUX_LOG" "$MACOS_LOG" "$WINDOWS_SIM_JSON" "$MACOS_PREFLIGHT_JSON" "$MACOS_DOCTOR_JSON" "$DOCTOR_JSON" "$LINUX_SUMMARY_JSON" "$LINUX_EXIT" "$MACOS_EXIT" "$DOCTOR_EXIT" <<'PY'
 import json
 import pathlib
 import re
@@ -75,6 +77,8 @@ from datetime import datetime, timezone
 (
     summary_json_path,
     summary_md_path,
+    golden_evidence_json_path,
+    golden_contract_json_path,
     linux_log,
     macos_log,
     windows_sim_json,
@@ -86,6 +90,8 @@ from datetime import datetime, timezone
     macos_exit,
     doctor_exit,
 ) = sys.argv[1:]
+
+root_dir = pathlib.Path.cwd()
 
 def load_json(path):
     p = pathlib.Path(path)
@@ -133,7 +139,99 @@ summary = {
     },
 }
 
+def run_status(run_name, run):
+    if run_name == "linux_dryrun":
+        signals = run.get("signals") or {}
+        return {
+            "ok": run.get("exit_code") == 0 and all(signals.values()),
+            "exit_code": run.get("exit_code"),
+            "required_signals": signals,
+        }
+    if run_name == "macos_installer_mvp":
+        summary_block = ((run.get("preflight") or {}).get("summary") or {})
+        blockers = summary_block.get("blockers")
+        return {
+            "ok": run.get("exit_code") == 0 and (blockers in (0, None)),
+            "exit_code": run.get("exit_code"),
+            "blockers": blockers,
+            "warnings": summary_block.get("warnings"),
+        }
+    if run_name == "windows_scenario_preflight":
+        summary_block = ((run.get("report") or {}).get("summary") or {})
+        blockers = summary_block.get("blockers")
+        return {
+            "ok": blockers == 0,
+            "blockers": blockers,
+            "warnings": summary_block.get("warnings"),
+        }
+    return {"ok": run is not None}
+
+def build_golden_evidence():
+    contract = load_json(golden_contract_json_path) or {"scenarios": []}
+    evidence = {
+        "version": "1",
+        "generated_at": summary["generated_at"],
+        "contract": golden_contract_json_path,
+        "scenarios": [],
+    }
+
+    runs = summary.get("runs") or {}
+    for scenario in contract.get("scenarios", []):
+        installer = scenario.get("installer") or {}
+        expected = scenario.get("expected") or {}
+        run_name = installer.get("ci_simulation")
+        run = runs.get(run_name) if run_name else None
+        compose_files = expected.get("compose_files") or []
+        generated_configs = expected.get("generated_configs") or []
+        health_checks = expected.get("health_checks") or []
+        missing_compose = [
+            path for path in compose_files
+            if not (root_dir / path).exists()
+        ]
+
+        status = run_status(run_name, run or {})
+        scenario_ok = bool(status.get("ok")) and not missing_compose
+        evidence["scenarios"].append({
+            "id": scenario.get("id"),
+            "label": scenario.get("label"),
+            "status": "pass" if scenario_ok else "fail",
+            "simulation_run": run_name,
+            "simulation_status": status,
+            "expected": {
+                "dream_mode": expected.get("dream_mode"),
+                "llm_backend": expected.get("llm_backend"),
+                "llm_host_port": expected.get("llm_host_port"),
+                "llm_container_port": expected.get("llm_container_port"),
+                "model_route": expected.get("model_route") or {},
+                "compose_files": compose_files,
+                "generated_config_surfaces": [
+                    item.get("surface") for item in generated_configs
+                    if isinstance(item, dict)
+                ],
+                "health_check_services": [
+                    item.get("service") for item in health_checks
+                    if isinstance(item, dict)
+                ],
+            },
+            "checks": {
+                "compose_files_exist": not missing_compose,
+                "missing_compose_files": missing_compose,
+                "generated_config_count": len(generated_configs),
+                "health_check_count": len(health_checks),
+            },
+        })
+    return evidence
+
+golden_evidence = build_golden_evidence()
+summary["golden_paths"] = {
+    "contract": golden_contract_json_path,
+    "evidence": golden_evidence_json_path,
+    "scenario_count": len(golden_evidence.get("scenarios", [])),
+    "pass_count": sum(1 for item in golden_evidence.get("scenarios", []) if item.get("status") == "pass"),
+}
+
 pathlib.Path(summary_json_path).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+pathlib.Path(golden_evidence_json_path).write_text(json.dumps(golden_evidence, indent=2) + "\n", encoding="utf-8")
 
 lines = []
 lines.append("# Installer Simulation Summary")
@@ -172,6 +270,14 @@ lines.append("## Doctor Snapshot")
 lines.append(f"- Exit code: {doctor_exit}")
 lines.append(f"- Runtime ready: {dsum.get('runtime_ready', 'n/a')}")
 lines.append(f"- Report: `{doctor_json}`")
+lines.append("")
+lines.append("## Golden Paths")
+for item in golden_evidence.get("scenarios", []):
+    status = item.get("status", "unknown")
+    label = item.get("label") or item.get("id")
+    run_name = item.get("simulation_run") or "n/a"
+    lines.append(f"- {label}: {status} via `{run_name}`")
+lines.append(f"- Evidence JSON: `{golden_evidence_json_path}`")
 
 pathlib.Path(summary_md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
@@ -183,3 +289,4 @@ fi
 echo "Installer simulation complete."
 echo "  JSON: $SUMMARY_JSON"
 echo "  MD:   $SUMMARY_MD"
+echo "  Golden paths: $GOLDEN_EVIDENCE_JSON"

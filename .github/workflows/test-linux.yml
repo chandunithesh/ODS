@@ -112,6 +112,7 @@ jobs:
           path: |
             dream-server/artifacts/installer-sim/summary.json
             dream-server/artifacts/installer-sim/SUMMARY.md
+            dream-server/artifacts/installer-sim/golden-paths.json
             dream-server/artifacts/installer-sim/linux-dryrun.log
             dream-server/artifacts/installer-sim/macos-installer.log
             dream-server/artifacts/installer-sim/windows-preflight-sim.json

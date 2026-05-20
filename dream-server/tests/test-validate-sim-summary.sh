@@ -76,6 +76,12 @@ cat > "$TMP_DIR/valid.json" <<'EOF'
 {
   "version": "1",
   "generated_at": "2026-03-15T12:34:56Z",
+  "golden_paths": {
+    "contract": "config/golden-paths.json",
+    "evidence": "artifacts/installer-sim/golden-paths.json",
+    "scenario_count": 4,
+    "pass_count": 4
+  },
   "runs": {
     "linux_dryrun": {
       "exit_code": 0,
@@ -129,6 +135,32 @@ if echo "$out" | grep -q "\[PASS\]"; then
     pass "valid summary prints PASS marker"
 else
     fail "valid summary should print PASS marker"
+fi
+
+python3 - <<'PY' "$TMP_DIR/valid.json" "$TMP_DIR/bad-golden-count.json"
+import json
+import sys
+src, dest = sys.argv[1], sys.argv[2]
+with open(src, encoding="utf-8") as f:
+    data = json.load(f)
+data["golden_paths"]["pass_count"] = 5
+with open(dest, "w", encoding="utf-8") as f:
+    json.dump(data, f)
+PY
+
+set +e
+out=$(python3 "$ROOT_DIR/scripts/validate-sim-summary.py" "$TMP_DIR/bad-golden-count.json" 2>&1)
+r=$?
+set -e
+if [[ $r -eq 2 ]]; then
+    pass "invalid golden path pass count exits 2"
+else
+    fail "invalid golden path pass count should exit 2, got $r"
+fi
+if echo "$out" | grep -q "pass_count"; then
+    pass "golden path validation error mentions pass_count"
+else
+    fail "golden path validation error should mention pass_count"
 fi
 
 python3 - <<'PY' "$TMP_DIR/valid.json" "$TMP_DIR/missing-signal.json"

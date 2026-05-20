@@ -248,6 +248,25 @@ def validate_doctor_snapshot(v: Validator, doctor: Mapping[str, Any], path: str)
             _require_type(v, summary.get("runtime_ready"), f"{path}.report.summary.runtime_ready", "bool")
 
 
+def validate_golden_paths(v: Validator, golden: Mapping[str, Any], path: str) -> None:
+    contract = _require_key(v, golden, path, "contract")
+    _require_path_like(v, contract, f"{path}.contract")
+
+    evidence = _require_key(v, golden, path, "evidence")
+    _require_path_like(v, evidence, f"{path}.evidence")
+
+    scenario_count = _require_key(v, golden, path, "scenario_count")
+    _require_type(v, scenario_count, f"{path}.scenario_count", "int")
+
+    pass_count = _require_key(v, golden, path, "pass_count")
+    _require_type(v, pass_count, f"{path}.pass_count", "int")
+
+    if _is_int(scenario_count) and scenario_count <= 0:
+        v.add(f"{path}.scenario_count", "must be greater than zero")
+    if _is_int(pass_count) and _is_int(scenario_count) and pass_count > scenario_count:
+        v.add(f"{path}.pass_count", "must be less than or equal to scenario_count")
+
+
 def validate_summary(v: Validator, data: Mapping[str, Any]) -> None:
     # version
     version = data.get("version")
@@ -298,9 +317,15 @@ def validate_summary(v: Validator, data: Mapping[str, Any]) -> None:
     if isinstance(doc, Mapping):
         validate_doctor_snapshot(v, doc, "$.runs.doctor_snapshot")
 
+    if "golden_paths" in data:
+        _require_type(v, data.get("golden_paths"), "$.golden_paths", "object")
+        golden = data.get("golden_paths")
+        if isinstance(golden, Mapping):
+            validate_golden_paths(v, golden, "$.golden_paths")
+
     # Strict mode: warn on unknown top-level keys
     if v.strict:
-        allowed_top = {"version", "generated_at", "runs"}
+        allowed_top = {"version", "generated_at", "runs", "golden_paths"}
         for k in data.keys():
             if k not in allowed_top:
                 v.add("$", f"unknown top-level key '{k}' (strict mode)")
