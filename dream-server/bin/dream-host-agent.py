@@ -4189,8 +4189,8 @@ def _write_lemonade_config(install_dir: Path, gguf_file: str):
         "litellm_settings:\n"
         "  drop_params: true\n"
         "  set_verbose: false\n"
-        "  request_timeout: 120\n"
-        "  stream_timeout: 60\n"
+        "  request_timeout: 900\n"
+        "  stream_timeout: 900\n"
     )
     config_path.write_text(content, encoding="utf-8")
     logger.info("Wrote lemonade.yaml for model: extra.%s", gguf_file)

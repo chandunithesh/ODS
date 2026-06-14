@@ -165,6 +165,20 @@ class TestWriteLemonadeConfig:
         assert "enable_thinking: false" in content
         assert 'model_name: "*"' in content
         assert "drop_params: true" in content
+        assert "request_timeout: 900" in content
+        assert "stream_timeout: 900" in content
+
+    def test_fallback_writer_keeps_long_model_timeouts(self, monkeypatch, tmp_path):
+        litellm_dir = tmp_path / "config" / "litellm"
+        litellm_dir.mkdir(parents=True)
+        monkeypatch.setattr(_mod, "_render_runtime_config", lambda *args, **kwargs: False)
+
+        _write_lemonade_config(tmp_path, "fallback-model.gguf")
+
+        content = (litellm_dir / "lemonade.yaml").read_text()
+        assert "model: openai/extra.fallback-model.gguf" in content
+        assert "request_timeout: 900" in content
+        assert "stream_timeout: 900" in content
 
     def test_reads_lemonade_key_from_env_file_when_process_env_unset(
         self, monkeypatch, tmp_path,
