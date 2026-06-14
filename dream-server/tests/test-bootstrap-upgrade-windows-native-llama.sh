@@ -161,5 +161,9 @@ grep -q '^    context_length: 32768$' "$install_dir/data/hermes/config.yaml" \
     || fail "bootstrap model should be removed after verified native Windows swap"
 grep -q '"status": "complete"' "$install_dir/data/bootstrap-status.json" \
     || fail "bootstrap status should finish complete"
+! grep -q 'backend_for_swap.*llama-server' "$TARGET" \
+    || fail "Windows native swap must not be selected by LLM_BACKEND=llama-server alone"
+! grep -q 'llm_backend.*llama-server' "$TARGET" \
+    || fail "Windows native restart helper must not be selected by LLM_BACKEND=llama-server alone"
 
 pass "Windows native llama-server bootstrap swap is verified"

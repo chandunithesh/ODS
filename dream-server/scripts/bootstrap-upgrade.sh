@@ -491,13 +491,12 @@ restart_windows_lemonade_with_full_model() {
 restart_windows_native_llama_server_with_full_model() {
     is_windows_bash || return 1
 
-    local runtime llm_backend managed runtime_mode location ps_cmd
+    local runtime managed runtime_mode location ps_cmd
     runtime="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
-    llm_backend="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
     managed="$(read_env_value AMD_INFERENCE_MANAGED | tr '[:upper:]' '[:lower:]')"
     runtime_mode="$(read_env_value AMD_INFERENCE_RUNTIME_MODE | tr '[:upper:]' '[:lower:]')"
     location="$(read_env_value AMD_INFERENCE_LOCATION | tr '[:upper:]' '[:lower:]')"
-    [[ "$runtime" == "llama-server" || "$llm_backend" == "llama-server" || "$runtime_mode" == "windows-llama-server-fallback" ]] || return 1
+    [[ "$runtime_mode" == "windows-llama-server-fallback" || ( "$runtime" == "llama-server" && "$location" == "host" ) ]] || return 1
     [[ "$managed" == "false" || "$location" == "external" ]] && return 1
 
     ps_cmd="$(windows_ps_command)"
@@ -1043,7 +1042,7 @@ if is_windows_bash; then
     if [[ "$_runtime_for_swap" == "lemonade" || "$_backend_for_swap" == "lemonade" ]]; then
         _windows_lemonade_swap_applies=true
     elif [[ "$_managed_for_swap" != "false" && "$_location_for_swap" != "external" ]] \
-        && [[ "$_runtime_for_swap" == "llama-server" || "$_backend_for_swap" == "llama-server" || "$_runtime_mode_for_swap" == "windows-llama-server-fallback" ]]; then
+        && [[ "$_runtime_mode_for_swap" == "windows-llama-server-fallback" || ( "$_runtime_for_swap" == "llama-server" && "$_location_for_swap" == "host" ) ]]; then
         _windows_native_llama_swap_applies=true
     fi
 fi
