@@ -243,6 +243,13 @@ def _serialize_form_values(
 
     return serialized
 
+
+def _empty_value_unsets_env_key(key: str, field: dict[str, Any]) -> bool:
+    """Return true when an empty form value should remove a runtime env key."""
+    if field.get("required") or field.get("secret"):
+        return False
+    return key.startswith("LLAMA_ARG_")
+
 # ── Apply-plan helpers ─────────────────────────────────────────────────────────
 
 

@@ -29,7 +29,8 @@ def settings_env_fixture(tmp_path, monkeypatch):
         "# ════════════════════════════════\n"
         "OPENAI_API_KEY=\n"
         "LLM_BACKEND=local\n"
-        "WEBUI_AUTH=true\n",
+        "WEBUI_AUTH=true\n"
+        "# LLAMA_ARG_N_CPU_MOE=25\n",
         encoding="utf-8",
     )
 
@@ -53,6 +54,11 @@ def settings_env_fixture(tmp_path, monkeypatch):
                         "type": "boolean",
                         "description": "Require login for the WebUI.",
                         "default": True,
+                    },
+                    "LLAMA_ARG_N_CPU_MOE": {
+                        "type": "integer",
+                        "description": "Optional llama.cpp MoE tuning knob.",
+                        "minimum": 0,
                     },
                 },
             }
@@ -256,6 +262,50 @@ def test_api_settings_env_save_returns_llama_apply_plan(test_client, settings_en
     assert payload["applyPlan"]["status"] == "ready"
     assert payload["applyPlan"]["services"] == ["llama-server"]
     assert "llama-server" in payload["applyPlan"]["summary"]
+
+
+def test_api_settings_env_preserves_commented_empty_llama_args(test_client, settings_env_fixture):
+    env_path = settings_env_fixture["env_path"]
+
+    response = test_client.put(
+        "/api/settings/env",
+        headers=test_client.auth_headers,
+        json={
+            "mode": "form",
+            "values": {
+                "LLM_BACKEND": "cloud",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    updated_lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert "# LLAMA_ARG_N_CPU_MOE=25" in updated_lines
+    assert not any(line.startswith("LLAMA_ARG_N_CPU_MOE=") for line in updated_lines)
+
+
+def test_api_settings_env_unsets_empty_existing_llama_arg(test_client, settings_env_fixture):
+    env_path = settings_env_fixture["env_path"]
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8") + "LLAMA_ARG_N_CPU_MOE=30\n",
+        encoding="utf-8",
+    )
+
+    response = test_client.put(
+        "/api/settings/env",
+        headers=test_client.auth_headers,
+        json={
+            "mode": "form",
+            "values": {
+                "LLAMA_ARG_N_CPU_MOE": "",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    updated_lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert "# LLAMA_ARG_N_CPU_MOE=25" in updated_lines
+    assert not any(line.startswith("LLAMA_ARG_N_CPU_MOE=") for line in updated_lines)
 
 
 def test_api_settings_env_apply_calls_host_agent(test_client, monkeypatch):
