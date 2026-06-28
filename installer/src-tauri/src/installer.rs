@@ -6,8 +6,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const REPO_URL: &str = "https://github.com/Light-Heart-Labs/ODS.git";
+const DEFAULT_REPO_URL: &str = "https://github.com/Light-Heart-Labs/ODS.git";
 const DEFAULT_INSTALL_REF: &str = "main";
+
+fn repo_url() -> &'static str {
+    option_env!("ODS_REPO_URL").unwrap_or(DEFAULT_REPO_URL)
+}
 
 fn install_ref() -> &'static str {
     option_env!("ODS_INSTALL_REF").unwrap_or(DEFAULT_INSTALL_REF)
@@ -184,7 +188,7 @@ fn ensure_checkout(install_dir: &Path) -> Result<(), String> {
     }
 
     let clone = Command::new("git")
-        .args(["clone", "--depth", "1", "--branch", install_ref(), REPO_URL])
+        .args(["clone", "--depth", "1", "--branch", install_ref(), repo_url()])
         .arg(install_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -220,11 +224,11 @@ fn validate_checkout(install_dir: &Path) -> Result<(), String> {
     }
 
     let origin = run_git(install_dir, &["remote", "get-url", "origin"])?;
-    if normalize_repo_url(&origin) != normalize_repo_url(REPO_URL) {
+    if normalize_repo_url(&origin) != normalize_repo_url(repo_url()) {
         return Err(format!(
             "{} is not a ODS checkout from {}.",
             install_dir.display(),
-            REPO_URL
+            repo_url()
         ));
     }
 
@@ -342,14 +346,19 @@ mod tests {
     }
 
     #[test]
+    fn default_repo_url_uses_canonical_ods_repo() {
+        assert_eq!(DEFAULT_REPO_URL, "https://github.com/Light-Heart-Labs/ODS.git");
+    }
+
+    #[test]
     fn normalize_repo_url_accepts_common_github_forms() {
         assert_eq!(
             normalize_repo_url("git@github.com:Light-Heart-Labs/ODS.git"),
-            normalize_repo_url(REPO_URL)
+            normalize_repo_url(DEFAULT_REPO_URL)
         );
         assert_eq!(
             normalize_repo_url("ssh://git@github.com/Light-Heart-Labs/ODS.git/"),
-            normalize_repo_url(REPO_URL)
+            normalize_repo_url(DEFAULT_REPO_URL)
         );
     }
 }
