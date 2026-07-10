@@ -3574,6 +3574,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         env_path = INSTALL_DIR / ".env"
         models_ini = INSTALL_DIR / "config" / "llama-server" / "models.ini"
         lemonade_yaml = INSTALL_DIR / "config" / "litellm" / "lemonade.yaml"
+        litellm_local_yaml = INSTALL_DIR / "config" / "litellm" / "local.yaml"
         hermes_live_config = INSTALL_DIR / "data" / "hermes" / "config.yaml"
         hermes_template_config = INSTALL_DIR / "extensions" / "services" / "hermes" / "cli-config.yaml.template"
 
@@ -3582,6 +3583,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         env_backup: str | None = None
         ini_backup: str | None = None
         lemonade_backup = None
+        litellm_local_existed: bool | None = None
+        litellm_local_backup: str | None = None
         hermes_backups: dict[Path, str] = {}
         committed = False
 
@@ -3592,6 +3595,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 models_ini.write_text(ini_backup, encoding="utf-8")
             if lemonade_backup is not None:
                 lemonade_yaml.write_text(lemonade_backup, encoding="utf-8")
+            if litellm_local_existed is True:
+                litellm_local_yaml.write_text(litellm_local_backup or "", encoding="utf-8")
+            elif litellm_local_existed is False:
+                litellm_local_yaml.unlink(missing_ok=True)
             for hermes_path, hermes_text in hermes_backups.items():
                 hermes_path.write_text(hermes_text, encoding="utf-8")
 
@@ -3600,6 +3607,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             env_pre = load_env(env_path)
             gpu_backend = env_pre.get("GPU_BACKEND", "nvidia")
             windows_host_lemonade = _is_windows_host_lemonade(env_pre)
+            windows_native_llama = _is_windows_host_llama_server(env_pre)
             windows_lemonade_already_serving = False
             if windows_host_lemonade and env_pre.get("GGUF_FILE") == gguf_file:
                 lemonade_port = env_pre.get("AMD_INFERENCE_PORT", "8080") or "8080"
@@ -3644,6 +3652,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             env_backup = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
             ini_backup = models_ini.read_text(encoding="utf-8") if models_ini.exists() else ""
             lemonade_backup = lemonade_yaml.read_text(encoding="utf-8") if lemonade_yaml.exists() else None
+            litellm_local_existed = litellm_local_yaml.exists()
+            if litellm_local_existed:
+                litellm_local_backup = litellm_local_yaml.read_text(encoding="utf-8")
             # Hermes's live config dir is created by the container at first
             # boot with UID 10000 / mode 0700, so the host-agent (running as
             # the host user) cannot read or write data/hermes/config.yaml.
@@ -3738,11 +3749,15 @@ class AgentHandler(BaseHTTPRequestHandler):
             )
 
             # Regenerate LiteLLM lemonade config so it routes to the new model.
-            # Only written on AMD installs where lemonade.yaml exists.
-            if lemonade_yaml.exists():
+            # Only written on Lemonade installs where lemonade.yaml exists.
+            if lemonade_yaml.exists() and not windows_native_llama:
                 _write_lemonade_config(INSTALL_DIR, gguf_file)
 
-            hermes_model_name = f"extra.{gguf_file}" if gpu_backend == "amd" else gguf_file
+            hermes_model_name = (
+                gguf_file
+                if windows_native_llama
+                else f"extra.{gguf_file}" if gpu_backend == "amd" else gguf_file
+            )
             try:
                 hermes_live_exists = hermes_live_config.exists()
             except PermissionError:
@@ -3786,6 +3801,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             if windows_host_lemonade:
                 if not windows_lemonade_already_serving:
                     _restart_windows_lemonade(env)
+            elif windows_native_llama:
+                _restart_windows_native_llama_server(env_path, env)
             elif gpu_backend == "apple":
                 # macOS: manage native llama-server process via PID file
                 pid_file = INSTALL_DIR / "data" / ".llama-server.pid"
@@ -3845,13 +3862,16 @@ class AgentHandler(BaseHTTPRequestHandler):
             if windows_host_lemonade:
                 llama_host = "127.0.0.1"
                 llama_port = env.get("AMD_INFERENCE_PORT", "8080")
+            elif windows_native_llama:
+                llama_host = "127.0.0.1"
+                llama_port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
             elif os.environ.get("ODS_HOST_INSTALL_DIR"):
                 llama_host = "ods-llama-server"
                 llama_port = "8080"
             else:
                 llama_host = "127.0.0.1"
                 llama_port = env.get("OLLAMA_PORT", "8080")
-            health_path = "/api/v1/health" if gpu_backend == "amd" else "/health"
+            health_path = "/api/v1/health" if gpu_backend == "amd" and not windows_native_llama else "/health"
             health_url = f"http://{llama_host}:{llama_port}{health_path}"
             logger.info("Waiting for llama-server health at %s", health_url)
             healthy = False
@@ -3864,7 +3884,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                         capture_output=True, text=True, timeout=10,
                     )
                     body = result.stdout.strip()
-                    if gpu_backend == "amd":
+                    if gpu_backend == "amd" and not windows_native_llama:
                         # Lemonade returns {"status":"ok","model_loaded":null}
                         # before a model is loaded — must verify model_loaded
                         # is non-null.  Mirrors bootstrap-upgrade.sh:330.
@@ -3884,7 +3904,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                                 )
                     else:
                         # llama.cpp: 200 with "ok" means model is loaded
-                        if '"ok"' in body:
+                        body_lower = body.lower()
+                        if '"ok"' in body_lower or body_lower == "ok":
                             healthy = True
                         elif attempt % 6 == 0:
                             logger.info("Health check attempt %d: %s", attempt + 1, body[:100])
@@ -3897,8 +3918,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                 time.sleep(5)
 
             if healthy:
+                if windows_native_llama:
+                    _write_windows_native_litellm_config(INSTALL_DIR, gguf_file, env)
+
                 # Regenerate lemonade.yaml if active.  Lemonade requires the
-                # exact model ID (extra.<GGUF_FILE>) — a wildcard doesn't work.
+                # exact model ID (extra.<GGUF_FILE>) - a wildcard doesn't work.
                 # Mirrors bootstrap-upgrade.sh lines 364-384.
                 ods_mode = env.get("ODS_MODE", "local")
                 if ods_mode == "lemonade":
@@ -3919,8 +3943,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                 restore_backups()
                 rollback_env = load_env(env_path)
                 rollback_windows_host_lemonade = _is_windows_host_lemonade(rollback_env)
+                rollback_windows_native_llama = _is_windows_host_llama_server(rollback_env)
                 if rollback_windows_host_lemonade:
                     _restart_windows_lemonade(rollback_env)
+                elif rollback_windows_native_llama:
+                    _restart_windows_native_llama_server(env_path, rollback_env)
                 elif gpu_backend == "apple":
                     # Stop newly launched native process, re-launch with old params
                     if pid_file.exists():
@@ -4096,6 +4123,106 @@ def _is_windows_host_lemonade(env: dict) -> bool:
         and (runtime == "lemonade" or backend == "lemonade")
         and location == "host"
     )
+
+
+def _is_windows_host_llama_server(env: dict) -> bool:
+    runtime = env.get("AMD_INFERENCE_RUNTIME", "").lower()
+    runtime_mode = env.get("AMD_INFERENCE_RUNTIME_MODE", "").lower()
+    backend = env.get("LLM_BACKEND", "").lower()
+    location = env.get("AMD_INFERENCE_LOCATION", "").lower()
+    managed = env.get("AMD_INFERENCE_MANAGED", "true").lower()
+    return (
+        platform.system().lower() == "windows"
+        and env.get("GPU_BACKEND", "").lower() == "amd"
+        and location == "host"
+        and managed != "false"
+        and (
+            runtime_mode == "windows-llama-server-fallback"
+            or runtime == "llama-server"
+            or backend == "llama-server"
+        )
+    )
+
+
+def _restart_windows_native_llama_server(env_path: Path, env: dict):
+    """Restart managed native Windows llama-server.exe with the active .env."""
+    llama_bin = INSTALL_DIR / "llama-server" / "llama-server.exe"
+    llama_log = INSTALL_DIR / "data" / "llama-server.log"
+    pid_file = INSTALL_DIR / "data" / "llama-server.pid"
+    gguf_file = env.get("GGUF_FILE", "")
+    model_path = INSTALL_DIR / "data" / "models" / gguf_file
+    port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
+
+    if not llama_bin.exists():
+        raise RuntimeError(f"llama-server.exe not found at {llama_bin}")
+    if not _model_file_ready(model_path):
+        raise RuntimeError(f"Model file not ready for native llama-server: {model_path}")
+
+    ps_env = os.environ.copy()
+    ps_env.update({
+        "ODS_WIN_LLAMA_EXE": str(llama_bin),
+        "ODS_WIN_LLAMA_PID_FILE": str(pid_file),
+        "ODS_WIN_LLAMA_PORT": str(port),
+    })
+    script = r'''
+$ErrorActionPreference = "Stop"
+$llamaExe = $env:ODS_WIN_LLAMA_EXE
+$pidPath = $env:ODS_WIN_LLAMA_PID_FILE
+$port = [int]$env:ODS_WIN_LLAMA_PORT
+
+function Test-ODSLlamaProcess {
+    param($Proc)
+    if (-not $Proc) { return $false }
+    if ($Proc.Name -like "llama-server*") { return $true }
+    if ($Proc.ExecutablePath -and $Proc.ExecutablePath.Equals($llamaExe, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($Proc.CommandLine -and $Proc.CommandLine.IndexOf("llama-server", [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    return $false
+}
+
+function Stop-ODSLlamaProcessId {
+    param([int]$ProcId)
+    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcId) -ErrorAction SilentlyContinue
+    if (-not (Test-ODSLlamaProcess $proc)) { return }
+    & taskkill.exe /PID $ProcId /T /F | Out-Null
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "Could not stop native llama-server process $ProcId"
+}
+
+if (Test-Path $pidPath) {
+    $rawPid = (Get-Content -LiteralPath $pidPath -Raw).Trim()
+    if ($rawPid -match "^\d+$") {
+        Stop-ODSLlamaProcessId -ProcId ([int]$rawPid)
+    }
+    Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+}
+
+foreach ($listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+    if ($listener.OwningProcess -gt 0) {
+        Stop-ODSLlamaProcessId -ProcId ([int]$listener.OwningProcess)
+    }
+}
+'''
+    ps_cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+    try:
+        result = subprocess.run(ps_cmd, capture_output=True, text=True, timeout=90, env=ps_env)
+    except FileNotFoundError:
+        result = subprocess.run(
+            ["pwsh.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=ps_env,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Windows native llama-server stop failed: "
+            f"{(result.stderr or result.stdout).strip()[:500]}"
+        )
+
+    _launch_native_llama_server(env_path, llama_bin, llama_log, pid_file)
 
 
 def _restart_windows_lemonade(env: dict):
@@ -4357,6 +4484,45 @@ def _write_lemonade_config(install_dir: Path, gguf_file: str):
     logger.info("Wrote lemonade.yaml for model: extra.%s", gguf_file)
 
 
+def _write_windows_native_litellm_config(install_dir: Path, gguf_file: str, env: dict):
+    """Regenerate LiteLLM local.yaml for native Windows llama-server."""
+    config_path = install_dir / "config" / "litellm" / "local.yaml"
+    port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
+    api_base = f"http://host.docker.internal:{port}/v1"
+    content = (
+        "model_list:\n"
+        "  - model_name: default\n"
+        "    litellm_params:\n"
+        f"      model: openai/{gguf_file}\n"
+        f"      api_base: {api_base}\n"
+        "      api_key: not-needed\n"
+        "      extra_body:\n"
+        "        chat_template_kwargs:\n"
+        "          enable_thinking: false\n"
+        "\n"
+        "  - model_name: \"*\"\n"
+        "    litellm_params:\n"
+        "      model: openai/*\n"
+        f"      api_base: {api_base}\n"
+        "      api_key: not-needed\n"
+        "      extra_body:\n"
+        "        chat_template_kwargs:\n"
+        "          enable_thinking: false\n"
+        "\n"
+        "general_settings:\n"
+        "  master_key: os.environ/LITELLM_MASTER_KEY\n"
+        "\n"
+        "litellm_settings:\n"
+        "  drop_params: true\n"
+        "  set_verbose: false\n"
+        "  request_timeout: 900\n"
+        "  stream_timeout: 900\n"
+    )
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(content, encoding="utf-8")
+    logger.info("Wrote native Windows LiteLLM local.yaml for model: %s", gguf_file)
+
+
 def _patch_hermes_model_config(
     path: Path,
     model_name: str,
@@ -4543,9 +4709,10 @@ def _launch_native_llama_server(env_path: Path, llama_bin: Path, llama_log: Path
     reasoning_fmt = {"off": "none", "on": "deepseek"}.get(reasoning, reasoning)
     # Honour the unified BIND_ADDRESS knob (PR #964); empty/missing → loopback.
     bind_addr = env.get("BIND_ADDRESS", "").strip() or "127.0.0.1"
+    port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
     args = [
         str(llama_bin),
-        "--host", bind_addr, "--port", "8080",
+        "--host", bind_addr, "--port", str(port),
         "--model", str(model_path),
         "--ctx-size", ctx_size,
         "--n-gpu-layers", "999",
@@ -4568,10 +4735,18 @@ def _launch_native_llama_server(env_path: Path, llama_bin: Path, llama_log: Path
             args.extend([flag, value])
     if _normalize_key(env.get("LLAMA_ARG_NO_CACHE_PROMPT")) not in {"", "0", "false", "off", "no"}:
         args.append("--no-cache-prompt")
+    llama_log.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    popen_kwargs = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if platform.system().lower() == "windows" and creationflags:
+        popen_kwargs["creationflags"] = creationflags
     with open(llama_log, "a") as log_f:
         proc = subprocess.Popen(
             args,
             stdout=log_f, stderr=log_f,
+            cwd=str(INSTALL_DIR),
+            **popen_kwargs,
         )
     pid_file.write_text(str(proc.pid), encoding="utf-8")
     logger.info("Native llama-server launched (pid %d, model %s)", proc.pid, gguf_file)

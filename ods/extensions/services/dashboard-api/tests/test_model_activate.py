@@ -25,6 +25,8 @@ _patch_hermes_model_config = _mod._patch_hermes_model_config
 _compose_restart_llama_server = _mod._compose_restart_llama_server
 _launch_native_llama_server = _mod._launch_native_llama_server
 _restart_windows_lemonade = _mod._restart_windows_lemonade
+_is_windows_host_llama_server = _mod._is_windows_host_llama_server
+_write_windows_native_litellm_config = _mod._write_windows_native_litellm_config
 
 
 # --- _check_lemonade_health ---
@@ -317,7 +319,10 @@ class TestLaunchNativeLlamaServer:
     def test_reads_env_and_writes_pid(self, monkeypatch, tmp_path):
         env_path = tmp_path / ".env"
         env_path.write_text(
-            "GGUF_FILE=test-model.gguf\nCTX_SIZE=8192\nLLAMA_REASONING=on\n",
+            "GGUF_FILE=test-model.gguf\n"
+            "CTX_SIZE=8192\n"
+            "LLAMA_REASONING=on\n"
+            "AMD_INFERENCE_PORT=9090\n",
             encoding="utf-8",
         )
         (tmp_path / "data" / "models").mkdir(parents=True)
@@ -347,10 +352,46 @@ class TestLaunchNativeLlamaServer:
         assert cmd[0] == str(llama_bin)
         assert "--model" in cmd
         assert str(tmp_path / "data" / "models" / "test-model.gguf") in cmd
+        assert cmd[cmd.index("--port") + 1] == "9090"
         assert "--ctx-size" in cmd
         assert "8192" in cmd
         assert "--reasoning-format" in cmd
         assert "deepseek" in cmd
+        assert _kwargs["cwd"] == str(tmp_path)
+
+
+class TestWindowsNativeLlamaServer:
+
+    def test_detects_managed_windows_amd_llama_fallback(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+
+        assert _is_windows_host_llama_server({
+            "GPU_BACKEND": "amd",
+            "LLM_BACKEND": "llama-server",
+            "AMD_INFERENCE_RUNTIME": "llama-server",
+            "AMD_INFERENCE_RUNTIME_MODE": "windows-llama-server-fallback",
+            "AMD_INFERENCE_LOCATION": "host",
+            "AMD_INFERENCE_MANAGED": "true",
+        }) is True
+        assert _is_windows_host_llama_server({
+            "GPU_BACKEND": "amd",
+            "LLM_BACKEND": "lemonade",
+            "AMD_INFERENCE_RUNTIME": "lemonade",
+            "AMD_INFERENCE_LOCATION": "host",
+        }) is False
+
+    def test_writes_litellm_local_config_for_native_windows_llama(self, tmp_path):
+        _write_windows_native_litellm_config(
+            tmp_path,
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            {"AMD_INFERENCE_PORT": "9090"},
+        )
+
+        content = (tmp_path / "config" / "litellm" / "local.yaml").read_text(encoding="utf-8")
+        assert "model: openai/Qwen3.5-4B-Q4_K_M.gguf" in content
+        assert "api_base: http://host.docker.internal:9090/v1" in content
+        assert 'model_name: "*"' in content
+        assert "request_timeout: 900" in content
 
 
 class TestRestartWindowsLemonade:
@@ -751,6 +792,125 @@ class TestModelActivateRollback:
         content = lemonade_yaml.read_text(encoding="utf-8")
         assert "model: openai/extra.new-model.gguf" in content
         assert ["docker", "restart", "ods-litellm"] in calls
+
+    def test_windows_native_llama_activation_uses_plain_health_and_litellm_local(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path, gpu_backend="amd")
+        )
+        env_path.write_text(
+            "GPU_BACKEND=amd\n"
+            "LLM_BACKEND=llama-server\n"
+            "AMD_INFERENCE_RUNTIME=llama-server\n"
+            "AMD_INFERENCE_RUNTIME_MODE=windows-llama-server-fallback\n"
+            "AMD_INFERENCE_LOCATION=host\n"
+            "AMD_INFERENCE_MANAGED=true\n"
+            "AMD_INFERENCE_PORT=9090\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
+            "CTX_SIZE=2048\n"
+            "OLLAMA_PORT=11434\n",
+            encoding="utf-8",
+        )
+        hermes_live = install_dir / "data" / "hermes" / "config.yaml"
+        hermes_template = install_dir / "extensions" / "services" / "hermes" / "cli-config.yaml.template"
+        hermes_live.parent.mkdir(parents=True)
+        hermes_template.parent.mkdir(parents=True)
+        hermes_text = (
+            "model:\n"
+            "  default: \"old-model.gguf\"\n"
+            "  provider: \"custom\"\n"
+            "  base_url: \"http://litellm:4000/v1\"\n"
+        )
+        hermes_live.write_text(hermes_text, encoding="utf-8")
+        hermes_template.write_text(hermes_text, encoding="utf-8")
+
+        restart_calls = []
+
+        def record_native_restart(path, env):
+            restart_calls.append((path, dict(env)))
+
+        def fail_wrong_restart(*_args, **_kwargs):
+            raise AssertionError("wrong restart path for Windows native llama-server")
+
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd and cmd[0] == "curl":
+                assert cmd[-1] == "http://127.0.0.1:9090/health"
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"status":"ok"}', stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_restart_windows_native_llama_server", record_native_restart)
+        monkeypatch.setattr(_mod, "_restart_windows_lemonade", fail_wrong_restart)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", fail_wrong_restart)
+        monkeypatch.setattr(_mod, "_send_lemonade_warmup", fail_wrong_restart)
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        assert restart_calls and restart_calls[0][0] == env_path
+        assert restart_calls[0][1]["GGUF_FILE"] == "new-model.gguf"
+        assert '  default: "new-model.gguf"' in hermes_live.read_text(encoding="utf-8")
+        assert "extra.new-model.gguf" not in hermes_live.read_text(encoding="utf-8")
+        local_yaml = install_dir / "config" / "litellm" / "local.yaml"
+        content = local_yaml.read_text(encoding="utf-8")
+        assert "model: openai/new-model.gguf" in content
+        assert "api_base: http://host.docker.internal:9090/v1" in content
+        assert ["docker", "restart", "ods-litellm"] in calls
+        assert ["docker", "restart", "ods-hermes"] in calls
+
+    def test_windows_native_litellm_local_rolls_back_on_late_failure(self, tmp_path, monkeypatch):
+        install_dir, env_path, env_text, models_ini, ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path, gpu_backend="amd")
+        )
+        env_path.write_text(
+            "GPU_BACKEND=amd\n"
+            "LLM_BACKEND=llama-server\n"
+            "AMD_INFERENCE_RUNTIME=llama-server\n"
+            "AMD_INFERENCE_RUNTIME_MODE=windows-llama-server-fallback\n"
+            "AMD_INFERENCE_LOCATION=host\n"
+            "AMD_INFERENCE_MANAGED=true\n"
+            "AMD_INFERENCE_PORT=9090\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
+            "CTX_SIZE=2048\n",
+            encoding="utf-8",
+        )
+        env_text = env_path.read_text(encoding="utf-8")
+        litellm_local = install_dir / "config" / "litellm" / "local.yaml"
+        old_local_yaml = "model_list:\n  - model_name: old\n"
+        litellm_local.write_text(old_local_yaml, encoding="utf-8")
+
+        def fake_run(cmd, **_kwargs):
+            if cmd and cmd[0] == "curl":
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"status":"ok"}', stderr="")
+            if cmd == ["docker", "restart", "ods-litellm"]:
+                raise subprocess.TimeoutExpired(cmd, 60)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_restart_windows_native_llama_server", lambda *_args: None)
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert env_path.read_text(encoding="utf-8") == env_text
+        assert models_ini.read_text(encoding="utf-8") == ini_text
+        assert litellm_local.read_text(encoding="utf-8") == old_local_yaml
 
     def test_activation_patches_hermes_configs_and_restarts_hermes(self, tmp_path, monkeypatch):
         install_dir, _env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
