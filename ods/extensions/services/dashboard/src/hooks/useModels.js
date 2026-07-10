@@ -70,6 +70,8 @@ function getMockModels() {
 
 const MOCK_GPU = { vramTotal: 16, vramUsed: 13.2, vramFree: 2.8 }
 const MOCK_CURRENT_MODEL = 'Qwen/Qwen2.5-32B-Instruct-AWQ'
+const DEFAULT_POLL_MS = 30000
+const PENDING_MODEL_ACTION_POLL_MS = 2000
 
 // Named export for dev-only mocking (explicit opt-in via VITE_USE_MOCK_DATA)
 export { getMockModels }
@@ -94,8 +96,41 @@ export function useModels() {
   const [recommendationAlternatives, setRecommendationAlternatives] = useState([])
   const [loading, setLoading] = useState(USE_MOCK_DATA ? false : true)
   const [error, setError] = useState(null)
-  const [actionLoading, setActionLoading] = useState(null)
+  const [pendingAction, setPendingActionState] = useState(null)
+  const pendingActionRef = useRef(null)
+  const actionTokenRef = useRef(0)
+  const modelsRequestRef = useRef(0)
+  const latestSettledModelsRequestRef = useRef(0)
+  const pollInFlightRef = useRef(false)
   const loadActiveRef = useRef(false)
+
+  const setPendingAction = useCallback((action) => {
+    pendingActionRef.current = action
+    setPendingActionState(action)
+  }, [])
+
+  const startAction = useCallback((modelId, kind) => {
+    const action = { modelId, kind, token: ++actionTokenRef.current }
+    setPendingAction(action)
+    return action
+  }, [setPendingAction])
+
+  const finishAction = useCallback((token) => {
+    if (pendingActionRef.current?.token === token) setPendingAction(null)
+  }, [setPendingAction])
+
+  const reconcilePendingAction = useCallback((nextModels) => {
+    const action = pendingActionRef.current
+    if (!action || !Array.isArray(nextModels)) return
+
+    const model = nextModels.find(candidate => candidate.id === action.modelId)
+    const downloadFinished = action.kind === 'download' &&
+      (model?.status === 'downloaded' || model?.status === 'loaded')
+    const deleteFinished = action.kind === 'delete' &&
+      (!model || model.status === 'available')
+
+    if (downloadFinished || deleteFinished) finishAction(action.token)
+  }, [finishAction])
 
   const fetchModels = useCallback(async () => {
     // If using mock data, don't attempt API call
@@ -104,43 +139,70 @@ export function useModels() {
       return
     }
 
+    const requestId = ++modelsRequestRef.current
     try {
       const response = await fetch('/api/models')
       if (!response.ok) throw new Error('Failed to fetch models')
       const data = await response.json()
+
+      // A slower, older request must not overwrite a newer snapshot.
+      if (requestId < latestSettledModelsRequestRef.current) return data
+      latestSettledModelsRequestRef.current = requestId
+
       setModels(data.models)
       setGpu(data.gpu)
       setCurrentModel(data.currentModel)
       setConfiguredModel(data.configuredModel ?? null)
       setRecommendationAlternatives(data.recommendationAlternatives ?? [])
       setError(null)
+      reconcilePendingAction(data.models)
+      return data
     } catch (err) {
-      setError(err.message)
+      if (requestId >= latestSettledModelsRequestRef.current) {
+        latestSettledModelsRequestRef.current = requestId
+        setError(err.message)
+      }
       // No silent fallback - let error propagate to UI
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [reconcilePendingAction])
+
+  const pollModels = useCallback(async () => {
+    if (document.hidden || pollInFlightRef.current) return
+    pollInFlightRef.current = true
+    try {
+      await fetchModels()
+    } finally {
+      pollInFlightRef.current = false
+    }
+  }, [fetchModels])
 
   useEffect(() => {
-    fetchModels()
-    // Refresh every 30 seconds — but skip ticks while the tab is hidden so
-    // an idle dashboard doesn't keep polling for nobody (#1490).
-    const tick = () => { if (!document.hidden) fetchModels() }
-    const interval = setInterval(tick, 30000)
+    pollModels()
+  }, [pollModels])
+
+  const pollInterval = pendingAction?.kind === 'download' || pendingAction?.kind === 'delete'
+    ? PENDING_MODEL_ACTION_POLL_MS
+    : DEFAULT_POLL_MS
+
+  useEffect(() => {
+    // Poll promptly while a model mutation is pending, while keeping at most
+    // one scheduled request in flight. Hidden tabs remain idle (#1490).
+    const interval = setInterval(pollModels, pollInterval)
 
     // Resume immediately when the tab becomes visible again
-    const onVisibility = () => { if (!document.hidden) fetchModels() }
+    const onVisibility = () => { if (!document.hidden) pollModels() }
     document.addEventListener('visibilitychange', onVisibility)
 
     return () => {
       clearInterval(interval)
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [fetchModels])
+  }, [pollInterval, pollModels])
 
   const downloadModel = async (modelId) => {
-    setActionLoading(modelId)
+    const action = startAction(modelId, 'download')
     try {
       const response = await fetch(`/api/models/${encodeURIComponent(modelId)}/download`, {
         method: 'POST'
@@ -150,7 +212,7 @@ export function useModels() {
     } catch (err) {
       setError(err.message)
     } finally {
-      setActionLoading(null)
+      finishAction(action.token)
     }
   }
 
@@ -158,7 +220,7 @@ export function useModels() {
     // Prevent concurrent activations — only one model can load at a time
     if (loadActiveRef.current) return
     loadActiveRef.current = true
-    setActionLoading(modelId)
+    const action = startAction(modelId, 'load')
     setError(null)
 
     // Model activation is long-running (20-60s).  The browser connection
@@ -186,28 +248,20 @@ export function useModels() {
         break
       }
       try {
-        const res = await fetch('/api/models')
-        if (res.ok) {
-          const data = await res.json()
-          if (data.currentModel === modelId) {
-            setModels(data.models)
-            setGpu(data.gpu)
-            setCurrentModel(data.currentModel)
-            break
-          }
-        }
+        const data = await fetchModels()
+        if (data?.currentModel === modelId) break
       } catch { /* poll failure, retry */ }
     }
 
     await fetchModels()
-    setActionLoading(null)
+    finishAction(action.token)
     loadActiveRef.current = false
   }
 
   const deleteModel = async (modelId) => {
     if (!confirm(`Delete ${modelId}? This cannot be undone.`)) return
     
-    setActionLoading(modelId)
+    const action = startAction(modelId, 'delete')
     try {
       const response = await fetch(`/api/models/${encodeURIComponent(modelId)}`, {
         method: 'DELETE'
@@ -217,12 +271,12 @@ export function useModels() {
     } catch (err) {
       setError(err.message)
     } finally {
-      setActionLoading(null)
+      finishAction(action.token)
     }
   }
 
   const benchmarkModel = async (modelId) => {
-    setActionLoading(modelId)
+    const action = startAction(modelId, 'benchmark')
     try {
       const response = await fetch(`/api/models/${encodeURIComponent(modelId)}/benchmark`, {
         method: 'POST',
@@ -234,9 +288,11 @@ export function useModels() {
     } catch (err) {
       setError(err.message)
     } finally {
-      setActionLoading(null)
+      finishAction(action.token)
     }
   }
+
+  const actionLoading = pendingAction?.modelId ?? null
 
   return {
     models,
