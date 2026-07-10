@@ -73,6 +73,7 @@ const MOCK_CURRENT_MODEL = 'Qwen/Qwen2.5-32B-Instruct-AWQ'
 const DEFAULT_POLL_MS = 30000
 const PENDING_MODEL_ACTION_POLL_MS = 2000
 const MODELS_FETCH_TIMEOUT_MS = 30000
+const MODEL_DOWNLOAD_START_TIMEOUT_MS = 15000
 const MODEL_ACTIVATION_POLL_MS = 5000
 // The dashboard API permits the host activation request to run for 600s.
 // Keep the UI lock slightly longer so that deadline can settle before we fail.
@@ -250,17 +251,31 @@ export function useModels() {
   }, [pollInterval, pollModels])
 
   const downloadModel = async (modelId) => {
-    setMutationError(null)
     const action = startAction(modelId, 'download')
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), MODEL_DOWNLOAD_START_TIMEOUT_MS)
     try {
-      const response = await fetch(`/api/models/${encodeURIComponent(modelId)}/download`, {
-        method: 'POST'
-      })
-      if (!response.ok) throw new Error('Failed to start download')
+      let response
+      try {
+        response = await fetch(`/api/models/${encodeURIComponent(modelId)}/download`, {
+          method: 'POST',
+          signal: controller.signal,
+        })
+      } catch (err) {
+        if (err?.name === 'AbortError') {
+          throw new Error(`Download for ${modelId} did not start within 15 seconds. Check the service and retry.`)
+        }
+        throw err
+      } finally {
+        clearTimeout(timeout)
+      }
+
+      if (!response.ok) {
+        throw new Error(await errorMessageFromResponse(response, `Failed to start download for ${modelId}`))
+      }
       await fetchModels() // Refresh
-    } catch (err) {
-      setMutationError(err.message)
     } finally {
+      clearTimeout(timeout)
       finishAction(action.token)
     }
   }
@@ -386,6 +401,7 @@ export function useModels() {
 
   const activationAction = pendingActions.find(action => action.kind === 'load')
   const latestAction = pendingActions[pendingActions.length - 1]
+  const activationLoading = activationAction?.modelId ?? null
   const actionLoading = activationAction?.modelId ?? latestAction?.modelId ?? null
   const actionLoadingModels = [...new Set(pendingActions.map(action => action.modelId))]
   const error = mutationError || fetchError
@@ -401,6 +417,7 @@ export function useModels() {
     error,
     actionLoading,
     actionLoadingModels,
+    activationLoading,
     downloadModel,
     loadModel,
     benchmarkModel,

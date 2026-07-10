@@ -20,7 +20,7 @@ import { useModels } from '../hooks/useModels'
 import { useDownloadProgress } from '../hooks/useDownloadProgress'
 
 const PAGE_SIZE = 10
-const DOWNLOAD_START_TIMEOUT_MS = 15000
+const DOWNLOAD_STATUS_TIMEOUT_MS = 15000
 const CLOUD_MODE_RUN_TITLE = 'Switch ODS to local mode to run this model.'
 const TECH_PANEL_STYLE = {
   background: 'linear-gradient(180deg, rgba(10,10,18,0.96), rgba(7,7,13,0.92))',
@@ -38,6 +38,25 @@ const TECH_TILE_STYLE = {
   boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.045), inset 0 -18px 34px rgba(0,0,0,0.18)',
 }
 
+function catalogModelIdForProgress(models, progressModel) {
+  const rawLabel = typeof progressModel === 'string' ? progressModel.trim() : ''
+  if (!rawLabel) return null
+
+  const rawToken = rawLabel.toLowerCase()
+  const directMatch = models.find(model => String(model.id || '').toLowerCase() === rawToken)
+  if (directMatch) return directMatch.id
+
+  const fileToken = rawLabel.split(' (', 1)[0].split(/[\\/]/).pop()?.toLowerCase()
+  if (!fileToken) return null
+  const fileMatch = models.find(model => {
+    if (String(model.gguf || '').toLowerCase() === fileToken) return true
+    return Array.isArray(model.ggufParts) && model.ggufParts.some(
+      part => String(part?.file || '').toLowerCase() === fileToken
+    )
+  })
+  return fileMatch?.id ?? null
+}
+
 export default function Models() {
   const downloadProgress = useDownloadProgress()
   const {
@@ -51,6 +70,7 @@ export default function Models() {
     error,
     actionLoading,
     actionLoadingModels,
+    activationLoading,
     downloadModel,
     loadModel,
     benchmarkModel,
@@ -59,6 +79,7 @@ export default function Models() {
   } = useModels()
 
   const [downloadStarting, setDownloadStarting] = useState(null)
+  const [downloadAwaitingStatus, setDownloadAwaitingStatus] = useState(false)
   const [downloadStartFailure, setDownloadStartFailure] = useState(null)
   const [openMenuId, setOpenMenuId] = useState(null)
   const [page, setPage] = useState(1)
@@ -73,37 +94,40 @@ export default function Models() {
     const terminalProgress = downloadProgress.progress?.error ||
       ['failed', 'error', 'cancelled'].includes(downloadProgress.progress?.status)
 
-    if (downloadProgress.isDownloading || error || terminalProgress) {
+    if (downloadProgress.isDownloading || terminalProgress) {
       setDownloadStarting(null)
+      setDownloadAwaitingStatus(false)
     }
     if (downloadProgress.isDownloading || terminalProgress) {
       setDownloadStartFailure(null)
     }
-  }, [downloadProgress.isDownloading, downloadProgress.progress, error])
+  }, [downloadProgress.isDownloading, downloadProgress.progress])
 
   useEffect(() => {
     if (downloadProgress.completedDownload?.status === 'complete') {
       setDownloadStarting(null)
+      setDownloadAwaitingStatus(false)
       setDownloadStartFailure(null)
       refresh()
     }
   }, [downloadProgress.completedDownload, refresh])
 
   useEffect(() => {
-    if (!downloadStarting) return undefined
+    if (!downloadStarting || !downloadAwaitingStatus) return undefined
 
     const modelId = downloadStarting
     const timeout = setTimeout(() => {
       setDownloadStarting(null)
+      setDownloadAwaitingStatus(false)
       setDownloadStartFailure({
         modelId,
         error: `Download for ${modelId} did not start within 15 seconds. Check the service and retry.`,
       })
       void downloadProgress.refresh()
-    }, DOWNLOAD_START_TIMEOUT_MS)
+    }, DOWNLOAD_STATUS_TIMEOUT_MS)
 
     return () => clearTimeout(timeout)
-  }, [downloadProgress.refresh, downloadStarting])
+  }, [downloadAwaitingStatus, downloadProgress.refresh, downloadStarting])
 
   useEffect(() => {
     const closeMenu = (event) => {
@@ -165,12 +189,15 @@ export default function Models() {
   const handleDownload = async (modelId) => {
     setDownloadStartFailure(null)
     downloadProgress.clearTerminal?.()
+    setDownloadAwaitingStatus(false)
     setDownloadStarting(modelId)
     try {
       await downloadModel(modelId)
+      setDownloadAwaitingStatus(true)
       await downloadProgress.refresh()
     } catch (downloadError) {
       setDownloadStarting(null)
+      setDownloadAwaitingStatus(false)
       setDownloadStartFailure({
         modelId,
         error: downloadError?.message || `Failed to start download for ${modelId}.`,
@@ -184,6 +211,7 @@ export default function Models() {
     model: downloadStartFailure.modelId,
     error: downloadStartFailure.error,
   })
+  const retryModelId = catalogModelIdForProgress(models, visibleDownloadProgress?.model)
 
   if (loading) {
     return (
@@ -243,8 +271,8 @@ export default function Models() {
         <DownloadProgressBar
           progress={visibleDownloadProgress}
           helpers={downloadProgress}
-          onRetry={visibleDownloadProgress.model
-            ? () => handleDownload(visibleDownloadProgress.model)
+          onRetry={retryModelId
+            ? () => handleDownload(retryModelId)
             : null}
         />
       )}
@@ -325,6 +353,7 @@ export default function Models() {
                       isCurrentModel={model.id === currentModel}
                       isLoading={pendingModelActions.includes(model.id)}
                       loadBusy={pendingModelActions.length > 0}
+                      activationBusy={Boolean(activationLoading)}
                       downloadBusy={downloadProgress.isDownloading || !!downloadStarting}
                       downloadStarting={downloadStarting === model.id}
                       menuOpen={openMenuId === rowId}
@@ -574,6 +603,7 @@ function ModelTableRow({
   isCurrentModel,
   isLoading,
   loadBusy,
+  activationBusy,
   downloadBusy,
   downloadStarting,
   menuOpen,
@@ -624,6 +654,7 @@ function ModelTableRow({
           isDownloaded={isDownloaded}
           isLoading={isLoading}
           loadBusy={loadBusy}
+          activationBusy={activationBusy}
           downloadBusy={downloadBusy}
           downloadStarting={downloadStarting}
           onDownload={onDownload}
@@ -636,13 +667,13 @@ function ModelTableRow({
         <button
           type="button"
           onClick={onToggleMenu}
-          disabled={isLoading}
+          disabled={isLoading || activationBusy}
           className="flex h-8 w-8 items-center justify-center rounded-lg text-theme-text-muted transition-colors hover:bg-white/[0.05] hover:text-theme-text disabled:cursor-not-allowed disabled:opacity-35"
           title="Model actions"
         >
           <MoreVertical size={15} />
         </button>
-        {menuOpen && !isLoading && (
+        {menuOpen && !isLoading && !activationBusy && (
           <div className="absolute left-0 top-9 z-30 w-44 overflow-hidden rounded-lg border border-white/[0.08] bg-[#101018] py-1 shadow-2xl">
             {isLoaded && (
               <MenuButton onClick={onBenchmark} icon={RefreshCw}>Benchmark</MenuButton>
@@ -707,6 +738,7 @@ function PrimaryAction({
   isDownloaded,
   isLoading,
   loadBusy,
+  activationBusy,
   downloadBusy,
   downloadStarting,
   onDownload,
@@ -727,7 +759,8 @@ function PrimaryAction({
       <button
         type="button"
         onClick={onBenchmark}
-        className="inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md bg-theme-accent px-3 text-xs font-semibold text-white shadow-[0_0_18px_rgba(168,85,247,0.26)] transition-colors hover:bg-theme-accent-hover"
+        disabled={activationBusy}
+        className="inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md bg-theme-accent px-3 text-xs font-semibold text-white shadow-[0_0_18px_rgba(168,85,247,0.26)] transition-colors hover:bg-theme-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
         title="Run a local benchmark for this loaded model"
       >
         <RefreshCw size={13} />
@@ -738,7 +771,7 @@ function PrimaryAction({
 
   if (isDownloaded) {
     const cloudMode = odsMode === 'cloud'
-    const runDisabled = cloudMode || !model.fitsVram || loadBusy
+    const runDisabled = cloudMode || !model.fitsVram || loadBusy || activationBusy
     return (
       <button
         type="button"
@@ -770,9 +803,9 @@ function PrimaryAction({
     <button
       type="button"
       onClick={onDownload}
-      disabled={downloadBusy}
+      disabled={downloadBusy || activationBusy}
       className={`inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md border px-3 text-xs font-semibold transition-colors ${
-        downloadBusy
+        downloadBusy || activationBusy
           ? 'cursor-not-allowed border-white/[0.08] bg-black/20 text-theme-text-muted'
           : 'border-white/[0.08] bg-black/20 text-theme-text-secondary hover:border-theme-accent/35 hover:text-theme-text'
       }`}
@@ -784,7 +817,7 @@ function PrimaryAction({
 }
 
 function DownloadProgressBar({ progress, helpers, onRetry }) {
-  const { formatBytes, formatEta, cancelDownload } = helpers
+  const { formatBytes, formatEta, cancelDownload, cancelError, isCancelling } = helpers
 
   if (progress.error) {
     const cancelled = progress.status === 'cancelled'
@@ -839,13 +872,20 @@ function DownloadProgressBar({ progress, helpers, onRetry }) {
           <button
             type="button"
             onClick={cancelDownload}
-            className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-white/[0.1] bg-black/20 px-2.5 text-xs font-semibold text-theme-text-secondary transition-colors hover:border-red-400/35 hover:text-red-300"
+            disabled={isCancelling}
+            className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-white/[0.1] bg-black/20 px-2.5 text-xs font-semibold text-theme-text-secondary transition-colors hover:border-red-400/35 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <X size={13} />
-            Cancel
+            {isCancelling ? <Loader2 size={13} className="animate-spin" /> : <X size={13} />}
+            {isCancelling ? 'Cancelling' : 'Cancel'}
           </button>
         </div>
       </div>
+
+      {cancelError && (
+        <p role="alert" className="mb-3 text-sm text-red-300">
+          {cancelError}
+        </p>
+      )}
 
       <div className="h-2.5 overflow-hidden rounded-full bg-theme-border">
         <div

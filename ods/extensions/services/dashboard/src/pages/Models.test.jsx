@@ -19,6 +19,8 @@ function baseDownloadState(overrides = {}) {
     isDownloading: false,
     progress: null,
     completedDownload: null,
+    cancelError: null,
+    isCancelling: false,
     refresh: vi.fn(),
     cancelDownload: vi.fn(),
     clearTerminal: vi.fn(),
@@ -43,6 +45,7 @@ function baseState(overrides = {}) {
     loading: false,
     error: null,
     actionLoading: null,
+    activationLoading: null,
     downloadModel: vi.fn(),
     loadModel: vi.fn(),
     benchmarkModel: vi.fn(),
@@ -50,6 +53,16 @@ function baseState(overrides = {}) {
     refresh: vi.fn(),
     ...overrides,
   }
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 function model(overrides = {}) {
@@ -222,6 +235,44 @@ test('shows terminal download failures with a retry action', async () => {
   await act(async () => {})
 })
 
+test.each([
+  [
+    'single GGUF filename',
+    { gguf: 'Qwen3.5-9B-Q4_K_M.gguf' },
+    'Qwen3.5-9B-Q4_K_M.gguf',
+  ],
+  [
+    'split-part progress label',
+    {
+      gguf: 'Qwen3-Coder-Next-Q4_K_M-00001-of-00002.gguf',
+      ggufParts: [
+        { file: 'Qwen3-Coder-Next-Q4_K_M-00001-of-00002.gguf' },
+        { file: 'Qwen3-Coder-Next-Q4_K_M-00002-of-00002.gguf' },
+      ],
+    },
+    'Qwen3-Coder-Next-Q4_K_M-00002-of-00002.gguf (part 2/2)',
+  ],
+])('retries a failed %s with the catalog model ID', async (_label, modelFields, progressModel) => {
+  const downloadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    downloadModel,
+    models: [model(modelFields)],
+  }))
+  useDownloadProgressMock.mockReturnValue(baseDownloadState({
+    progress: {
+      status: 'failed',
+      model: progressModel,
+      error: 'Transfer failed.',
+    },
+  }))
+
+  renderModels()
+  fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+
+  expect(downloadModel).toHaveBeenCalledWith('qwen3.5-9b-q4')
+  await act(async () => {})
+})
+
 test('shows a cancel control while downloading', () => {
   const cancelDownload = vi.fn()
   useModelsMock.mockReturnValue(baseState({ models: [model()] }))
@@ -243,6 +294,30 @@ test('shows a cancel control while downloading', () => {
   fireEvent.click(screen.getByRole('button', { name: /cancel/i }))
 
   expect(cancelDownload).toHaveBeenCalledTimes(1)
+})
+
+test('shows cancellation state and errors without hiding active progress', () => {
+  useModelsMock.mockReturnValue(baseState({ models: [model()] }))
+  useDownloadProgressMock.mockReturnValue(baseDownloadState({
+    isDownloading: true,
+    isCancelling: true,
+    cancelError: 'The host agent did not accept cancellation.',
+    progress: {
+      status: 'downloading',
+      model: 'qwen3.5-9b-q4',
+      bytesDownloaded: 5,
+      bytesTotal: 10,
+      percent: 50,
+      speedMbps: 1,
+      eta: 5,
+    },
+  }))
+
+  renderModels()
+
+  expect(screen.getByText(/downloading qwen3\.5-9b-q4/i)).toBeInTheDocument()
+  expect(screen.getByRole('alert')).toHaveTextContent('The host agent did not accept cancellation.')
+  expect(screen.getByRole('button', { name: /cancelling/i })).toBeDisabled()
 })
 
 test('recovers from Download Starting when status remains idle', async () => {
@@ -272,6 +347,52 @@ test('recovers from Download Starting when status remains idle', async () => {
   }
 })
 
+test('does not expose Retry while the download start request is unresolved', async () => {
+  vi.useFakeTimers()
+  const startRequest = deferred()
+  useModelsMock.mockReturnValue(baseState({
+    downloadModel: vi.fn(() => startRequest.promise),
+    models: [model()],
+  }))
+
+  try {
+    renderModels()
+    fireEvent.click(screen.getByRole('button', { name: /^download$/i }))
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000) })
+    expect(screen.getByRole('button', { name: /starting/i })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument()
+
+    await act(async () => {
+      startRequest.reject(new Error('Download start timed out.'))
+      await startRequest.promise.catch(() => {})
+    })
+    expect(screen.getByRole('button', { name: /retry/i })).toBeEnabled()
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test('does not let unrelated mutation errors clear an in-flight download start', () => {
+  const startRequest = deferred()
+  let hookState = baseState({
+    downloadModel: vi.fn(() => startRequest.promise),
+    models: [model()],
+  })
+  useModelsMock.mockImplementation(() => hookState)
+
+  const view = renderModels()
+  fireEvent.click(screen.getByRole('button', { name: /^download$/i }))
+  expect(screen.getByRole('button', { name: /starting/i })).toBeDisabled()
+
+  hookState = { ...hookState, error: 'Delete is blocked by the active runtime.' }
+  view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+
+  expect(screen.getByText('Delete is blocked by the active runtime.')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /starting/i })).toBeDisabled()
+  expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument()
+})
+
 test('disables model actions and hides Delete while that model is working', () => {
   useModelsMock.mockReturnValue(baseState({
     actionLoading: 'qwen3.5-9b-q4',
@@ -283,6 +404,31 @@ test('disables model actions and hides Delete while that model is working', () =
 
   expect(screen.getByRole('button', { name: /working/i })).toBeDisabled()
   expect(screen.getByRole('button', { name: /model actions/i })).toBeDisabled()
+  expect(screen.queryByRole('button', { name: /delete file/i })).not.toBeInTheDocument()
+})
+
+test('locks every model action while activation is in progress, including rollback and downloads', () => {
+  useModelsMock.mockReturnValue(baseState({
+    actionLoading: 'next-model',
+    actionLoadingModels: ['next-model'],
+    activationLoading: 'next-model',
+    models: [
+      model({ id: 'rollback-model', name: 'Rollback Model', status: 'downloaded' }),
+      model({ id: 'next-model', name: 'Next Model', status: 'downloaded' }),
+      model({ id: 'available-model', name: 'Available Model', status: 'available' }),
+    ],
+  }))
+
+  renderModels()
+
+  expect(screen.getByText('Rollback Model')).toBeInTheDocument()
+  for (const button of screen.getAllByRole('button', { name: /model actions/i })) {
+    expect(button).toBeDisabled()
+  }
+  for (const button of screen.getAllByRole('button', { name: /^run$/i })) {
+    expect(button).toBeDisabled()
+  }
+  expect(screen.getByRole('button', { name: /^download$/i })).toBeDisabled()
   expect(screen.queryByRole('button', { name: /delete file/i })).not.toBeInTheDocument()
 })
 

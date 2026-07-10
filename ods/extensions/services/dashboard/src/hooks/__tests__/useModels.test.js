@@ -125,6 +125,102 @@ describe('useModels', () => {
     expect(postCall[0]).toContain('/download')
   })
 
+  test('aborts a hung download start and releases its pending action for retry', async () => {
+    vi.useFakeTimers()
+    let postCount = 0
+    fetch.mockImplementation((_url, options) => {
+      if (options?.method === 'POST') {
+        postCount += 1
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            const error = new Error('The operation was aborted.')
+            error.name = 'AbortError'
+            reject(error)
+          }, { once: true })
+        })
+      }
+      return Promise.resolve(modelsResponse([{ id: 'new-model', status: 'available' }]))
+    })
+
+    try {
+      const { result } = renderHook(() => useModels())
+      await act(async () => {})
+
+      let firstError
+      let firstDownload
+      act(() => {
+        firstDownload = result.current.downloadModel('new-model').catch((error) => {
+          firstError = error
+        })
+      })
+      expect(result.current.actionLoading).toBe('new-model')
+      expect(postCount).toBe(1)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000)
+        await firstDownload
+      })
+
+      expect(firstError?.message).toMatch(/did not start within 15 seconds/i)
+      expect(result.current.actionLoading).toBeNull()
+      expect(result.current.error).toBeNull()
+
+      let retryDownload
+      act(() => {
+        retryDownload = result.current.downloadModel('new-model').catch(() => {})
+      })
+      expect(postCount).toBe(2)
+      expect(result.current.actionLoading).toBe('new-model')
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000)
+        await retryDownload
+      })
+      expect(result.current.actionLoading).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('keeps unrelated mutation errors separate from download start failures', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    fetch.mockImplementation((_url, options) => {
+      if (options?.method === 'DELETE') {
+        return Promise.resolve({
+          ok: false,
+          json: () => Promise.resolve({ detail: 'Delete is blocked by the active runtime.' }),
+        })
+      }
+      if (options?.method === 'POST') {
+        return Promise.resolve({
+          ok: false,
+          json: () => Promise.resolve({ detail: 'Download service is unavailable.' }),
+        })
+      }
+      return Promise.resolve(modelsResponse([{ id: 'new-model', status: 'available' }]))
+    })
+
+    const { result } = renderHook(() => useModels())
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    await act(async () => {
+      await result.current.deleteModel('old-model')
+    })
+    expect(result.current.error).toBe('Delete is blocked by the active runtime.')
+
+    let downloadError
+    await act(async () => {
+      try {
+        await result.current.downloadModel('new-model')
+      } catch (error) {
+        downloadError = error
+      }
+    })
+
+    expect(downloadError?.message).toBe('Download service is unavailable.')
+    expect(result.current.error).toBe('Delete is blocked by the active runtime.')
+  })
+
   test('clears a pending download when an independent refresh confirms completion', async () => {
     const downloadRequest = deferred()
     let snapshot = [{ id: 'new-model', status: 'available' }]
@@ -568,7 +664,7 @@ describe('useModels', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
       expect(getCount).toBe(2)
 
-      downloadRequest.resolve({ ok: false })
+      downloadRequest.resolve({ ok: true })
       await act(async () => { await downloadPromise })
     } finally {
       vi.useRealTimers()

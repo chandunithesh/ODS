@@ -6,6 +6,19 @@ function isTerminalProgress(progress) {
   return TERMINAL_DOWNLOAD_STATUSES.has(progress?.status)
 }
 
+async function cancelErrorFromResponse(response) {
+  try {
+    const payload = await response.json()
+    const detail = payload?.detail
+    if (typeof detail === 'string' && detail.trim()) return detail
+    if (typeof payload?.error === 'string' && payload.error.trim()) return payload.error
+    if (typeof payload?.message === 'string' && payload.message.trim()) return payload.message
+  } catch {
+    // Fall through to the stable user-facing fallback.
+  }
+  return 'Failed to cancel download.'
+}
+
 /**
  * Hook to poll download progress during model downloads.
  * Returns progress data when a download is active.
@@ -14,14 +27,22 @@ export function useDownloadProgress(pollIntervalMs = 1000) {
   const [progress, setProgress] = useState(null)
   const [isDownloading, setIsDownloading] = useState(false)
   const [completedDownload, setCompletedDownload] = useState(null)
+  const [cancelError, setCancelError] = useState(null)
+  const [isCancelling, setIsCancelling] = useState(false)
   const lastCompleteKeyRef = useRef(null)
+  const progressRequestRef = useRef(0)
+  const latestAppliedProgressRequestRef = useRef(0)
+  const cancelInFlightRef = useRef(false)
 
   const fetchProgress = useCallback(async () => {
+    const requestId = ++progressRequestRef.current
     try {
       const response = await fetch('/api/models/download-status')
       if (!response.ok) return
       
       const data = await response.json()
+      if (requestId < latestAppliedProgressRequestRef.current) return data
+      latestAppliedProgressRequestRef.current = requestId
       
       if (data.status === 'downloading' || data.status === 'verifying') {
         const downloaded = data.bytesDownloaded || 0
@@ -42,6 +63,7 @@ export function useDownloadProgress(pollIntervalMs = 1000) {
         })
       } else if (data.status === 'complete' || data.status === 'idle') {
         setIsDownloading(false)
+        setCancelError(null)
         if (data.status === 'complete') {
           setProgress(null)
           const completeKey = `${data.model || ''}:${data.updatedAt || ''}`
@@ -60,6 +82,7 @@ export function useDownloadProgress(pollIntervalMs = 1000) {
         }
       } else if (TERMINAL_DOWNLOAD_STATUSES.has(data.status)) {
         setIsDownloading(false)
+        setCancelError(null)
         setProgress({
           status: data.status,
           error: data.error || data.message || (data.status === 'cancelled' ? 'Download cancelled' : 'Download failed'),
@@ -74,8 +97,10 @@ export function useDownloadProgress(pollIntervalMs = 1000) {
   }, [])
 
   useEffect(() => {
-    fetchProgress()
+    void fetchProgress()
+  }, [fetchProgress])
 
+  useEffect(() => {
     // Poll frequently only while downloading; otherwise check every 10s.
     // Skip ticks while the tab is hidden — nobody sees the progress bar and
     // the visibility handler below catches state up on return (#1490).
@@ -117,23 +142,34 @@ export function useDownloadProgress(pollIntervalMs = 1000) {
   }
 
   const cancelDownload = useCallback(async () => {
+    if (cancelInFlightRef.current) return null
+    cancelInFlightRef.current = true
+    setIsCancelling(true)
+    setCancelError(null)
     try {
-      await fetch('/api/models/download/cancel', { method: 'POST' })
+      const response = await fetch('/api/models/download/cancel', { method: 'POST' })
+      if (!response.ok) throw new Error(await cancelErrorFromResponse(response))
       return await fetchProgress()
     } catch (err) {
-      console.error('Failed to cancel download:', err)
+      setCancelError(err?.message || 'Failed to cancel download.')
       return null
+    } finally {
+      cancelInFlightRef.current = false
+      setIsCancelling(false)
     }
   }, [fetchProgress])
 
   const clearTerminal = useCallback(() => {
     setProgress(current => isTerminalProgress(current) ? null : current)
+    setCancelError(null)
   }, [])
 
   return {
     isDownloading,
     progress,
     completedDownload,
+    cancelError,
+    isCancelling,
     formatBytes,
     formatEta,
     refresh: fetchProgress,
