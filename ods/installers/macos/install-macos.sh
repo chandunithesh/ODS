@@ -2265,7 +2265,8 @@ for ((idx=0; idx<${#HEALTH_NAMES[@]}; idx++)); do
             fi
         else
             # Host-native service -- poll HTTP on 127.0.0.1.
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" 2>/dev/null || echo "000")
+            HTTP_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+                -o /dev/null -w "%{http_code}" "$URL" 2>/dev/null || echo "000")
             if [[ "$HTTP_CODE" -ge 200 ]] && [[ "$HTTP_CODE" -lt 400 ]]; then
                 HEALTHY=true
                 break
