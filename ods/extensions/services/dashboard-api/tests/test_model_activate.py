@@ -26,6 +26,7 @@ _compose_restart_llama_server = _mod._compose_restart_llama_server
 _launch_native_llama_server = _mod._launch_native_llama_server
 _restart_windows_lemonade = _mod._restart_windows_lemonade
 _is_windows_host_llama_server = _mod._is_windows_host_llama_server
+_restart_windows_native_llama_server = _mod._restart_windows_native_llama_server
 _write_windows_native_litellm_config = _mod._write_windows_native_litellm_config
 
 
@@ -392,6 +393,46 @@ class TestWindowsNativeLlamaServer:
         assert "api_base: http://host.docker.internal:9090/v1" in content
         assert 'model_name: "*"' in content
         assert "request_timeout: 900" in content
+
+    def test_native_restart_uses_stop_process_before_taskkill(self, monkeypatch, tmp_path):
+        install_dir = tmp_path / "install"
+        env_path = install_dir / ".env"
+        model_dir = install_dir / "data" / "models"
+        llama_bin = install_dir / "llama-server" / "llama-server.exe"
+        model_dir.mkdir(parents=True)
+        llama_bin.parent.mkdir(parents=True)
+        model_dir.joinpath("model.gguf").write_text("model", encoding="utf-8")
+        llama_bin.write_text("", encoding="utf-8")
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("GGUF_FILE=model.gguf\nAMD_INFERENCE_PORT=9090\n", encoding="utf-8")
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["script"] = cmd[-1]
+            captured["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        launch_calls = []
+
+        def fake_launch(*args):
+            launch_calls.append(args)
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_mod, "_launch_native_llama_server", fake_launch)
+
+        _restart_windows_native_llama_server(env_path, {
+            "GGUF_FILE": "model.gguf",
+            "AMD_INFERENCE_PORT": "9090",
+        })
+
+        assert "Stop-Process -Id $ProcId -Force" in captured["script"]
+        assert "taskkill.exe /PID $ProcId /F" in captured["script"]
+        assert "taskkill.exe /PID $ProcId /T /F" not in captured["script"]
+        assert captured["env"]["ODS_WIN_LLAMA_PORT"] == "9090"
+        assert launch_calls
 
 
 class TestRestartWindowsLemonade:

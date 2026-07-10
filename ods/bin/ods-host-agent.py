@@ -4183,7 +4183,12 @@ function Stop-ODSLlamaProcessId {
     param([int]$ProcId)
     $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcId) -ErrorAction SilentlyContinue
     if (-not (Test-ODSLlamaProcess $proc)) { return }
-    & taskkill.exe /PID $ProcId /T /F | Out-Null
+    Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    & taskkill.exe /PID $ProcId /F | Out-Null
     for ($i = 0; $i -lt 30; $i++) {
         if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
         Start-Sleep -Milliseconds 500
