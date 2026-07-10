@@ -34,6 +34,16 @@ def test_peer_allowlist_is_loopback_only():
     assert bridge.peer_is_allowed("not-an-ip") is False
 
 
+def test_peer_allowlist_accepts_explicit_vm_address_or_subnet():
+    exact = bridge.parse_allowed_networks(["192.168.64.2"])
+    subnet = bridge.parse_allowed_networks(["192.168.64.0/24"])
+
+    assert bridge.peer_is_allowed("192.168.64.2", exact) is True
+    assert bridge.peer_is_allowed("192.168.64.3", exact) is False
+    assert bridge.peer_is_allowed("192.168.64.3", subnet) is True
+    assert bridge.peer_is_allowed("192.168.65.2", subnet) is False
+
+
 def test_bridge_forwards_loopback_http():
     upstream = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _HttpHandler)
     proxy = bridge.LlmBridgeServer(

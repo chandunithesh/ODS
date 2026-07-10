@@ -174,6 +174,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     log_info "Removing macOS LaunchAgents..."
     for _label in \
         com.ods.llm-bridge \
+        com.ods.host-agent-bridge \
         com.ods.host-agent \
         com.ods.opencode-web \
         com.ods.llama-server \

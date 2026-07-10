@@ -345,17 +345,27 @@ generate_ods_env() {
     langfuse_init_project_id=$(new_secure_hex 16)
     local langfuse_init_user_password
     langfuse_init_user_password=$(new_secure_hex 16)
-    # Colima cannot reliably connect its host gateway to some loopback-only
-    # application listeners. Keep llama-server private on a second port and
-    # place a loopback-peer-filtered bridge on the public ODS inference port.
+    # Colima's user-mode host.docker.internal route can become unreachable
+    # under load. The orchestrator enables its private vmnet address first;
+    # bridge loopback-only host services through that scoped interface.
     local macos_llm_bridge_enabled="false"
+    local macos_host_agent_bridge_enabled="false"
     local native_llama_port="8080"
+    local macos_host_gateway=""
+    local macos_vm_ip=""
+    local agent_host="host.docker.internal"
+    local llm_api_url="http://host.docker.internal:8080"
     if [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]]; then
         macos_llm_bridge_enabled="true"
+        macos_host_agent_bridge_enabled="true"
         native_llama_port="18080"
+        macos_host_gateway="${COLIMA_HOST_IP:-}"
+        macos_vm_ip="${COLIMA_VM_IP:-}"
+        if [[ -n "$macos_host_gateway" ]]; then
+            agent_host="$macos_host_gateway"
+            llm_api_url="http://${macos_host_gateway}:8080"
+        fi
     fi
-    # macOS containers reach the public endpoint via host.docker.internal.
-    local llm_api_url="http://host.docker.internal:8080"
 
     # Host LAN IP — only populated when the operator has pre-set
     # BIND_ADDRESS=0.0.0.0 in the environment (macOS has no --lan flag).
@@ -386,8 +396,8 @@ HOST_LAN_IP=${host_lan_ip}
 # Derived from the macOS LocalHostName/hostname so multiple installs on one LAN
 # do not all collide on auth.ods.local/chat.ods.local.
 ODS_DEVICE_NAME=${device_name}
-# Docker Desktop containers reach loopback-only host services through this name.
-ODS_AGENT_HOST=${ODS_AGENT_HOST:-host.docker.internal}
+# Container route to the loopback-only host agent (private Colima bridge or Docker Desktop helper).
+ODS_AGENT_HOST=${ODS_AGENT_HOST:-${agent_host}}
 
 #=== LLM Backend Mode ===
 ODS_MODE=local
@@ -401,6 +411,9 @@ MINIMAX_API_KEY=
 
 #=== LLM Settings (llama-server -- native Metal) ===
 ODS_MACOS_LLM_BRIDGE_ENABLED=${macos_llm_bridge_enabled}
+ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED=${macos_host_agent_bridge_enabled}
+ODS_MACOS_HOST_GATEWAY=${macos_host_gateway}
+ODS_MACOS_VM_IP=${macos_vm_ip}
 ODS_NATIVE_LLAMA_PORT=${native_llama_port}
 MODEL_PROFILE=${MODEL_PROFILE_REQUESTED:-${MODEL_PROFILE:-qwen}}
 # Effective model profile for this hardware: ${MODEL_PROFILE_EFFECTIVE:-qwen}
@@ -458,8 +471,8 @@ OPENCLAW_PORT=7860
 LANGFUSE_PORT=3006
 
 #=== Hermes Agent ===
-# macOS runs llama-server natively with Metal; containers reach it via host.docker.internal.
-HERMES_LLM_BASE_URL=http://host.docker.internal:8080/v1
+# macOS runs llama-server natively with Metal; containers use the scoped host route above.
+HERMES_LLM_BASE_URL=${llm_api_url}/v1
 HERMES_LLM_API_KEY=sk-ods-hermes-local
 HERMES_LANGUAGE=en
 HERMES_PROXY_PORT=9120

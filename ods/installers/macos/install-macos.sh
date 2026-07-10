@@ -4,9 +4,9 @@
 # ============================================================================
 # Standalone macOS Apple Silicon installer. Does not modify any existing files.
 #
-# macOS: llama-server runs natively with Metal on the host (port 8080).
-#        Everything else runs in Docker. Containers reach llama-server via
-#        host.docker.internal.
+# macOS: llama-server runs natively with Metal on the host. Everything else
+#        runs in Docker. Colima uses a private vmnet bridge because its
+#        host.docker.internal forwarding can become unreachable under load.
 #
 # Usage:
 #   ./install-macos.sh                  # Interactive install
@@ -211,44 +211,117 @@ _compute_launchd_path() {
     printf '%s' "$path_out"
 }
 
-_configure_macos_llm_bridge() {
-    local env_file="${INSTALL_DIR}/.env"
-    local enabled
-    enabled="$(read_env_value "$env_file" "ODS_MACOS_LLM_BRIDGE_ENABLED")"
+COLIMA_VM_IP=""
+COLIMA_HOST_IP=""
 
-    launchctl bootout "gui/$(id -u)/${LLM_BRIDGE_PLIST_LABEL}" >/dev/null 2>&1 || true
-    rm -f "$LLM_BRIDGE_PLIST" 2>/dev/null || true
+_detect_colima_private_network() {
+    local status_json interface_name
+    COLIMA_VM_IP=""
+    COLIMA_HOST_IP=""
+
+    status_json="$(colima status --json 2>>"$ODS_LOG_FILE" || true)"
+    [[ -n "$status_json" ]] || return 1
+    COLIMA_VM_IP="$(printf '%s' "$status_json" | /usr/bin/python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin).get("ip_address", "")
+except (AttributeError, json.JSONDecodeError):
+    value = ""
+print(value if isinstance(value, str) else "")
+' 2>/dev/null || true)"
+    [[ -n "$COLIMA_VM_IP" ]] || return 1
+
+    interface_name="$(/sbin/route -n get "$COLIMA_VM_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+    [[ -n "$interface_name" ]] || return 1
+    COLIMA_HOST_IP="$(/sbin/ifconfig "$interface_name" 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}')"
+    [[ -n "$COLIMA_HOST_IP" ]] || return 1
+
+    COLIMA_VM_IP="$COLIMA_VM_IP" COLIMA_HOST_IP="$COLIMA_HOST_IP" /usr/bin/python3 -c '
+import ipaddress, os
+vm = ipaddress.ip_address(os.environ["COLIMA_VM_IP"])
+host = ipaddress.ip_address(os.environ["COLIMA_HOST_IP"])
+network = ipaddress.ip_network(f"{vm}/24", strict=False)
+valid = vm.version == 4 and host.version == 4 and host != vm and host in network and host.is_private
+raise SystemExit(0 if valid else 1)
+' >/dev/null 2>&1
+}
+
+_ensure_colima_private_network() {
+    [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]] || return 0
+    if ! command -v colima >/dev/null 2>&1; then
+        ai_err "Docker is using Colima, but the colima CLI is not on PATH."
+        return 1
+    fi
+
+    if _detect_colima_private_network; then
+        ai_ok "Colima private host bridge ready (${COLIMA_HOST_IP} <-> ${COLIMA_VM_IP})"
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        ai "[DRY RUN] Would restart Colima with --network-address for private host-service routing"
+        return 0
+    fi
+
+    ai_warn "Colima has no reachable private VM address; restarting it with --network-address."
+    ai_warn "Running non-ODS containers will restart with the Colima VM. Container data is preserved."
+    if ! colima stop >>"$ODS_LOG_FILE" 2>&1 || ! colima start --network-address >>"$ODS_LOG_FILE" 2>&1; then
+        ai_err "Could not enable Colima private networking."
+        ai "  Run: colima stop && colima start --network-address"
+        return 1
+    fi
+
+    local attempt
+    for attempt in $(seq 1 60); do
+        docker info >/dev/null 2>&1 && break
+        sleep 1
+    done
+    if ! docker info >/dev/null 2>&1 || ! _detect_colima_private_network; then
+        ai_err "Colima restarted, but its private host bridge could not be discovered."
+        return 1
+    fi
+    ai_ok "Colima private host bridge enabled (${COLIMA_HOST_IP} <-> ${COLIMA_VM_IP})"
+}
+
+_configure_macos_port_bridge() {
+    local enabled="$1" label="$2" plist="$3" log_path="$4" description="$5"
+    local listen_host="$6" listen_port="$7" target_port="$8" allowed_peer="$9"
+
+    launchctl bootout "gui/$(id -u)/${label}" >/dev/null 2>&1 || true
+    rm -f "$plist" 2>/dev/null || true
     [[ "$enabled" == "true" ]] || return 0
 
     local bridge_script="${INSTALL_DIR}/bin/ods-macos-llm-bridge.py"
-    local listen_port target_port
-    listen_port="$(read_env_value "$env_file" "OLLAMA_PORT")"
-    target_port="$(read_env_value "$env_file" "ODS_NATIVE_LLAMA_PORT")"
-    [[ "$listen_port" =~ ^[0-9]+$ ]] || listen_port="8080"
-    [[ "$target_port" =~ ^[0-9]+$ ]] || target_port="18080"
-
     if [[ ! -f "$bridge_script" ]]; then
-        ai_err "Colima LLM bridge is missing: ${bridge_script}"
+        ai_err "Colima host bridge is missing: ${bridge_script}"
+        return 1
+    fi
+    if [[ -z "$listen_host" || -z "$allowed_peer" ]]; then
+        ai_err "Colima private bridge addresses are missing; re-run with Colima --network-address."
         return 1
     fi
 
     chmod +x "$bridge_script"
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ODS"
-    cat > "$LLM_BRIDGE_PLIST" <<BRIDGE_PLIST_EOF
+    cat > "$plist" <<BRIDGE_PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${LLM_BRIDGE_PLIST_LABEL}</string>
+    <string>${label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
         <string>${bridge_script}</string>
+        <string>--listen-host</string>
+        <string>${listen_host}</string>
         <string>--listen-port</string>
         <string>${listen_port}</string>
         <string>--target-port</string>
         <string>${target_port}</string>
+        <string>--allow-peer</string>
+        <string>${allowed_peer}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${INSTALL_DIR}</string>
@@ -259,32 +332,61 @@ _configure_macos_llm_bridge() {
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>${LLM_BRIDGE_LOG}</string>
+    <string>${log_path}</string>
     <key>StandardErrorPath</key>
-    <string>${LLM_BRIDGE_LOG}</string>
+    <string>${log_path}</string>
 </dict>
 </plist>
 BRIDGE_PLIST_EOF
 
     local bootstrap_err bootstrap_rc
-    bootstrap_err="$(launchctl bootstrap "gui/$(id -u)" "$LLM_BRIDGE_PLIST" 2>&1)" \
+    bootstrap_err="$(launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1)" \
         && bootstrap_rc=0 || bootstrap_rc=$?
     if [[ "$bootstrap_rc" -ne 0 ]]; then
-        ai_err "Colima LLM bridge LaunchAgent failed (rc=${bootstrap_rc}): ${bootstrap_err}"
+        ai_err "${description} LaunchAgent failed (rc=${bootstrap_rc}): ${bootstrap_err}"
         return 1
     fi
-    launchctl kickstart -k "gui/$(id -u)/${LLM_BRIDGE_PLIST_LABEL}" >/dev/null 2>&1 || true
+    launchctl kickstart -k "gui/$(id -u)/${label}" >/dev/null 2>&1 || true
     for _ in $(seq 1 30); do
         if /usr/bin/python3 -c \
-            'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' \
-            "$listen_port" >/dev/null 2>&1; then
-            ai_ok "Colima LLM bridge listening on ${listen_port} -> 127.0.0.1:${target_port}"
+            'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 1).close()' \
+            "$listen_host" "$listen_port" >/dev/null 2>&1; then
+            ai_ok "${description} listening on ${listen_host}:${listen_port} -> 127.0.0.1:${target_port}"
             return 0
         fi
         sleep 0.2
     done
-    ai_err "Colima LLM bridge did not open port ${listen_port}; inspect ${LLM_BRIDGE_LOG}"
+    ai_err "${description} did not open ${listen_host}:${listen_port}; inspect ${log_path}"
     return 1
+}
+
+_configure_macos_llm_bridge() {
+    local env_file="${INSTALL_DIR}/.env"
+    local enabled listen_host allowed_peer
+    enabled="$(read_env_value "$env_file" "ODS_MACOS_LLM_BRIDGE_ENABLED")"
+    local listen_port target_port
+    listen_host="$(read_env_value "$env_file" "ODS_MACOS_HOST_GATEWAY")"
+    allowed_peer="$(read_env_value "$env_file" "ODS_MACOS_VM_IP")"
+    listen_port="$(read_env_value "$env_file" "OLLAMA_PORT")"
+    target_port="$(read_env_value "$env_file" "ODS_NATIVE_LLAMA_PORT")"
+    [[ "$listen_port" =~ ^[0-9]+$ ]] || listen_port="8080"
+    [[ "$target_port" =~ ^[0-9]+$ ]] || target_port="18080"
+    _configure_macos_port_bridge "$enabled" "$LLM_BRIDGE_PLIST_LABEL" \
+        "$LLM_BRIDGE_PLIST" "$LLM_BRIDGE_LOG" "Colima LLM bridge" \
+        "$listen_host" "$listen_port" "$target_port" "$allowed_peer"
+}
+
+_configure_macos_host_agent_bridge() {
+    local env_file="${INSTALL_DIR}/.env"
+    local enabled listen_host allowed_peer agent_port
+    enabled="$(read_env_value "$env_file" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED")"
+    listen_host="$(read_env_value "$env_file" "ODS_MACOS_HOST_GATEWAY")"
+    allowed_peer="$(read_env_value "$env_file" "ODS_MACOS_VM_IP")"
+    agent_port="$(read_env_value "$env_file" "ODS_AGENT_PORT")"
+    [[ "$agent_port" =~ ^[0-9]+$ ]] || agent_port="7710"
+    _configure_macos_port_bridge "$enabled" "$HOST_AGENT_BRIDGE_PLIST_LABEL" \
+        "$HOST_AGENT_BRIDGE_PLIST" "$HOST_AGENT_BRIDGE_LOG" "Colima host-agent bridge" \
+        "$listen_host" "$agent_port" "$agent_port" "$allowed_peer"
 }
 
 _opencode_candidate_is_file() {
@@ -538,6 +640,10 @@ if ! $DOCKER_RUNNING; then
     exit 1
 fi
 ai_ok "Docker daemon ready (v${DOCKER_VERSION}, backend=${DOCKER_BACKEND:-unknown})"
+
+if ! _ensure_colima_private_network; then
+    exit 1
+fi
 
 # Pre-flight the docker daemon's CPU allocation. Trip early with a clear
 # message rather than letting compose fail after pulls/builds. If the user
@@ -1005,13 +1111,26 @@ else
     env_existed=false
     [[ -f "${INSTALL_DIR}/.env" ]] && env_existed=true
     generate_ods_env "$INSTALL_DIR" "$SELECTED_TIER" "$FORCE"
-    if [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]] && ! $CLOUD_MODE; then
-        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_LLM_BRIDGE_ENABLED" "true"
-        upsert_env_value "${INSTALL_DIR}/.env" "ODS_NATIVE_LLAMA_PORT" "18080"
+    if [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]]; then
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_HOST_GATEWAY" "$COLIMA_HOST_IP"
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_VM_IP" "$COLIMA_VM_IP"
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED" "true"
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_AGENT_HOST" "$COLIMA_HOST_IP"
+        if ! $CLOUD_MODE; then
+            upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_LLM_BRIDGE_ENABLED" "true"
+            upsert_env_value "${INSTALL_DIR}/.env" "ODS_NATIVE_LLAMA_PORT" "18080"
+            upsert_env_value "${INSTALL_DIR}/.env" "LLM_API_URL" "http://${COLIMA_HOST_IP}:8080"
+            upsert_env_value "${INSTALL_DIR}/.env" "HERMES_LLM_BASE_URL" "http://${COLIMA_HOST_IP}:8080/v1"
+        else
+            upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_LLM_BRIDGE_ENABLED" "false"
+        fi
     else
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED" "false"
         upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_LLM_BRIDGE_ENABLED" "false"
         upsert_env_value "${INSTALL_DIR}/.env" "ODS_NATIVE_LLAMA_PORT" "8080"
     fi
+    CONTAINER_LLM_URL="$(read_env_value "${INSTALL_DIR}/.env" "LLM_API_URL")"
+    [[ -n "$CONTAINER_LLM_URL" ]] || CONTAINER_LLM_URL="http://host.docker.internal:8080"
     if $env_existed && ! $FORCE; then
         ai_ok "Preserved existing .env (use --force to regenerate secrets)"
     else
@@ -1038,7 +1157,7 @@ else
         openclaw_existed=false
         [[ -f "${INSTALL_DIR}/data/openclaw/home/openclaw.json" ]] && openclaw_existed=true
         generate_openclaw_config "$INSTALL_DIR" "$LLM_MODEL" "$MAX_CONTEXT" \
-            "$ENV_OPENCLAW_TOKEN" "http://host.docker.internal:8080" "$FORCE"
+            "$ENV_OPENCLAW_TOKEN" "$CONTAINER_LLM_URL" "$FORCE"
         if $openclaw_existed && ! $FORCE; then
             ai_ok "Preserved existing OpenClaw config (use --force to regenerate)"
         else
@@ -1136,7 +1255,7 @@ else
     # `base_url: "http://llama-server:8080/v1"`, which only resolves
     # inside the ods compose bridge. On macOS llama-server
     # runs native on the host (Metal binary, port 8080), so the
-    # Hermes container reaches it via host.docker.internal — and
+    # Hermes container reaches it through the scoped macOS host route — and
     # crucially `model.base_url` in cli-config.yaml WINS over the
     # OPENAI_BASE_URL env compose.yaml sets, so the env override the
     # Linux path relies on doesn't help here.
@@ -1146,11 +1265,11 @@ else
     # rather than the friendly "qwen3.5-9b" the template ships with).
     # This must run for all local macOS installs, not only bootstrap mode:
     # Tier 0, offline/no-bootstrap, and already-downloaded full models need
-    # the same host.docker.internal base_url.
+    # the same container-visible base_url.
     if ! $CLOUD_MODE; then
         _hermes_tpl="${INSTALL_DIR}/extensions/services/hermes/cli-config.yaml.template"
         if [[ -f "$_hermes_tpl" ]]; then
-            _hermes_base_url="http://host.docker.internal:${OLLAMA_PORT:-8080}/v1"
+            _hermes_base_url="${CONTAINER_LLM_URL%/}/v1"
             _hermes_patcher="${INSTALL_DIR}/scripts/patch-hermes-config.py"
             if [[ -f "$_hermes_patcher" ]]; then
                 python3 "$_hermes_patcher" "$_hermes_tpl" \
@@ -1174,10 +1293,10 @@ else
                     -e "s|^    context_length: .*|    context_length: ${MAX_CONTEXT}|" \
                     "$_hermes_tpl"
             fi
-            if grep -q "host.docker.internal" "$_hermes_tpl" && \
+            if grep -Fq "base_url: \"${_hermes_base_url}\"" "$_hermes_tpl" && \
                grep -q "^  default: \"${GGUF_FILE}\"$" "$_hermes_tpl" && \
                grep -q "^  context_length: ${MAX_CONTEXT}$" "$_hermes_tpl"; then
-                ai_ok "Patched Hermes config for macOS (model=${GGUF_FILE}, context=${MAX_CONTEXT}, base_url=host.docker.internal)"
+                ai_ok "Patched Hermes config for macOS (model=${GGUF_FILE}, context=${MAX_CONTEXT}, base_url=${_hermes_base_url})"
             else
                 ai_warn "Hermes template patch incomplete — Hermes may fail to reach llama-server. Hand-edit ${_hermes_tpl} if prompts hang."
             fi
@@ -1569,6 +1688,8 @@ else
     # (ODS_HOME pointing at the deleted install dir).  Clearing them
     # here guarantees a clean slate regardless of what happens below.
     launchctl bootout "gui/$(id -u)/${ODS_AGENT_PLIST_LABEL}" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/${HOST_AGENT_BRIDGE_PLIST_LABEL}" 2>/dev/null || true
+    rm -f "$HOST_AGENT_BRIDGE_PLIST" 2>/dev/null || true
     launchctl bootout "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" 2>/dev/null || true
     for _legacy_plist_label in \
         com.ods.llama-server \
@@ -2055,6 +2176,34 @@ else
     [[ -z "$AGENT_PYTHON" ]] && ai_warn "python3 not found, host agent not installed"
 fi
 
+if ! _configure_macos_host_agent_bridge; then
+    exit 1
+fi
+_agent_bridge_enabled="$(read_env_value "$INSTALL_DIR/.env" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED")"
+if [[ "$_agent_bridge_enabled" == "true" ]]; then
+    _agent_bridge_host="$(read_env_value "$INSTALL_DIR/.env" "ODS_MACOS_HOST_GATEWAY")"
+    _agent_bridge_port="$(read_env_value "$INSTALL_DIR/.env" "ODS_AGENT_PORT")"
+    _agent_bridge_key="$(read_env_value "$INSTALL_DIR/.env" "ODS_AGENT_KEY")"
+    [[ "$_agent_bridge_port" =~ ^[0-9]+$ ]] || _agent_bridge_port="7710"
+    _agent_bridge_ready=false
+    for _agent_bridge_i in $(seq 1 20); do
+        if docker exec ods-dashboard-api curl -fsS --max-time 2 \
+            -H "Authorization: Bearer ${_agent_bridge_key}" \
+            "http://${_agent_bridge_host}:${_agent_bridge_port}/health" >/dev/null 2>&1; then
+            _agent_bridge_ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$_agent_bridge_ready" != "true" ]]; then
+        ai_err "Dashboard container cannot reach the host agent through ${_agent_bridge_host}:${_agent_bridge_port}."
+        ai "  Host log:   $HOME/Library/Logs/ODS/ods-host-agent.log"
+        ai "  Bridge log: $HOST_AGENT_BRIDGE_LOG"
+        exit 1
+    fi
+    ai_ok "Dashboard container reached the host agent through the private Colima bridge"
+fi
+
 # ============================================================================
 # PHASE 6 -- VERIFICATION
 # ============================================================================
@@ -2184,7 +2333,7 @@ fi
 # ── Auto-configure Perplexica ──
 ai "Configuring Perplexica..."
 PERPLEXICA_MODEL="${GGUF_FILE:-$LLM_MODEL}"
-if configure_perplexica 3004 "$PERPLEXICA_MODEL" "${LLM_API_URL:-http://host.docker.internal:8080}" "no-key"; then
+if configure_perplexica 3004 "$PERPLEXICA_MODEL" "${CONTAINER_LLM_URL:-http://host.docker.internal:8080}" "no-key"; then
     ai_ok "Perplexica configured (model: ${PERPLEXICA_MODEL})"
 else
     ai_warn "Perplexica auto-config skipped -- complete setup at http://localhost:3004"

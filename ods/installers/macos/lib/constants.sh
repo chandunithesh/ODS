@@ -48,6 +48,9 @@ LLAMA_SERVER_LOG="${ODS_INSTALL_DIR}/data/llama-server.log"
 LLM_BRIDGE_PLIST_LABEL="com.ods.llm-bridge"
 LLM_BRIDGE_PLIST="$HOME/Library/LaunchAgents/${LLM_BRIDGE_PLIST_LABEL}.plist"
 LLM_BRIDGE_LOG="$HOME/Library/Logs/ODS/ods-llm-bridge.log"
+HOST_AGENT_BRIDGE_PLIST_LABEL="com.ods.host-agent-bridge"
+HOST_AGENT_BRIDGE_PLIST="$HOME/Library/LaunchAgents/${HOST_AGENT_BRIDGE_PLIST_LABEL}.plist"
+HOST_AGENT_BRIDGE_LOG="$HOME/Library/Logs/ODS/ods-host-agent-bridge.log"
 
 # llama.cpp release for macOS Metal build (update when new releases ship)
 LLAMA_CPP_RELEASE_TAG="b8210"

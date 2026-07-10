@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-filtered TCP bridge for Colima to reach macOS-native llama-server."""
+"""Peer-filtered TCP bridge from Colima to a loopback-only macOS service."""
 
 from __future__ import annotations
 
@@ -10,16 +10,31 @@ import signal
 import socket
 import socketserver
 import threading
+from collections.abc import Iterable
+from typing import Union
 
 logger = logging.getLogger("ods-macos-llm-bridge")
+AllowedNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 
-def peer_is_allowed(address: str) -> bool:
-    """Only local forwarding helpers may cross the wildcard listener."""
+def parse_allowed_networks(values: Iterable[str]) -> tuple[AllowedNetwork, ...]:
+    """Parse explicit peer addresses or CIDRs into an immutable allowlist."""
+    networks = []
+    for value in values:
+        networks.append(ipaddress.ip_network(value, strict=False))
+    return tuple(networks)
+
+
+def peer_is_allowed(
+    address: str,
+    allowed_networks: Iterable[AllowedNetwork] = (),
+) -> bool:
+    """Allow host loopback helpers plus explicitly configured VM peers."""
     try:
-        return ipaddress.ip_address(address).is_loopback
+        peer = ipaddress.ip_address(address)
     except ValueError:
         return False
+    return peer.is_loopback or any(peer in network for network in allowed_networks)
 
 
 def _pump(source: socket.socket, destination: socket.socket) -> None:
@@ -41,8 +56,8 @@ def _pump(source: socket.socket, destination: socket.socket) -> None:
 class LlmBridgeHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         peer = str(self.client_address[0])
-        if not peer_is_allowed(peer):
-            logger.warning("Rejected non-loopback bridge client %s", peer)
+        if not peer_is_allowed(peer, self.server.allowed_networks):  # type: ignore[attr-defined]
+            logger.warning("Rejected bridge client outside the peer allowlist: %s", peer)
             return
 
         server = self.server
@@ -82,8 +97,10 @@ class LlmBridgeServer(socketserver.ThreadingTCPServer):
         self,
         server_address: tuple[str, int],
         target_address: tuple[str, int],
+        allowed_peers: Iterable[str] = (),
     ) -> None:
         self.target_host, self.target_port = target_address
+        self.allowed_networks = parse_allowed_networks(allowed_peers)
         super().__init__(server_address, LlmBridgeHandler)
 
 
@@ -93,10 +110,20 @@ def main() -> None:
     parser.add_argument("--listen-port", type=int, default=8080)
     parser.add_argument("--target-host", default="127.0.0.1")
     parser.add_argument("--target-port", type=int, default=18080)
+    parser.add_argument(
+        "--allow-peer",
+        action="append",
+        default=[],
+        help="Allowed peer IP or CIDR; may be repeated (loopback is always allowed)",
+    )
     args = parser.parse_args()
 
-    if args.listen_port == args.target_port:
-        parser.error("listen and target ports must differ")
+    if args.listen_host == args.target_host and args.listen_port == args.target_port:
+        parser.error("listen and target addresses must differ")
+    try:
+        parse_allowed_networks(args.allow_peer)
+    except ValueError as exc:
+        parser.error(f"invalid --allow-peer value: {exc}")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -105,6 +132,7 @@ def main() -> None:
     server = LlmBridgeServer(
         (args.listen_host, args.listen_port),
         (args.target_host, args.target_port),
+        args.allow_peer,
     )
 
     def request_shutdown(signum, _frame) -> None:
@@ -114,9 +142,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
     logger.info(
-        "Listening on %s:%d for loopback peers; forwarding to %s:%d",
+        "Listening on %s:%d for loopback plus %s; forwarding to %s:%d",
         args.listen_host,
         args.listen_port,
+        ", ".join(args.allow_peer) or "no explicit peers",
         args.target_host,
         args.target_port,
     )
