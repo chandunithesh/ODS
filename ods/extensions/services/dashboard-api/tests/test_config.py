@@ -5,7 +5,12 @@ import logging
 import pytest
 
 import config
-from config import _detect_container_default_gateway, load_extension_manifests, _read_manifest_file
+from config import (
+    _apply_host_native_llm_service_override,
+    _detect_container_default_gateway,
+    load_extension_manifests,
+    _read_manifest_file,
+)
 
 
 VALID_MANIFEST = """\
@@ -94,6 +99,37 @@ class TestHostAgentResolution:
         monkeypatch.setattr(config, "_detect_container_default_gateway", lambda: "192.168.1.1")
 
         assert config._resolve_agent_host() == "host.docker.internal"
+
+
+class TestHostNativeLlmResolution:
+
+    def test_routes_windows_amd_host_runtime_to_ollama_url(self):
+        services = {"llama-server": {"host": "llama-server", "port": 8080}}
+        env = {
+            "AMD_INFERENCE_LOCATION": "host",
+            "AMD_INFERENCE_PORT": "9090",
+            "OLLAMA_URL": "http://host.docker.internal:9090/v1",
+        }
+
+        _apply_host_native_llm_service_override(services, "amd", env)
+
+        assert services["llama-server"]["host"] == "host.docker.internal"
+        assert services["llama-server"]["port"] == 9090
+
+    @pytest.mark.parametrize(
+        ("backend", "location"),
+        [("nvidia", "host"), ("amd", "container"), ("amd", "external")],
+    )
+    def test_leaves_non_host_native_services_unchanged(self, backend, location):
+        services = {"llama-server": {"host": "llama-server", "port": 8080}}
+
+        _apply_host_native_llm_service_override(
+            services,
+            backend,
+            {"AMD_INFERENCE_LOCATION": location, "OLLAMA_URL": "http://host.docker.internal:9090"},
+        )
+
+        assert services["llama-server"] == {"host": "llama-server", "port": 8080}
 
 
 class TestLoadExtensionManifests:
