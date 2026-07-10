@@ -63,6 +63,7 @@ check 'HERMES_AGENT_IMAGE_FALLBACK' "$INSTALL_PS1" "installer supports Hermes im
 check 'Validating Hermes Agent image tag before startup' "$INSTALL_PS1" "installer validates Hermes image before compose up"
 check 'ImageEnvName = "LLAMA_SERVER_IMAGE"' "$INSTALL_PS1" "image validation labels override env var"
 check 'Used user'\''s default Docker config for local image builds' "$INSTALL_PS1" "installer records default Docker config build fallback"
+check 'Continuing Compose preflight and service launch with the user'\''s default Docker config' "$INSTALL_PS1" "installer carries Docker fallback through preflight and launch"
 check 'Remove-Item Env:DOCKER_CONFIG' "$INSTALL_PS1" "installer can clear scoped Docker config for fallback builds"
 check '$_probeImage = "alpine:3.20"' "$PRE_SCRIPT" "preflight uses pinned Alpine probe image"
 check '$_inspectExit = $LASTEXITCODE' "$PRE_SCRIPT" "preflight captures inspect exit before deciding to pull"
@@ -89,7 +90,33 @@ if command -v pwsh >/dev/null 2>&1; then
     INSTALL_DIR="$TMP_DIR/ods"
     mkdir -p "$TMP_DIR/bin" "$INSTALL_DIR/logs"
 
-    cat > "$TMP_DIR/bin/docker" <<'EOF'
+    if [[ "${OS:-}" == "Windows_NT" ]]; then
+        cat > "$TMP_DIR/bin/docker.cmd" <<'EOF'
+@echo off
+if /I "%~1"=="version" (
+  echo Docker version 29.2.1
+  exit /b 0
+)
+if /I "%~1"=="info" (
+  echo Server Version: 29.2.1
+  exit /b 0
+)
+set args=%*
+echo %args% | findstr /I /C:"compose" >nul || exit /b 0
+echo %args% | findstr /I /C:"config" >nul || goto :check_ps
+echo services:
+echo   dashboard-api:
+echo     environment:
+echo       DASHBOARD_API_KEY: super-secret-dashboard-key
+echo       OPENCLAW_TOKEN: super-secret-openclaw-token
+exit /b 0
+:check_ps
+echo %args% | findstr /I /C:"ps -a" >nul || exit /b 0
+echo NAME IMAGE COMMAND SERVICE CREATED STATUS PORTS
+exit /b 0
+EOF
+    else
+        cat > "$TMP_DIR/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == "version" ]]; then
   echo "Docker version 29.2.1"
@@ -115,7 +142,8 @@ if [[ "$1" == "compose" ]]; then
 fi
 exit 0
 EOF
-    chmod +x "$TMP_DIR/bin/docker"
+        chmod +x "$TMP_DIR/bin/docker"
+    fi
 
     cat > "$INSTALL_DIR/.env" <<'EOF'
 GPU_BACKEND=nvidia
@@ -186,7 +214,8 @@ EOF
             Assert-ODSWindowsComposeCwd -InstallDir $env:INSTALL_DIR
             Write-ODSWindowsComposeLaunchRecord -InstallDir $env:INSTALL_DIR `
                 -ComposeFlags @("--env-file", ".env", "-f", "docker-compose.base.yml") `
-                -ComposeArgs @("up", "-d", "--remove-orphans", "--no-build", "--pull", "never")
+                -ComposeArgs @("up", "-d", "--remove-orphans", "--no-build", "--pull", "never") `
+                -DockerClientArgs @("--config", $expectedDockerConfig)
         }
         finally {
             [Environment]::CurrentDirectory = $previous
@@ -196,14 +225,17 @@ EOF
         $record = Join-Path $env:INSTALL_DIR "logs\compose-launch.txt"
         if (-not (Test-Path $record)) { throw "launch record not created" }
         $text = Get-Content $record -Raw
+        $normalizedText = $text.Replace("\", "/")
+        $normalizedInstallDir = $env:INSTALL_DIR.Replace("\", "/")
+        $normalizedDockerConfig = $expectedDockerConfig.Replace("\", "/")
         foreach ($needle in @(
-            "cwd=$env:INSTALL_DIR",
-            "dotnet_cwd=$env:INSTALL_DIR",
-            "docker_config=$expectedDockerConfig",
-            "compose_command=docker --config `"$expectedDockerConfig`" compose --env-file .env -f docker-compose.base.yml up -d --remove-orphans --no-build --pull never",
+            "cwd=$normalizedInstallDir",
+            "dotnet_cwd=$normalizedInstallDir",
+            "docker_config=$normalizedDockerConfig",
+            "compose_command=docker --config `"$normalizedDockerConfig`" compose --env-file .env -f docker-compose.base.yml up -d --remove-orphans --no-build --pull never",
             "compose_ps_command=cd"
         )) {
-            if (-not $text.Contains($needle)) { throw "missing $needle" }
+            if (-not $normalizedText.Contains($needle)) { throw "missing $needle" }
         }
     '; then
         pass "PowerShell compose launch record captures install-dir cwd"

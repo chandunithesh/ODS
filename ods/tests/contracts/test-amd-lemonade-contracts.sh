@@ -262,6 +262,16 @@ else
     fail "amd.json: Windows Lemonade MSI contract missing"
 fi
 
+echo "[contract] Windows Lemonade follows the normal per-user install contract"
+if grep -q 'INSTALLDIR=' installers/windows/install-windows.ps1 \
+   && ! grep -q 'ALLUSERS=1' installers/windows/install-windows.ps1 \
+   && grep -q 'LOCALAPPDATA' installers/windows/lib/backend-contract.ps1 \
+   && grep -q 'LOCALAPPDATA' bin/ods-host-agent.py; then
+    pass "Windows Lemonade uses and resolves the per-user MSI install location"
+else
+    fail "Windows Lemonade must use the non-elevated per-user MSI install location across lifecycle paths"
+fi
+
 # ---------------------------------------------------------------------------
 # 14. Linux AMD image consumers use the same Lemonade image pin
 # ---------------------------------------------------------------------------

@@ -377,29 +377,43 @@ if ($dryRun) {
                 if ($lemonadeChoice -match "^[Yy]") {
                     Write-AI "Installing AMD Lemonade Server..."
                     $msiPath = Join-Path $env:TEMP $script:LEMONADE_MSI_FILE
+                    $lemonadeInstallDir = Get-ODSLemonadeUserInstallDir
+                    $lemonadeMsiLog = Join-Path (Join-Path $installDir "logs") "lemonade-msi-install.log"
                     $dlOk = Invoke-DownloadWithRetry -Url $script:LEMONADE_MSI_URL `
                         -Destination $msiPath -Label "Downloading Lemonade Server (~3MB)"
                     if ($dlOk) {
-                        $msiArgs = "/i `"$msiPath`" /quiet /norestart ALLUSERS=1"
-                        $msiProc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -NoNewWindow -PassThru
-                        $_msiExit = $(if ($msiProc) { [int]$msiProc.ExitCode } else { 0 })
-                        if ($_msiExit -eq 0) {
-                            $_resolvedLemonadeExe = Resolve-ODSLemonadeExe -ExecutableName ([string]$amdLemonadeRuntime.windows_executable)
-                            if ($_resolvedLemonadeExe) { $script:LEMONADE_EXE = $_resolvedLemonadeExe }
-                            if (Test-Path $script:LEMONADE_EXE) {
-                                Write-AISuccess "AMD Lemonade Server installed"
-                                $useLemonade = $true
-                            } else {
-                                Write-AIWarn "Lemonade MSI completed, but no Lemonade executable was found in the known install roots."
-                                $_candidateSample = @(Get-ODSLemonadeExeCandidatePaths -ExecutableName ([string]$amdLemonadeRuntime.windows_executable) | Select-Object -First 6)
-                                if ($_candidateSample.Count -gt 0) {
-                                    Write-AI "  Checked paths include: $($_candidateSample -join '; ')"
+                        if ([string]::IsNullOrWhiteSpace($lemonadeInstallDir)) {
+                            Write-AIWarn "Could not determine the current user's Lemonade install directory."
+                            Write-AI "  Falling back to llama-server (Vulkan)."
+                        } else {
+                            $lemonadeMsiLogDir = Split-Path -Parent $lemonadeMsiLog
+                            New-Item -ItemType Directory -Path $lemonadeMsiLogDir -Force | Out-Null
+                            Remove-Item -LiteralPath $lemonadeMsiLog -Force -ErrorAction SilentlyContinue
+                            # Keep Lemonade in its supported per-user location. ODS installs from a
+                            # normal PowerShell and must not require an all-users MSI elevation.
+                            $msiArgs = "/i `"$msiPath`" /quiet /norestart INSTALLDIR=`"$lemonadeInstallDir`" /L*V `"$lemonadeMsiLog`""
+                            $msiProc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -NoNewWindow -PassThru
+                            $_msiExit = $(if ($msiProc) { [int]$msiProc.ExitCode } else { 0 })
+                            if ($_msiExit -eq 0) {
+                                $_resolvedLemonadeExe = Resolve-ODSLemonadeExe -ExecutableName ([string]$amdLemonadeRuntime.windows_executable)
+                                if ($_resolvedLemonadeExe) { $script:LEMONADE_EXE = $_resolvedLemonadeExe }
+                                if (Test-Path $script:LEMONADE_EXE) {
+                                    Write-AISuccess "AMD Lemonade Server installed"
+                                    $useLemonade = $true
+                                } else {
+                                    Write-AIWarn "Lemonade MSI completed, but no Lemonade executable was found in the known install roots."
+                                    Write-AI "  Expected per-user location: $lemonadeInstallDir"
+                                    $_candidateSample = @(Get-ODSLemonadeExeCandidatePaths -ExecutableName ([string]$amdLemonadeRuntime.windows_executable) | Select-Object -First 6)
+                                    if ($_candidateSample.Count -gt 0) {
+                                        Write-AI "  Checked paths include: $($_candidateSample -join '; ')"
+                                    }
+                                    Write-AI "  Falling back to llama-server (Vulkan)."
                                 }
+                            } else {
+                                Write-AIWarn "Lemonade MSI exited with code $_msiExit."
+                                Write-AI "  Verbose MSI log: $lemonadeMsiLog"
                                 Write-AI "  Falling back to llama-server (Vulkan)."
                             }
-                        } else {
-                            Write-AIWarn "Lemonade MSI exited with code $_msiExit."
-                            Write-AI "  Falling back to llama-server (Vulkan)."
                         }
                     } else {
                         Write-AIWarn "Lemonade download failed. Falling back to llama-server (Vulkan)."
@@ -909,7 +923,8 @@ litellm_settings:
             param(
                 [string]$InstallDir,
                 [string[]]$ComposeFlags,
-                [string[]]$ComposeArgs
+                [string[]]$ComposeArgs,
+                [string[]]$DockerClientArgs
             )
 
             $logDir = Join-Path $InstallDir "logs"
@@ -917,7 +932,12 @@ litellm_settings:
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
             }
             $recordPath = Join-Path $logDir "compose-launch.txt"
-            $dockerPrefix = "docker --config `"$($env:DOCKER_CONFIG)`""
+            $dockerConfig = "default"
+            $dockerPrefix = "docker"
+            if ($DockerClientArgs.Count -ge 2 -and $DockerClientArgs[0] -eq "--config") {
+                $dockerConfig = $DockerClientArgs[1]
+                $dockerPrefix = "docker --config `"$dockerConfig`""
+            }
             $composeCommand = ("$dockerPrefix compose " + (($ComposeFlags + $ComposeArgs) -join " ")).Trim()
             $composeFiles = New-Object System.Collections.Generic.List[string]
             for ($i = 0; $i -lt $ComposeFlags.Count; $i++) {
@@ -931,7 +951,7 @@ litellm_settings:
                 "cwd=$((Get-Location).ProviderPath)",
                 "dotnet_cwd=$([Environment]::CurrentDirectory)",
                 "install_dir=$InstallDir",
-                "docker_config=$($env:DOCKER_CONFIG)",
+                "docker_config=$dockerConfig",
                 "compose_command=$composeCommand",
                 "compose_flags=$($ComposeFlags -join ' ')",
                 "compose_flags_file=$InstallDir\.compose-flags",
@@ -1421,11 +1441,6 @@ litellm_settings:
 
         Assert-ODSWindowsComposeCwd -InstallDir $installDir
         $composeUpArgs = @("up", "-d", "--remove-orphans", "--no-build", "--pull", "never")
-        Write-ODSWindowsComposeLaunchRecord -InstallDir $installDir -ComposeFlags $composeFlags `
-            -ComposeArgs $composeUpArgs
-
-        Write-AI "Running: docker --config `"$($env:DOCKER_CONFIG)`" compose $($composeFlags -join ' ') $($composeUpArgs -join ' ')"
-        Write-AI "Compose working directory: $installDir"
         # PS 5.1 treats ANY stderr output from native commands as NativeCommandError.
         # Silence stderr-as-error so $LASTEXITCODE reflects the real compose exit code.
         # Write output to log file to avoid ForEach-Object pipeline hang on failure.
@@ -1508,6 +1523,9 @@ litellm_settings:
             }
             if ($_defaultDockerConfigServices.Count -gt 0) {
                 Write-AIWarn "Used user's default Docker config for local image builds: $($_defaultDockerConfigServices -join ', ')"
+                Write-AIWarn "Continuing Compose preflight and service launch with the user's default Docker config."
+                $dockerClientArgs = @()
+                Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
             }
             if ($_failedBuildServices.Count -gt 0) {
                 Write-Host ""
@@ -1527,7 +1545,25 @@ litellm_settings:
             }
             Write-AISuccess "Local images rebuilt"
 
-            if (-not (Invoke-ODSWindowsComposeImagePreflight -DockerClientArgs $dockerClientArgs -ComposeFlags $composeFlags -LogPath $_composeLog)) {
+            $composePreflightOk = Invoke-ODSWindowsComposeImagePreflight -DockerClientArgs $dockerClientArgs -ComposeFlags $composeFlags -LogPath $_composeLog
+            if (-not $composePreflightOk -and $dockerClientArgs.Count -gt 0) {
+                Write-AIWarn "Compose image preflight failed with the install-scoped Docker config; retrying with the user's default Docker config."
+                Add-Content -LiteralPath $_composeLog -Value "`n--- retrying Compose image preflight with user's default Docker config after install-scoped config failure ---"
+                $dockerClientArgs = @()
+                Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
+                $composePreflightOk = Invoke-ODSWindowsComposeImagePreflight -DockerClientArgs $dockerClientArgs -ComposeFlags $composeFlags -LogPath $_composeLog
+                if ($composePreflightOk) {
+                    Write-AIWarn "Using the user's default Docker config for Compose preflight and service launch."
+                }
+            }
+
+            Write-ODSWindowsComposeLaunchRecord -InstallDir $installDir -ComposeFlags $composeFlags `
+                -ComposeArgs $composeUpArgs -DockerClientArgs $dockerClientArgs
+            $dockerLaunchLabel = if ($dockerClientArgs.Count -eq 0) { "docker" } else { "docker $($dockerClientArgs -join ' ')" }
+            Write-AI "Running: $dockerLaunchLabel compose $($composeFlags -join ' ') $($composeUpArgs -join ' ')"
+            Write-AI "Compose working directory: $installDir"
+
+            if (-not $composePreflightOk) {
                 Write-ODSComposeDiagnostics -InstallDir $installDir -ComposeFlags $composeFlags `
                     -ComposeArgs $composeUpArgs `
                     -ComposeLogPath $_composeLog `
