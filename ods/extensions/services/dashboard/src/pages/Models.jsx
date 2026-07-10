@@ -21,7 +21,6 @@ import { useDownloadProgress } from '../hooks/useDownloadProgress'
 
 const PAGE_SIZE = 10
 const DOWNLOAD_STATUS_TIMEOUT_MS = 15000
-const CLOUD_MODE_RUN_TITLE = 'Switch ODS to local mode to run this model.'
 const TECH_PANEL_STYLE = {
   background: 'linear-gradient(180deg, rgba(10,10,18,0.96), rgba(7,7,13,0.92))',
   borderColor: 'rgba(255,255,255,0.08)',
@@ -65,6 +64,9 @@ export default function Models() {
     currentModel,
     configuredModel,
     odsMode,
+    configuredMode,
+    canActivateModels,
+    activationModeError,
     recommendationAlternatives,
     loading,
     error,
@@ -241,7 +243,11 @@ export default function Models() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex max-w-full flex-wrap items-center gap-2">
+          <span className="inline-flex min-h-9 max-w-full items-center rounded-lg border border-white/[0.08] bg-black/20 px-3 py-2 text-center text-xs font-medium text-theme-text-secondary">
+            Runtime: {formatModeLabel(odsMode)}
+            {configuredMode !== odsMode ? ` / configured ${formatModeLabel(configuredMode)}` : ''}
+          </span>
           <button
             type="button"
             onClick={() => libraryRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
@@ -265,6 +271,25 @@ export default function Models() {
         <div className="mb-5 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
           {error}
         </div>
+      )}
+
+      {!canActivateModels && (
+        <section className="mb-5 flex flex-col gap-3 rounded-xl border border-amber-400/25 bg-amber-500/10 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-start gap-3">
+            <AlertCircle size={18} className="mt-0.5 shrink-0 text-amber-300" />
+            <div>
+              <p className="text-sm font-semibold text-amber-100">Local model runtime unavailable</p>
+              <p className="mt-1 text-sm text-amber-100/75">{activationModeError}</p>
+              <p className="mt-1 text-xs text-amber-100/60">Model downloads and deletion remain available.</p>
+            </div>
+          </div>
+          <Link
+            to="/settings"
+            className="inline-flex h-8 shrink-0 items-center justify-center rounded-md border border-amber-200/20 bg-black/20 px-3 text-xs font-semibold text-amber-100 transition-colors hover:border-amber-200/40"
+          >
+            Review runtime settings
+          </Link>
+        </section>
       )}
 
       {visibleDownloadProgress && (
@@ -349,7 +374,7 @@ export default function Models() {
                       key={rowId}
                       model={model}
                       gpu={gpu}
-                      odsMode={odsMode}
+                      canActivateModels={canActivateModels}
                       isCurrentModel={model.id === currentModel}
                       isLoading={pendingModelActions.includes(model.id)}
                       loadBusy={pendingModelActions.length > 0}
@@ -599,7 +624,7 @@ function FilterChip({ active, onClick, children }) {
 function ModelTableRow({
   model,
   gpu,
-  odsMode,
+  canActivateModels,
   isCurrentModel,
   isLoading,
   loadBusy,
@@ -615,7 +640,6 @@ function ModelTableRow({
 }) {
   const isLoaded = model.status === 'loaded' || isCurrentModel
   const isDownloaded = model.status === 'downloaded'
-  const cloudMode = odsMode === 'cloud'
   const memory = getMemoryMeta(model, gpu)
   const compatibility = getCompatibilityMeta(model, memory)
   const speed = getSpeedDisplay(model)
@@ -649,7 +673,7 @@ function ModelTableRow({
       <div className="self-center">
         <PrimaryAction
           model={model}
-          odsMode={odsMode}
+          canActivateModels={canActivateModels}
           isLoaded={isLoaded}
           isDownloaded={isDownloaded}
           isLoading={isLoading}
@@ -679,14 +703,17 @@ function ModelTableRow({
               <MenuButton onClick={onBenchmark} icon={RefreshCw}>Benchmark</MenuButton>
             )}
             {isDownloaded && !isLoaded && (
-              <MenuButton
-                onClick={onLoad}
-                icon={Play}
-                disabled={cloudMode || !model.fitsVram || loadBusy}
-                title={cloudMode ? CLOUD_MODE_RUN_TITLE : undefined}
-              >
-                Run model
-              </MenuButton>
+              canActivateModels ? (
+                <MenuButton
+                  onClick={onLoad}
+                  icon={Play}
+                  disabled={!model.fitsVram || loadBusy}
+                >
+                  Run model
+                </MenuButton>
+              ) : (
+                <MenuLink to="/settings" icon={AlertCircle}>Review runtime mode</MenuLink>
+              )
             )}
             {model.status === 'available' && (
               <MenuButton onClick={onDownload} icon={Download} disabled={downloadBusy}>Download</MenuButton>
@@ -733,7 +760,7 @@ function ModelTableRow({
 
 function PrimaryAction({
   model,
-  odsMode,
+  canActivateModels,
   isLoaded,
   isDownloaded,
   isLoading,
@@ -770,14 +797,23 @@ function PrimaryAction({
   }
 
   if (isDownloaded) {
-    const cloudMode = odsMode === 'cloud'
-    const runDisabled = cloudMode || !model.fitsVram || loadBusy || activationBusy
+    if (!canActivateModels) {
+      return (
+        <Link
+          to="/settings"
+          className="inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md border border-amber-300/20 bg-amber-500/10 px-3 text-xs font-semibold text-amber-100 transition-colors hover:border-amber-200/40"
+        >
+          <AlertCircle size={13} />
+          Review mode
+        </Link>
+      )
+    }
+    const runDisabled = !model.fitsVram || loadBusy || activationBusy
     return (
       <button
         type="button"
         onClick={onLoad}
         disabled={runDisabled}
-        title={cloudMode ? CLOUD_MODE_RUN_TITLE : undefined}
         className={`inline-flex h-8 min-w-24 items-center justify-center gap-2 rounded-md px-3 text-xs font-semibold transition-colors ${
           !runDisabled
             ? 'bg-theme-accent text-white shadow-[0_0_18px_rgba(168,85,247,0.32)] hover:bg-theme-accent-hover'
@@ -957,6 +993,24 @@ function MenuButton({ icon: Icon, children, onClick, disabled, danger, title }) 
       {children}
     </button>
   )
+}
+
+function MenuLink({ icon: Icon, children, to }) {
+  return (
+    <Link
+      to={to}
+      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-amber-100 transition-colors hover:bg-amber-500/10"
+    >
+      <Icon size={13} />
+      {children}
+    </Link>
+  )
+}
+
+function formatModeLabel(mode) {
+  if (!mode || mode === 'unknown') return 'Unknown'
+  if (mode === 'lemonade') return 'Lemonade'
+  return `${mode.charAt(0).toUpperCase()}${mode.slice(1)}`
 }
 
 function ModelSpeedVisual({ model, speed, compact = false }) {

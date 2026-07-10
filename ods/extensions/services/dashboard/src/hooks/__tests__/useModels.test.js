@@ -19,7 +19,14 @@ const deferred = () => {
 
 const modelsResponse = (models, overrides = {}) => ({
   ok: true,
-  json: () => Promise.resolve({ models, gpu: null, currentModel: null, ...overrides })
+  json: () => Promise.resolve({
+    models,
+    gpu: null,
+    currentModel: null,
+    odsMode: 'local',
+    configuredMode: 'local',
+    ...overrides,
+  })
 })
 
 describe('useModels', () => {
@@ -39,6 +46,7 @@ describe('useModels', () => {
       currentModel: 'qwen-32b',
       configuredModel: 'qwen-32b',
       odsMode: 'cloud',
+      configuredMode: 'cloud',
       recommendationAlternatives: [{ id: 'qwen-32b', name: 'Qwen2.5 32B' }]
     }
     fetch.mockResolvedValue({
@@ -57,24 +65,31 @@ describe('useModels', () => {
     expect(result.current.currentModel).toBe('qwen-32b')
     expect(result.current.configuredModel).toBe('qwen-32b')
     expect(result.current.odsMode).toBe('cloud')
+    expect(result.current.configuredMode).toBe('cloud')
+    expect(result.current.canActivateModels).toBe(false)
     expect(result.current.recommendationAlternatives[0].id).toBe('qwen-32b')
     expect(result.current.error).toBeNull()
   })
 
-  test('defaults odsMode to local when the models response omits it', async () => {
-    fetch.mockResolvedValue(modelsResponse([]))
+  test('treats a missing runtime mode as unknown and blocks activation', async () => {
+    fetch.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ models: [], gpu: null, currentModel: null }),
+    })
 
     const { result } = renderHook(() => useModels())
 
     await waitFor(() => expect(result.current.loading).toBe(false))
-    expect(result.current.odsMode).toBe('local')
+    expect(result.current.odsMode).toBe('unknown')
+    expect(result.current.configuredMode).toBe('unknown')
+    expect(result.current.canActivateModels).toBe(false)
   })
 
   test('does not send a model activation POST in cloud mode', async () => {
     const target = 'downloaded-model'
     fetch.mockResolvedValue(modelsResponse(
       [{ id: target, status: 'downloaded' }],
-      { odsMode: 'cloud' }
+      { odsMode: 'cloud', configuredMode: 'cloud' }
     ))
 
     const { result } = renderHook(() => useModels())
@@ -87,7 +102,27 @@ describe('useModels', () => {
     const activationPosts = fetch.mock.calls.filter(([, options]) => options?.method === 'POST')
     expect(activationPosts).toHaveLength(0)
     expect(result.current.actionLoading).toBeNull()
-    expect(result.current.error).toBe('Switch ODS to local mode to run this model.')
+    expect(result.current.error).toBe('ODS is running in cloud mode. A local-mode installation is required to run downloaded models.')
+  })
+
+  test('does not activate when effective and configured modes differ', async () => {
+    const target = 'downloaded-model'
+    fetch.mockResolvedValue(modelsResponse(
+      [{ id: target, status: 'downloaded' }],
+      { odsMode: 'local', configuredMode: 'cloud' }
+    ))
+
+    const { result } = renderHook(() => useModels())
+    await waitFor(() => expect(result.current.configuredMode).toBe('cloud'))
+
+    await act(async () => {
+      await result.current.loadModel(target)
+    })
+
+    const activationPosts = fetch.mock.calls.filter(([, options]) => options?.method === 'POST')
+    expect(activationPosts).toHaveLength(0)
+    expect(result.current.canActivateModels).toBe(false)
+    expect(result.current.error).toContain('running in local mode but configured for cloud mode')
   })
 
   test('sets error on fetch failure', async () => {

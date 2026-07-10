@@ -78,6 +78,8 @@ const MODEL_ACTIVATION_POLL_MS = 5000
 // The dashboard API permits the host activation request to run for 600s.
 // Keep the UI lock slightly longer so that deadline can settle before we fail.
 const MODEL_ACTIVATION_TIMEOUT_MS = 610000
+const ODS_MODES = new Set(['local', 'cloud', 'hybrid', 'lemonade'])
+const LOCAL_MODEL_MODES = new Set(['local', 'hybrid', 'lemonade'])
 
 // Named export for dev-only mocking (explicit opt-in via VITE_USE_MOCK_DATA)
 export { getMockModels }
@@ -117,9 +119,21 @@ function conflictActiveModelId(data) {
 }
 
 function normalizeOdsMode(value) {
-  return typeof value === 'string' && value.trim().toLowerCase() === 'cloud'
-    ? 'cloud'
-    : 'local'
+  const mode = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return ODS_MODES.has(mode) ? mode : 'unknown'
+}
+
+function modelActivationModeError(effectiveMode, configuredMode) {
+  if (effectiveMode === 'unknown' || configuredMode === 'unknown') {
+    return 'ODS could not verify the active runtime mode. Repair or restart ODS before running a local model.'
+  }
+  if (effectiveMode !== configuredMode) {
+    return `ODS is running in ${effectiveMode} mode but configured for ${configuredMode} mode. Restart or repair ODS before running a local model.`
+  }
+  if (!LOCAL_MODEL_MODES.has(effectiveMode)) {
+    return 'ODS is running in cloud mode. A local-mode installation is required to run downloaded models.'
+  }
+  return null
 }
 
 export function useModels() {
@@ -127,7 +141,8 @@ export function useModels() {
   const [gpu, setGpu] = useState(USE_MOCK_DATA ? MOCK_GPU : null)
   const [currentModel, setCurrentModel] = useState(USE_MOCK_DATA ? MOCK_CURRENT_MODEL : null)
   const [configuredModel, setConfiguredModel] = useState(USE_MOCK_DATA ? MOCK_CURRENT_MODEL : null)
-  const [odsMode, setOdsMode] = useState('local')
+  const [odsMode, setOdsMode] = useState('unknown')
+  const [configuredMode, setConfiguredMode] = useState('unknown')
   const [recommendationAlternatives, setRecommendationAlternatives] = useState([])
   const [loading, setLoading] = useState(USE_MOCK_DATA ? false : true)
   const [fetchError, setFetchError] = useState(null)
@@ -200,7 +215,9 @@ export function useModels() {
       setGpu(data.gpu)
       setCurrentModel(data.currentModel)
       setConfiguredModel(data.configuredModel ?? null)
-      setOdsMode(normalizeOdsMode(data.odsMode))
+      const effectiveMode = normalizeOdsMode(data.odsMode)
+      setOdsMode(effectiveMode)
+      setConfiguredMode(normalizeOdsMode(data.configuredMode ?? data.odsMode))
       setRecommendationAlternatives(data.recommendationAlternatives ?? [])
       setFetchError(null)
       reconcilePendingActions(data.models)
@@ -281,8 +298,9 @@ export function useModels() {
   }
 
   const loadModel = async (modelId) => {
-    if (odsMode === 'cloud') {
-      setMutationError('Switch ODS to local mode to run this model.')
+    const modeError = modelActivationModeError(odsMode, configuredMode)
+    if (modeError) {
+      setMutationError(modeError)
       return
     }
 
@@ -405,6 +423,7 @@ export function useModels() {
   const actionLoading = activationAction?.modelId ?? latestAction?.modelId ?? null
   const actionLoadingModels = [...new Set(pendingActions.map(action => action.modelId))]
   const error = mutationError || fetchError
+  const activationModeError = modelActivationModeError(odsMode, configuredMode)
 
   return {
     models,
@@ -412,6 +431,9 @@ export function useModels() {
     currentModel,
     configuredModel,
     odsMode,
+    configuredMode,
+    canActivateModels: activationModeError === null,
+    activationModeError,
     recommendationAlternatives,
     loading,
     error,

@@ -41,6 +41,9 @@ function baseState(overrides = {}) {
     currentModel: null,
     configuredModel: null,
     odsMode: 'local',
+    configuredMode: 'local',
+    canActivateModels: true,
+    activationModeError: null,
     recommendationAlternatives: [],
     loading: false,
     error: null,
@@ -196,6 +199,9 @@ test('keeps Download available in cloud mode', () => {
   const downloadModel = vi.fn()
   useModelsMock.mockReturnValue(baseState({
     odsMode: 'cloud',
+    configuredMode: 'cloud',
+    canActivateModels: false,
+    activationModeError: 'ODS is running in cloud mode. A local-mode installation is required to run downloaded models.',
     downloadModel,
     models: [model()],
   }))
@@ -206,6 +212,8 @@ test('keeps Download available in cloud mode', () => {
   fireEvent.click(downloadButton)
 
   expect(downloadModel).toHaveBeenCalledWith('qwen3.5-9b-q4')
+  expect(screen.getByText('Runtime: Cloud')).toBeInTheDocument()
+  expect(screen.getByText(/Model downloads and deletion remain available/i)).toBeInTheDocument()
 })
 
 test('shows terminal download failures with a retry action', async () => {
@@ -432,28 +440,43 @@ test('locks every model action while activation is in progress, including rollba
   expect(screen.queryByRole('button', { name: /delete file/i })).not.toBeInTheDocument()
 })
 
-test('disables primary and menu Run actions in cloud mode', () => {
+test('replaces unusable Run actions with visible runtime settings links', () => {
   const loadModel = vi.fn()
   useModelsMock.mockReturnValue(baseState({
     odsMode: 'cloud',
+    configuredMode: 'cloud',
+    canActivateModels: false,
+    activationModeError: 'ODS is running in cloud mode. A local-mode installation is required to run downloaded models.',
     loadModel,
     models: [model({ status: 'downloaded' })],
   }))
 
   renderModels()
 
-  const primaryRun = screen.getByRole('button', { name: /^run$/i })
-  expect(primaryRun).toBeDisabled()
-  expect(primaryRun).toHaveAttribute('title', 'Switch ODS to local mode to run this model.')
-  fireEvent.click(primaryRun)
+  expect(screen.queryByRole('button', { name: /^run$/i })).not.toBeInTheDocument()
+  expect(screen.getByRole('link', { name: /^review mode$/i })).toHaveAttribute('href', '/settings')
+  expect(screen.getByRole('link', { name: /review runtime settings/i })).toHaveAttribute('href', '/settings')
 
   fireEvent.click(screen.getByRole('button', { name: /model actions/i }))
-  const menuRun = screen.getByRole('button', { name: /run model/i })
-  expect(menuRun).toBeDisabled()
-  expect(menuRun).toHaveAttribute('title', 'Switch ODS to local mode to run this model.')
-  fireEvent.click(menuRun)
+  expect(screen.queryByRole('button', { name: /run model/i })).not.toBeInTheDocument()
+  expect(screen.getByRole('link', { name: /review runtime mode/i })).toHaveAttribute('href', '/settings')
 
   expect(loadModel).not.toHaveBeenCalled()
+})
+
+test('shows effective and configured runtime modes when they differ', () => {
+  useModelsMock.mockReturnValue(baseState({
+    odsMode: 'local',
+    configuredMode: 'cloud',
+    canActivateModels: false,
+    activationModeError: 'ODS is running in local mode but configured for cloud mode. Restart or repair ODS before running a local model.',
+    models: [model({ status: 'downloaded' })],
+  }))
+
+  renderModels()
+
+  expect(screen.getByText('Runtime: Local / configured Cloud')).toBeInTheDocument()
+  expect(screen.getByText(/running in local mode but configured for cloud mode/i)).toBeInTheDocument()
 })
 
 test('treats currentModel as active even if a stale row still says downloaded', () => {
