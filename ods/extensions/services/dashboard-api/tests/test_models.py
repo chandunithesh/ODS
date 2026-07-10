@@ -6,7 +6,10 @@ import importlib
 import asyncio
 import json
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock
 
 from models import GPUInfo
@@ -58,6 +61,42 @@ def test_default_model_discovery_timeout_covers_slow_local_runtime():
     import routers.models as models_router
 
     assert models_router._MODEL_DISCOVERY_TIMEOUT_SECONDS >= 10.0
+
+
+def test_agent_model_status_collapses_concurrent_poll_bursts(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    calls_lock = threading.Lock()
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"status":"downloading","percent":42}'
+
+    def fake_urlopen(_request, timeout):
+        nonlocal calls
+        assert timeout == 5
+        with calls_lock:
+            calls += 1
+        time.sleep(0.05)
+        return _Response()
+
+    monkeypatch.setattr(models_router.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(models_router, "_AGENT_MODEL_STATUS_CACHE_TTL_SECONDS", 1.0)
+    monkeypatch.setattr(models_router, "_agent_model_status_cache_at", 0.0)
+    monkeypatch.setattr(models_router, "_agent_model_status_cache_value", None)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: models_router._get_agent_model_status(), range(16)))
+
+    assert calls == 1
+    assert results == [{"status": "downloading", "percent": 42}] * 16
 
 
 def test_fetch_loaded_model_falls_back_to_models_when_lemonade_health_empty(monkeypatch):

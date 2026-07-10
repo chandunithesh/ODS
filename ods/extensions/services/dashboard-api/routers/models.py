@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -44,6 +45,12 @@ _LIBRARY_PATH = Path(INSTALL_DIR) / "config" / "model-library.json"
 _MODELS_DIR = Path(DATA_DIR) / "models"
 _ENV_PATH = Path(INSTALL_DIR) / ".env"
 _MODEL_DISCOVERY_TIMEOUT_SECONDS = float(os.environ.get("DASHBOARD_MODEL_DISCOVERY_TIMEOUT", "15.0"))
+_AGENT_MODEL_STATUS_CACHE_TTL_SECONDS = float(
+    os.environ.get("DASHBOARD_AGENT_MODEL_STATUS_CACHE_TTL", "0.5")
+)
+_agent_model_status_cache_lock = threading.Lock()
+_agent_model_status_cache_at = 0.0
+_agent_model_status_cache_value: Optional[dict] = None
 _GPU_VRAM_EXCEPTIONS = (
     ImportError,
     FileNotFoundError,
@@ -370,16 +377,31 @@ def model_download_status(api_key: str = Depends(verify_api_key)):
 
 def _get_agent_model_status(timeout: int = 5) -> Optional[dict]:
     """Return host-agent-normalized model download status when reachable."""
-    req = urllib.request.Request(
-        f"{AGENT_URL}/v1/model/status",
-        method="GET",
-        headers={"Authorization": f"Bearer {ODS_AGENT_KEY}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    global _agent_model_status_cache_at, _agent_model_status_cache_value
+
+    now = time.monotonic()
+    if now - _agent_model_status_cache_at < _AGENT_MODEL_STATUS_CACHE_TTL_SECONDS:
+        return _agent_model_status_cache_value
+
+    with _agent_model_status_cache_lock:
+        now = time.monotonic()
+        if now - _agent_model_status_cache_at < _AGENT_MODEL_STATUS_CACHE_TTL_SECONDS:
+            return _agent_model_status_cache_value
+
+        req = urllib.request.Request(
+            f"{AGENT_URL}/v1/model/status",
+            method="GET",
+            headers={"Authorization": f"Bearer {ODS_AGENT_KEY}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = json.loads(resp.read().decode())
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, json.JSONDecodeError):
+            status = None
+
+        _agent_model_status_cache_value = status
+        _agent_model_status_cache_at = time.monotonic()
+        return status
 
 
 def _call_agent_model(path: str, body: dict, timeout: int = 30) -> dict:
