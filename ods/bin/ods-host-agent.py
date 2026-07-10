@@ -3867,6 +3867,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             elif windows_native_llama:
                 llama_host = "127.0.0.1"
                 llama_port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
+            elif gpu_backend == "apple":
+                llama_host = "127.0.0.1"
+                llama_port = env.get("ODS_NATIVE_LLAMA_PORT") or env.get("OLLAMA_PORT") or "8080"
             elif os.environ.get("ODS_HOST_INSTALL_DIR"):
                 llama_host = "ods-llama-server"
                 llama_port = "8080"
@@ -4727,7 +4730,12 @@ def _launch_native_llama_server(env_path: Path, llama_bin: Path, llama_log: Path
     reasoning_fmt = {"off": "none", "on": "deepseek"}.get(reasoning, reasoning)
     # Honour the unified BIND_ADDRESS knob (PR #964); empty/missing → loopback.
     bind_addr = env.get("BIND_ADDRESS", "").strip() or "127.0.0.1"
-    port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
+    port = (
+        env.get("ODS_NATIVE_LLAMA_PORT")
+        or env.get("AMD_INFERENCE_PORT")
+        or env.get("OLLAMA_PORT")
+        or "8080"
+    )
     args = [
         str(llama_bin),
         "--host", bind_addr, "--port", str(port),

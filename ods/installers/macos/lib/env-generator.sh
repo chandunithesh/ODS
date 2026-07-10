@@ -345,7 +345,16 @@ generate_ods_env() {
     langfuse_init_project_id=$(new_secure_hex 16)
     local langfuse_init_user_password
     langfuse_init_user_password=$(new_secure_hex 16)
-    # macOS: llama-server runs natively, containers reach it via host.docker.internal
+    # Colima cannot reliably connect its host gateway to some loopback-only
+    # application listeners. Keep llama-server private on a second port and
+    # place a loopback-peer-filtered bridge on the public ODS inference port.
+    local macos_llm_bridge_enabled="false"
+    local native_llama_port="8080"
+    if [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]]; then
+        macos_llm_bridge_enabled="true"
+        native_llama_port="18080"
+    fi
+    # macOS containers reach the public endpoint via host.docker.internal.
     local llm_api_url="http://host.docker.internal:8080"
 
     # Host LAN IP — only populated when the operator has pre-set
@@ -391,6 +400,8 @@ TOGETHER_API_KEY=
 MINIMAX_API_KEY=
 
 #=== LLM Settings (llama-server -- native Metal) ===
+ODS_MACOS_LLM_BRIDGE_ENABLED=${macos_llm_bridge_enabled}
+ODS_NATIVE_LLAMA_PORT=${native_llama_port}
 MODEL_PROFILE=${MODEL_PROFILE_REQUESTED:-${MODEL_PROFILE:-qwen}}
 # Effective model profile for this hardware: ${MODEL_PROFILE_EFFECTIVE:-qwen}
 LLM_MODEL=${LLM_MODEL}

@@ -211,6 +211,80 @@ _compute_launchd_path() {
     printf '%s' "$path_out"
 }
 
+_configure_macos_llm_bridge() {
+    local env_file="${INSTALL_DIR}/.env"
+    local enabled
+    enabled="$(read_env_value "$env_file" "ODS_MACOS_LLM_BRIDGE_ENABLED")"
+
+    launchctl bootout "gui/$(id -u)/${LLM_BRIDGE_PLIST_LABEL}" >/dev/null 2>&1 || true
+    rm -f "$LLM_BRIDGE_PLIST" 2>/dev/null || true
+    [[ "$enabled" == "true" ]] || return 0
+
+    local bridge_script="${INSTALL_DIR}/bin/ods-macos-llm-bridge.py"
+    local listen_port target_port
+    listen_port="$(read_env_value "$env_file" "OLLAMA_PORT")"
+    target_port="$(read_env_value "$env_file" "ODS_NATIVE_LLAMA_PORT")"
+    [[ "$listen_port" =~ ^[0-9]+$ ]] || listen_port="8080"
+    [[ "$target_port" =~ ^[0-9]+$ ]] || target_port="18080"
+
+    if [[ ! -f "$bridge_script" ]]; then
+        ai_err "Colima LLM bridge is missing: ${bridge_script}"
+        return 1
+    fi
+
+    chmod +x "$bridge_script"
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ODS"
+    cat > "$LLM_BRIDGE_PLIST" <<BRIDGE_PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LLM_BRIDGE_PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>${bridge_script}</string>
+        <string>--listen-port</string>
+        <string>${listen_port}</string>
+        <string>--target-port</string>
+        <string>${target_port}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>${LLM_BRIDGE_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${LLM_BRIDGE_LOG}</string>
+</dict>
+</plist>
+BRIDGE_PLIST_EOF
+
+    local bootstrap_err bootstrap_rc
+    bootstrap_err="$(launchctl bootstrap "gui/$(id -u)" "$LLM_BRIDGE_PLIST" 2>&1)" \
+        && bootstrap_rc=0 || bootstrap_rc=$?
+    if [[ "$bootstrap_rc" -ne 0 ]]; then
+        ai_err "Colima LLM bridge LaunchAgent failed (rc=${bootstrap_rc}): ${bootstrap_err}"
+        return 1
+    fi
+    launchctl kickstart -k "gui/$(id -u)/${LLM_BRIDGE_PLIST_LABEL}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+        if /usr/bin/nc -z 127.0.0.1 "$listen_port" >/dev/null 2>&1; then
+            ai_ok "Colima LLM bridge listening on ${listen_port} -> 127.0.0.1:${target_port}"
+            return 0
+        fi
+        sleep 0.2
+    done
+    ai_err "Colima LLM bridge did not open port ${listen_port}; inspect ${LLM_BRIDGE_LOG}"
+    return 1
+}
+
 _opencode_candidate_is_file() {
     local candidate="$1"
     [[ -n "$candidate" && "$candidate" == /* && -x "$candidate" && ! -d "$candidate" ]]
@@ -929,6 +1003,13 @@ else
     env_existed=false
     [[ -f "${INSTALL_DIR}/.env" ]] && env_existed=true
     generate_ods_env "$INSTALL_DIR" "$SELECTED_TIER" "$FORCE"
+    if [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]] && ! $CLOUD_MODE; then
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_LLM_BRIDGE_ENABLED" "true"
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_NATIVE_LLAMA_PORT" "18080"
+    else
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_MACOS_LLM_BRIDGE_ENABLED" "false"
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_NATIVE_LLAMA_PORT" "8080"
+    fi
     if $env_existed && ! $FORCE; then
         ai_ok "Preserved existing .env (use --force to regenerate secrets)"
     else
@@ -1223,6 +1304,10 @@ else
         fi
         unset _reaped
 
+        if ! _configure_macos_llm_bridge; then
+            exit 1
+        fi
+
         # Read reasoning mode from .env (default off to prevent thinking models
         # from consuming the entire token budget on internal reasoning)
         _reasoning=$(grep '^LLAMA_REASONING=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
@@ -1239,6 +1324,8 @@ else
         # to loopback when unset (default-secure).
         _bind=$(grep '^BIND_ADDRESS=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
         [[ -z "$_bind" ]] && _bind="127.0.0.1"
+        _native_llama_port=$(read_env_value "$INSTALL_DIR/.env" "ODS_NATIVE_LLAMA_PORT")
+        [[ "$_native_llama_port" =~ ^[0-9]+$ ]] || _native_llama_port="8080"
 
         _flash_attn=$(grep '^LLAMA_ARG_FLASH_ATTN=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
         _cache_type_k=$(grep '^LLAMA_ARG_CACHE_TYPE_K=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
@@ -1247,7 +1334,7 @@ else
         _spec_type=$(grep '^LLAMA_ARG_SPEC_TYPE=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
         _spec_draft_n_max=$(grep '^LLAMA_ARG_SPEC_DRAFT_N_MAX=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
         _llama_args=(
-            --host "$_bind" --port 8080
+            --host "$_bind" --port "$_native_llama_port"
             --model "$MODEL_FULL_PATH"
             --ctx-size "$MAX_CONTEXT"
             --n-gpu-layers 999
@@ -1276,7 +1363,7 @@ else
         while [[ "$WAITED" -lt "$MAX_WAIT" ]]; do
             sleep 2
             WAITED=$((WAITED + 2))
-            if curl -sf --max-time 10 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+            if curl -sf --max-time 10 "http://127.0.0.1:${_native_llama_port}/health" >/dev/null 2>&1; then
                 HEALTHY=true
                 break
             fi
@@ -1483,7 +1570,11 @@ else
     launchctl bootout "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" 2>/dev/null || true
     for _legacy_plist_label in \
         com.ods.llama-server \
-        com.ods.full-model-download; do
+        com.ods.full-model-download \
+        com.dreamserver.llama-server \
+        com.dreamserver.full-model-download \
+        com.dreamserver.host-agent \
+        com.dreamserver.opencode-web; do
         launchctl bootout "gui/$(id -u)/${_legacy_plist_label}" 2>/dev/null || true
         rm -f "$HOME/Library/LaunchAgents/${_legacy_plist_label}.plist" 2>/dev/null || true
     done

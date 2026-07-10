@@ -45,6 +45,9 @@ LLAMA_SERVER_DIR="${ODS_INSTALL_DIR}/bin"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_DIR}/llama-server"
 LLAMA_SERVER_PID_FILE="${ODS_INSTALL_DIR}/data/.llama-server.pid"
 LLAMA_SERVER_LOG="${ODS_INSTALL_DIR}/data/llama-server.log"
+LLM_BRIDGE_PLIST_LABEL="com.ods.llm-bridge"
+LLM_BRIDGE_PLIST="$HOME/Library/LaunchAgents/${LLM_BRIDGE_PLIST_LABEL}.plist"
+LLM_BRIDGE_LOG="$HOME/Library/Logs/ODS/ods-llm-bridge.log"
 
 # llama.cpp release for macOS Metal build (update when new releases ship)
 LLAMA_CPP_RELEASE_TAG="b8210"

@@ -1880,6 +1880,8 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
             # Honour the unified BIND_ADDRESS knob (PR #964); empty/missing → loopback.
             _bind=$(grep '^BIND_ADDRESS=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
             [[ -z "$_bind" ]] && _bind="127.0.0.1"
+            _native_port=$(grep '^ODS_NATIVE_LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
+            [[ "$_native_port" =~ ^[0-9]+$ ]] || _native_port="8080"
             _flash_attn=$(grep '^LLAMA_ARG_FLASH_ATTN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
             _cache_type_k=$(grep '^LLAMA_ARG_CACHE_TYPE_K=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
             _cache_type_v=$(grep '^LLAMA_ARG_CACHE_TYPE_V=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
@@ -1887,7 +1889,7 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
             _spec_type=$(grep '^LLAMA_ARG_SPEC_TYPE=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
             _spec_draft_n_max=$(grep '^LLAMA_ARG_SPEC_DRAFT_N_MAX=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
             _llama_args=(
-                --host "$_bind" --port 8080
+                --host "$_bind" --port "$_native_port"
                 --model "$_model_path"
                 --ctx-size "$_ctx_size"
                 --n-gpu-layers 999
@@ -1914,7 +1916,7 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
             log "Waiting for native llama-server health..."
             _healthy=false
             for _i in $(seq 1 60); do
-                if curl -sf --max-time 5 "http://127.0.0.1:8080/health" &>/dev/null; then
+                if curl -sf --max-time 5 "http://127.0.0.1:${_native_port}/health" &>/dev/null; then
                     _healthy=true
                     break
                 fi
@@ -1935,7 +1937,7 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
                     (
                         cd "$INSTALL_DIR" || exit 1
                         exec "$LLAMA_SERVER_BIN" \
-                            --host "$_bind" --port 8080 \
+                            --host "$_bind" --port "$_native_port" \
                             --model "$_old_model_path" \
                             --ctx-size "$_ctx_size" \
                             --n-gpu-layers 999 \

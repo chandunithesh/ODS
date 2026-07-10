@@ -290,8 +290,11 @@ get_native_llama_status() {
         NATIVE_LLAMA_RUNNING=true
         NATIVE_LLAMA_PID="$saved_pid"
 
-        # Health check
-        if curl -sf --max-time 10 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+        local native_port
+        native_port="$(read_env_value "${INSTALL_DIR}/.env" "ODS_NATIVE_LLAMA_PORT")"
+        [[ "$native_port" =~ ^[0-9]+$ ]] || native_port="8080"
+        # Health check the native listener, behind the Colima bridge when enabled.
+        if curl -sf --max-time 10 "http://127.0.0.1:${native_port}/health" >/dev/null 2>&1; then
             NATIVE_LLAMA_HEALTHY=true
         fi
     else
@@ -316,6 +319,8 @@ start_native_llama() {
     read_ods_env
     local gguf_file="${ENV_GGUF_FILE:-Qwen3.5-9B-Q4_K_M.gguf}"
     local ctx_size="${ENV_CTX_SIZE:-65536}"
+    local native_port="${ENV_ODS_NATIVE_LLAMA_PORT:-8080}"
+    [[ "$native_port" =~ ^[0-9]+$ ]] || native_port="8080"
     local model_path="${INSTALL_DIR}/data/models/${gguf_file}"
 
     if [[ ! -f "$model_path" ]]; then
@@ -335,7 +340,7 @@ start_native_llama() {
     esac
 
     local -a llama_args=(
-        --host "${ENV_BIND_ADDRESS:-127.0.0.1}" --port 8080
+        --host "${ENV_BIND_ADDRESS:-127.0.0.1}" --port "$native_port"
         --model "$model_path"
         --ctx-size "$ctx_size"
         --n-gpu-layers 999
@@ -364,7 +369,7 @@ start_native_llama() {
     while [[ "$waited" -lt "$max_wait" ]]; do
         sleep 2
         waited=$((waited + 2))
-        if curl -sf --max-time 10 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+        if curl -sf --max-time 10 "http://127.0.0.1:${native_port}/health" >/dev/null 2>&1; then
             ai_ok "Native llama-server healthy"
             return
         fi
@@ -465,7 +470,9 @@ cmd_start() {
     local flags
     flags=$(get_compose_flags)
 
-    if [[ -n "$service" ]]; then
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        start_native_llama
+    elif [[ -n "$service" ]]; then
         ai "Starting ${service}..."
         # shellcheck disable=SC2086
         docker compose $flags up -d "$service"
@@ -486,7 +493,9 @@ cmd_stop() {
     local flags
     flags=$(get_compose_flags)
 
-    if [[ -n "$service" ]]; then
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        stop_native_llama
+    elif [[ -n "$service" ]]; then
         ai "Stopping ${service}..."
         # shellcheck disable=SC2086
         docker compose $flags stop "$service"
@@ -514,7 +523,10 @@ cmd_restart() {
     local flags
     flags=$(get_compose_flags)
 
-    if [[ -n "$service" ]]; then
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        stop_native_llama
+        start_native_llama
+    elif [[ -n "$service" ]]; then
         ai "Restarting ${service}..."
         # shellcheck disable=SC2086
         docker compose $flags up -d "$service"
