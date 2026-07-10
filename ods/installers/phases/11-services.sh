@@ -569,24 +569,30 @@ else
                 . "$SCRIPT_DIR/installers/lib/background-tasks.sh"
             fi
 
-            nohup env \
-                SDXL_CHECKPOINT_DIR="$SDXL_CHECKPOINT_DIR" \
-                SDXL_MODEL="$SDXL_MODEL" \
-                SDXL_URL="$SDXL_URL" \
-                bash -c '
-                    echo "[SDXL] Starting SDXL Lightning model download..."
-                    if [[ ! -f "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL" ]]; then
-                        echo "[SDXL] Downloading $SDXL_MODEL (~6.5GB)..."
-                        curl -fSL -C - --connect-timeout 30 --max-time 3600 \
-                            --retry 5 --retry-delay 10 --retry-all-errors \
-                            -o "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL.part" \
-                            "$SDXL_URL" 2>&1 && \
-                            mv "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL.part" "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL" && \
-                            echo "[SDXL] $SDXL_MODEL complete" || \
-                            echo "[SDXL] ERROR: Failed to download $SDXL_MODEL"
-                    fi
-                    echo "[SDXL] SDXL Lightning model download finished."
-                ' > "$INSTALL_DIR/logs/sdxl-download.log" 2>&1 &
+            # This daemon must not inherit the installer model lifecycle lock;
+            # otherwise full-model activation waits for an unrelated 6.5 GB
+            # image download after the installer itself releases the lock.
+            (
+                _phase11_close_inherited_fds_for_daemon
+                exec nohup env \
+                    SDXL_CHECKPOINT_DIR="$SDXL_CHECKPOINT_DIR" \
+                    SDXL_MODEL="$SDXL_MODEL" \
+                    SDXL_URL="$SDXL_URL" \
+                    bash -c '
+                        echo "[SDXL] Starting SDXL Lightning model download..."
+                        if [[ ! -f "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL" ]]; then
+                            echo "[SDXL] Downloading $SDXL_MODEL (~6.5GB)..."
+                            curl -fSL -C - --connect-timeout 30 --max-time 3600 \
+                                --retry 5 --retry-delay 10 --retry-all-errors \
+                                -o "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL.part" \
+                                "$SDXL_URL" 2>&1 && \
+                                mv "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL.part" "$SDXL_CHECKPOINT_DIR/$SDXL_MODEL" && \
+                                echo "[SDXL] $SDXL_MODEL complete" || \
+                                echo "[SDXL] ERROR: Failed to download $SDXL_MODEL"
+                        fi
+                        echo "[SDXL] SDXL Lightning model download finished."
+                    ' > "$INSTALL_DIR/logs/sdxl-download.log" 2>&1
+            ) &
 
             sdxl_pid=$!
 

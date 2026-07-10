@@ -38,7 +38,37 @@ BOOTSTRAP_GGUF_FILE="${7:-Qwen3.5-2B-Q4_K_M.gguf}"
 LOG_TAG="[BOOTSTRAP-UPGRADE]"
 
 log()  { echo "$LOG_TAG $(date '+%H:%M:%S') $*"; }
-fail() { log "ERROR: $*"; release_upgrade_lock; exit 1; }
+release_model_lifecycle_lock() {
+    if declare -F ods_model_lifecycle_lock_release >/dev/null 2>&1; then
+        ods_model_lifecycle_lock_release
+    fi
+}
+prepare_model_lifecycle_lock() {
+    [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 0
+    declare -F ods_model_lifecycle_lock_acquire >/dev/null 2>&1 && return 0
+
+    local script_root candidate
+    script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)" || return 1
+    for candidate in \
+        "$INSTALL_DIR/installers/lib/model-lifecycle-lock.sh" \
+        "$script_root/installers/lib/model-lifecycle-lock.sh"
+    do
+        if [[ -f "$candidate" ]]; then
+            # shellcheck source=installers/lib/model-lifecycle-lock.sh
+            . "$candidate"
+            return 0
+        fi
+    done
+
+    log "ERROR: Linux model lifecycle lock helper is missing."
+    return 1
+}
+acquire_model_lifecycle_lock() {
+    prepare_model_lifecycle_lock || return 1
+    [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 0
+    ods_model_lifecycle_lock_acquire "$INSTALL_DIR" "background full-model activation"
+}
+fail() { log "ERROR: $*"; release_model_lifecycle_lock; release_upgrade_lock; exit 1; }
 
 if [[ -z "$INSTALL_DIR" || ! -d "$INSTALL_DIR" ]]; then
     log "ERROR: install directory does not exist: ${INSTALL_DIR:-<empty>}"
@@ -181,7 +211,7 @@ acquire_upgrade_lock() {
 
     UPGRADE_LOCK_DIR="$lock_dir"
     printf '%s\n' "$$" > "$pid_file"
-    trap 'release_upgrade_lock' EXIT
+    trap 'release_model_lifecycle_lock; release_upgrade_lock' EXIT
 }
 
 model_sha256() {
@@ -1091,6 +1121,7 @@ case "$_download_attempts" in
 esac
 
 if [[ -f "$_final_path" ]]; then
+    acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
     log "Full model already exists on disk; verifying before reuse"
     if verify_model_integrity "$_final_path"; then
         _dl_success=true
@@ -1098,6 +1129,7 @@ if [[ -f "$_final_path" ]]; then
     else
         log "Existing full model failed integrity; deleting and retrying from a clean file."
         rm -f "$_final_path"
+        release_model_lifecycle_lock
     fi
 fi
 
@@ -1112,7 +1144,7 @@ fi
 if [[ "$_dl_success" != "true" ]]; then
     monitor_download "$_part_path" "$TOTAL_BYTES" &
     _monitor_pid=$!
-    trap 'kill $_monitor_pid 2>/dev/null || true; write_failed_download_status "$_part_path" "$TOTAL_BYTES" "Download interrupted; partial file preserved for resume."; release_upgrade_lock; exit 1' TERM INT
+    trap 'kill $_monitor_pid 2>/dev/null || true; write_failed_download_status "$_part_path" "$TOTAL_BYTES" "Download interrupted; partial file preserved for resume."; release_model_lifecycle_lock; release_upgrade_lock; exit 1' TERM INT
 
     # Download with resume support. curl success is not enough: finalizing the
     # .part file can fail, and checksum verification can expose a corrupt
@@ -1128,8 +1160,10 @@ if [[ "$_dl_success" != "true" ]]; then
                 rm -f "$_part_path"
             elif [[ "$_part_bytes" -eq "$TOTAL_BYTES" ]]; then
                 log "Partial file already has the expected size; promoting it for integrity verification."
+                acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
                 if ! mv "$_part_path" "$_final_path"; then
                     log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
+                    release_model_lifecycle_lock
                 fi
             fi
         fi
@@ -1142,10 +1176,12 @@ if [[ "$_dl_success" != "true" ]]; then
                     -o "$_part_path" "$FULL_GGUF_URL" 2>&1; then
                 if [[ ! -s "$_part_path" ]]; then
                     log "Download attempt $_attempt reported success but produced no partial file: $_part_path"
-                elif mv "$_part_path" "$_final_path"; then
-                    :
                 else
-                    log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
+                    acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
+                    if ! mv "$_part_path" "$_final_path"; then
+                        log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
+                        release_model_lifecycle_lock
+                    fi
                 fi
             else
                 log "Download attempt $_attempt failed"
@@ -1160,11 +1196,13 @@ if [[ "$_dl_success" != "true" ]]; then
             ACTUAL_BYTES=$(file_size "$_final_path")
             if [[ "$ACTUAL_BYTES" -lt "$TOTAL_BYTES" ]]; then
                 mv "$_final_path" "$_part_path" 2>/dev/null || rm -f "$_final_path"
+                release_model_lifecycle_lock
                 log "Downloaded model is smaller than expected (got $ACTUAL_BYTES, expected $TOTAL_BYTES); preserving as partial for retry."
                 continue
             fi
             if [[ "$ACTUAL_BYTES" -gt "$TOTAL_BYTES" ]]; then
                 rm -f "$_final_path" "$_part_path"
+                release_model_lifecycle_lock
                 log "Downloaded model is larger than expected (got $ACTUAL_BYTES, expected $TOTAL_BYTES); deleting corrupt file and retrying from scratch."
                 continue
             fi
@@ -1178,6 +1216,7 @@ if [[ "$_dl_success" != "true" ]]; then
         fi
 
         rm -f "$_final_path" "$_part_path"
+        release_model_lifecycle_lock
         log "Integrity verification failed on attempt $_attempt; retrying from a clean download."
     done
 
@@ -1201,6 +1240,11 @@ if [[ -n "$FULL_GGUF_SHA256" ]]; then
         fail "SHA256 mismatch after retries. Deleted corrupt file."
     fi
 fi
+
+# Download bytes stay outside the lifecycle lock. Linux finalization acquires it
+# immediately before publishing the full GGUF filename, then retains it through
+# config promotion, compose verification, and bootstrap cleanup.
+acquire_model_lifecycle_lock || fail "Could not serialize background full-model activation."
 
 _windows_lemonade_swap_applies=false
 _windows_native_llama_swap_applies=false
