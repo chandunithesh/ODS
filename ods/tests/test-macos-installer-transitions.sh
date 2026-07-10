@@ -82,6 +82,9 @@ docker() {
         printf 'running\n'
         return 0
     fi
+    if [[ "$1" == "exec" && "${6:-}" == "-c" ]]; then
+        return 0
+    fi
     [[ "$1" == "exec" && "$2" == "--user" && "$3" == "0:0" ]] \
         || fail "Hermes live patch did not execute as container root"
     command cat > "$TMP_DIR/hermes-live-patch.py"
@@ -108,9 +111,9 @@ assert data["custom"]["preserve"] is True
 PY
 pass "Hermes persisted routing is container-patched and verified"
 
-# Disabled Hermes still has authoritative persisted state. If its own image is
-# gone, the installer must patch through the always-present dashboard API image
-# rather than silently accepting stale local/cloud routing.
+# Disabled Hermes still has authoritative persisted state. Its cached runtime
+# image may exist without PyYAML, so the installer must select a verified
+# dashboard API helper rather than silently accepting stale routing.
 cat > "$INSTALL_DIR/data/hermes/config.yaml" <<'YAML'
 model:
   default: stale-local-model
@@ -125,15 +128,19 @@ docker() {
         case "${3:-}:${4:-}" in
             "{{.State.Status}}:ods-hermes") printf 'exited\n' ;;
             "{{.Config.Image}}:ods-hermes") printf 'missing-hermes:latest\n' ;;
-            "{{.Config.Image}}:ods-dashboard-api") printf 'dashboard-helper:latest\n' ;;
+            "{{.Config.Image}}:ods-dashboard-api") printf '\n' ;;
         esac
         return 0
     fi
     if [[ "$1" == "image" && "$2" == "inspect" ]]; then
-        [[ "$3" == "dashboard-helper:latest" ]]
-        return
+        [[ "$3" == "hermes-install-dashboard-api:latest" || "$3" == "missing-hermes:latest" ]]
+        return $?
     fi
-    [[ "$1" == "run" && " $* " == *" --entrypoint python3 dashboard-helper:latest - cloud-default http://litellm:4000/v1 131072 "* ]] \
+    if [[ "$1" == "run" && " $* " == *" -c import yaml "* ]]; then
+        [[ " $* " == *" --entrypoint python3 hermes-install-dashboard-api:latest -c import yaml "* ]]
+        return $?
+    fi
+    [[ "$1" == "run" && " $* " == *" --entrypoint python3 hermes-install-dashboard-api:latest - cloud-default http://litellm:4000/v1 131072 "* ]] \
         || fail "persisted Hermes fallback did not use the dashboard API image"
     command cat > "$TMP_DIR/hermes-helper-patch.py"
     sed \

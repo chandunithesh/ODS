@@ -292,30 +292,49 @@ _macos_sync_builtin_compose_states() {
 
 _macos_patch_hermes_persisted_config() {
     local model_name="$1" base_url="$2" context_length="$3"
-    local state image helper_image persisted_config
+    local state hermes_image helper_image project_image selected_image persisted_config candidate
     local -a patch_command=()
 
     persisted_config="${INSTALL_DIR}/data/hermes/config.yaml"
     state="$(docker inspect --format '{{.State.Status}}' ods-hermes 2>/dev/null || true)"
-    if [[ "$state" == "running" ]]; then
+    if [[ "$state" == "running" ]] \
+       && docker exec --user 0:0 ods-hermes python3 -c 'import yaml' >/dev/null 2>&1; then
         patch_command=(docker exec --user 0:0 -i ods-hermes python3 - "$model_name" "$base_url" "$context_length")
-    else
-        image="$(docker inspect --format '{{.Config.Image}}' ods-hermes 2>/dev/null || true)"
-        [[ -n "$image" ]] || image="$(read_env_value "${INSTALL_DIR}/.env" "HERMES_AGENT_IMAGE")"
-        [[ -n "$image" ]] || image="nousresearch/hermes-agent:v2026.5.16"
-        if ! docker image inspect "$image" >/dev/null 2>&1; then
-            [[ -e "$persisted_config" ]] || return 3
-            helper_image="$(docker inspect --format '{{.Config.Image}}' ods-dashboard-api 2>/dev/null || true)"
-            if [[ -z "$helper_image" ]] \
-               || ! docker image inspect "$helper_image" >/dev/null 2>&1; then
-                return 4
+    fi
+
+    if (( ${#patch_command[@]} == 0 )); then
+        helper_image="$(docker inspect --format '{{.Config.Image}}' ods-dashboard-api 2>/dev/null || true)"
+        project_image="$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]')-dashboard-api:latest"
+        hermes_image="$(docker inspect --format '{{.Config.Image}}' ods-hermes 2>/dev/null || true)"
+        [[ -n "$hermes_image" ]] || hermes_image="$(read_env_value "${INSTALL_DIR}/.env" "HERMES_AGENT_IMAGE")"
+        [[ -n "$hermes_image" ]] || hermes_image="nousresearch/hermes-agent:v2026.5.16"
+
+        # The Hermes runtime image is not guaranteed to include PyYAML. Probe
+        # candidates instead of treating a cached image as a usable migrator.
+        # dashboard-api is preferred because its application imports yaml.
+        selected_image=""
+        for candidate in "$helper_image" "$project_image" \
+            "ods-dashboard-api:latest" "dream-server-dashboard-api:latest" "$hermes_image"; do
+            [[ -n "$candidate" ]] || continue
+            docker image inspect "$candidate" >/dev/null 2>&1 || continue
+            if docker run --rm --pull never --network none --user 0:0 \
+                --entrypoint python3 "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+                selected_image="$candidate"
+                break
             fi
-            image="$helper_image"
+        done
+
+        if [[ -z "$selected_image" ]]; then
+            if [[ ! -e "$(dirname "$persisted_config")" ]] \
+               || { [[ -x "$(dirname "$persisted_config")" ]] && [[ ! -e "$persisted_config" ]]; }; then
+                return 3
+            fi
+            return 4
         fi
         patch_command=(
             docker run --rm --pull never --network none --user 0:0 -i
             -v "${INSTALL_DIR}/data/hermes:/opt/data"
-            --entrypoint python3 "$image" - "$model_name" "$base_url" "$context_length"
+            --entrypoint python3 "$selected_image" - "$model_name" "$base_url" "$context_length"
         )
     fi
 
