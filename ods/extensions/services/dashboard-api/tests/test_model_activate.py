@@ -30,6 +30,10 @@ _restart_windows_native_llama_server = _mod._restart_windows_native_llama_server
 _write_windows_native_litellm_config = _mod._write_windows_native_litellm_config
 
 
+def test_host_agent_backlog_handles_dashboard_poll_bursts():
+    assert _mod.ThreadedHTTPServer.request_queue_size >= 64
+
+
 # --- _check_lemonade_health ---
 
 

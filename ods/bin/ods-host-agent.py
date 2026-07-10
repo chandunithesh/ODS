@@ -5019,6 +5019,9 @@ def _write_model_status(path: Path, status: str, model: str, downloaded: int, to
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    # Dashboard model discovery can issue bursts larger than HTTPServer's
+    # default backlog of 5; keep action requests from being dropped behind polls.
+    request_queue_size = 128
 
 
 def _request_server_shutdown(server, signum=None):

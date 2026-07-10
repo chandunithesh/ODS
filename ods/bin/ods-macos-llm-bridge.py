@@ -92,6 +92,9 @@ class LlmBridgeHandler(socketserver.BaseRequestHandler):
 class LlmBridgeServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # The Models page fans out status polls while starting an action. The
+    # socketserver default backlog of 5 can drop the action connection.
+    request_queue_size = 128
 
     def __init__(
         self,

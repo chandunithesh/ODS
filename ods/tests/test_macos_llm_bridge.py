@@ -65,3 +65,7 @@ def test_bridge_forwards_loopback_http():
         upstream.shutdown()
         proxy.server_close()
         upstream.server_close()
+
+
+def test_bridge_backlog_handles_dashboard_poll_bursts():
+    assert bridge.LlmBridgeServer.request_queue_size >= 64
