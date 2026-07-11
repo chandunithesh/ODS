@@ -507,20 +507,56 @@ def _get_agent_model_status(timeout: int = 5) -> Optional[dict]:
         return status
 
 
-def _call_agent_model(path: str, body: dict, timeout: int = 30) -> dict:
-    """Call the host agent model endpoint."""
+_MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS = 12.0
+
+
+def _agent_http_detail(exc: AgentHTTPError) -> Any:
+    detail: Any = exc.detail
     try:
-        return request_agent_json("POST", path, payload=body, timeout=timeout)
+        payload = json.loads(exc.response_text)
+        if isinstance(payload, dict):
+            detail = payload
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return detail
+
+
+def _is_download_lifecycle_busy(detail: Any) -> bool:
+    return (
+        isinstance(detail, dict)
+        and detail.get("code") == "model_lifecycle_busy"
+        and detail.get("activeOperation") == "model_download"
+    )
+
+
+def _call_agent_model(
+    path: str,
+    body: dict,
+    timeout: int = 30,
+    *,
+    retry_download_busy_seconds: float = 0.0,
+) -> dict:
+    """Call the host agent model endpoint."""
+    deadline = time.monotonic() + max(float(retry_download_busy_seconds or 0.0), 0.0)
+    try:
+        while True:
+            try:
+                return request_agent_json("POST", path, payload=body, timeout=timeout)
+            except AgentHTTPError as exc:
+                if exc.status_code != 409:
+                    raise
+                detail = _agent_http_detail(exc)
+                if (
+                    retry_download_busy_seconds > 0
+                    and _is_download_lifecycle_busy(detail)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.5)
+                    continue
+                raise HTTPException(status_code=409, detail=detail) from exc
     except AgentHTTPError as exc:
         if exc.status_code == 409:
-            detail: Any = exc.detail
-            try:
-                payload = json.loads(exc.response_text)
-                if isinstance(payload, dict):
-                    detail = payload
-            except (json.JSONDecodeError, TypeError):
-                pass
-            raise HTTPException(status_code=409, detail=detail) from exc
+            raise HTTPException(status_code=409, detail=_agent_http_detail(exc)) from exc
         raise HTTPException(status_code=502, detail=exc.detail) from exc
     except AgentUnavailable as exc:
         raise HTTPException(status_code=503, detail=f"Host agent unreachable: {exc}") from exc
@@ -899,7 +935,12 @@ def load_model(model_id: str, api_key: str = Depends(verify_api_key)):
         return {"status": "already_active", "model_id": model_id, "loadedModel": loaded_model}
 
     # Long timeout — model loading can take minutes
-    result = _call_agent_model("/v1/model/activate", {"model_id": model_id}, timeout=600)
+    result = _call_agent_model(
+        "/v1/model/activate",
+        {"model_id": model_id},
+        timeout=600,
+        retry_download_busy_seconds=_MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS,
+    )
     return result
 
 

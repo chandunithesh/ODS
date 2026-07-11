@@ -137,6 +137,76 @@ def test_agent_activation_conflict_preserves_target(monkeypatch):
     assert exc_info.value.detail == payload
 
 
+def test_agent_activation_waits_for_download_lifecycle_teardown(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    conflict_payload = {
+        "error": "Cannot activate a model while model_download is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "model_download",
+        "activeModelId": None,
+    }
+
+    def request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise models_router.AgentHTTPError(
+                409,
+                conflict_payload["error"],
+                json.dumps(conflict_payload),
+            )
+        return {"status": "started"}
+
+    monkeypatch.setattr(models_router, "request_agent_json", request)
+    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+
+    assert models_router._call_agent_model(
+        "/v1/model/activate",
+        {"model_id": "qwen3.5-35b-a3b-q4"},
+        timeout=600,
+        retry_download_busy_seconds=1.0,
+    ) == {"status": "started"}
+    assert calls == 3
+
+
+def test_agent_activation_does_not_retry_unrelated_lifecycle_conflict(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    conflict_payload = {
+        "error": "Another model activation is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "model_activation",
+        "activeModelId": "phi4-mini-q4",
+    }
+
+    def request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise models_router.AgentHTTPError(
+            409,
+            conflict_payload["error"],
+            json.dumps(conflict_payload),
+        )
+
+    monkeypatch.setattr(models_router, "request_agent_json", request)
+    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        models_router._call_agent_model(
+            "/v1/model/activate",
+            {"model_id": "qwen3.5-35b-a3b-q4"},
+            timeout=600,
+            retry_download_busy_seconds=1.0,
+        )
+
+    assert calls == 1
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == conflict_payload
+
+
 def test_fetch_loaded_model_falls_back_to_models_when_lemonade_health_empty(monkeypatch):
     import routers.models as models_router
 
@@ -630,7 +700,7 @@ def test_load_model_delegates_when_live_backend_reports_different_model(test_cli
     monkeypatch.setattr(
         models_router,
         "_call_agent_model",
-        lambda path, body, timeout=30: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
     )
 
     resp = test_client.post("/api/models/qwen3.5-9b-q4/load", headers=test_client.auth_headers)
@@ -670,7 +740,7 @@ def test_load_model_delegates_when_loaded_backend_is_not_ready(test_client, monk
     monkeypatch.setattr(
         models_router,
         "_call_agent_model",
-        lambda path, body, timeout=30: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
     )
 
     resp = test_client.post("/api/models/qwen3.5-9b-q4/load", headers=test_client.auth_headers)
@@ -698,7 +768,7 @@ def test_load_model_delegates_local_gguf_without_catalog_entry(test_client, monk
     monkeypatch.setattr(
         models_router,
         "_call_agent_model",
-        lambda path, body, timeout=30: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
     )
 
     resp = test_client.post(
@@ -863,7 +933,7 @@ def test_load_model_resolves_local_gguf_by_stem_with_mixed_case_extension(
     monkeypatch.setattr(
         models_router,
         "_call_agent_model",
-        lambda path, body, timeout=30: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
     )
 
     resp = test_client.post(
@@ -900,7 +970,7 @@ def test_local_gguf_ui_id_loads_and_deletes_spaced_filename(test_client, monkeyp
     gguf.write_text("model", encoding="utf-8")
     calls = []
 
-    def agent_call(path, body, timeout=30):
+    def agent_call(path, body, timeout=30, **_kwargs):
         calls.append((path, body, timeout))
         return {"status": "ok"}
 
