@@ -714,6 +714,44 @@ def test_load_model_delegates_when_live_backend_reports_different_model(test_cli
     }
 
 
+def test_load_model_uses_observed_download_teardown_grace(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-35b-a3b-q4",
+        "name": "Qwen 3.5 35B-A3B",
+        "gguf_file": "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+        "size_mb": 21500,
+        "vram_required_gb": 24,
+        "context_length": 131072,
+        "quantization": "Q4_K_M",
+        "specialty": "Quality",
+        "description": "High-context model.",
+        "llm_model_name": "qwen3.5-35b-a3b",
+    }])
+    (data_dir / "models" / "Qwen3.5-35B-A3B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text("ODS_MODE=local\n", encoding="utf-8")
+
+    captured = {}
+
+    def agent_call(path, body, timeout=30, **kwargs):
+        captured.update({"path": path, "body": body, "timeout": timeout, **kwargs})
+        return {"status": "activated"}
+
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: "phi4-mini-q4")
+    monkeypatch.setattr(models_router, "_call_agent_model", agent_call)
+
+    resp = test_client.post("/api/models/qwen3.5-35b-a3b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert captured == {
+        "path": "/v1/model/activate",
+        "body": {"model_id": "qwen3.5-35b-a3b-q4"},
+        "timeout": 600,
+        "retry_download_busy_seconds": models_router._MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS,
+    }
+    assert captured["retry_download_busy_seconds"] >= 30.0
+
+
 def test_load_model_delegates_when_loaded_backend_is_not_ready(test_client, monkeypatch, tmp_path):
     models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
     _write_model_library(install_dir, [{

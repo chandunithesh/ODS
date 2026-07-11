@@ -507,7 +507,10 @@ def _get_agent_model_status(timeout: int = 5) -> Optional[dict]:
         return status
 
 
-_MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS = 12.0
+# Windows/Lemonade can report a row as downloaded before the host-agent releases
+# the model_download lifecycle lock. Keep this finite so unrelated conflicts
+# still surface, but cover observed 15-20s teardown lag on large GGUF downloads.
+_MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS = 30.0
 
 
 def _agent_http_detail(exc: AgentHTTPError) -> Any:
