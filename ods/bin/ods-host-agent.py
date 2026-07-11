@@ -5733,16 +5733,34 @@ function Stop-ODSProcessId {
     if (-not (Test-ODSLemonadeProcess $owned)) {
         throw "Refusing to stop unowned process $ProcId on configured Lemonade port $port"
     }
+
+    function Wait-ODSProcessExit {
+        param([int]$TargetPid)
+        for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) { return $true }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
+    }
+
+    function Invoke-ODSTaskkillViaWmi {
+        param([int]$TargetPid)
+        try {
+            $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+                -Arguments @{ CommandLine = ("cmd.exe /c taskkill.exe /PID {0} /T /F" -f $TargetPid) } `
+                -ErrorAction Stop
+            return ([int]$result.ReturnValue -eq 0)
+        } catch {
+            return $false
+        }
+    }
+
     Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
-    for ($i = 0; $i -lt 30; $i++) {
-        if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
-        Start-Sleep -Milliseconds 500
-    }
+    if (Wait-ODSProcessExit -TargetPid $ProcId) { return }
     & taskkill.exe /PID $ProcId /T /F | Out-Null
-    for ($i = 0; $i -lt 30; $i++) {
-        if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
-        Start-Sleep -Milliseconds 500
-    }
+    if (Wait-ODSProcessExit -TargetPid $ProcId) { return }
+    [void](Invoke-ODSTaskkillViaWmi -TargetPid $ProcId)
+    if (Wait-ODSProcessExit -TargetPid $ProcId) { return }
     throw "Could not stop process $ProcId"
 }
 

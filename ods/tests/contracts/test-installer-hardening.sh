@@ -200,7 +200,9 @@ assert_contains "$win_lemonade_helper" 'backend = "vulkan"' "Windows Lemonade he
 assert_contains "$win_lemonade_helper" 'Authorization.*Bearer' "Windows Lemonade helper should authenticate internal configuration"
 assert_contains "$win_lemonade_helper" 'RedirectStandardOutput' "Windows Lemonade direct fallback should detach stdout from SSH/CLI parents"
 assert_contains "$win_lemonade_helper" 'RedirectStandardError' "Windows Lemonade direct fallback should detach stderr from SSH/CLI parents"
-assert_contains "$win_lemonade_helper" 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create' "Windows Lemonade direct fallback should launch outside the OpenSSH child process tree"
+assert_contains "$win_lemonade_helper" 'Start-Process -FilePath \$Contract\.ExecutablePath' "Windows Lemonade direct fallback should launch in the user session"
+assert_contains "$win_lemonade_helper" 'LaunchMethod = "start-process"' "Windows Lemonade direct fallback should report the user-session launch method"
+assert_not_contains "$win_lemonade_helper" 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create' "Windows Lemonade direct fallback must not create session-0 WMI orphans"
 assert_contains "$win_installer" 'Lemonade scheduled task did not start a server process' "Windows installer should recover when Task Scheduler reports success without a Lemonade process"
 assert_contains "$win_installer" 'Start-Process msiexec\.exe .* -PassThru' "Windows installer should capture Lemonade MSI exit codes"
 assert_contains "$win_installer" 'Lemonade MSI exited with code' "Windows installer should report failed Lemonade MSI exit codes honestly"
@@ -305,6 +307,7 @@ assert_contains "$host_agent" 'Could not refresh Lemonade scheduled task; reusin
 assert_contains "$host_agent" 'LemonadeServer.exe' "host-agent should accept current Lemonade MSI executable aliases"
 assert_contains "$host_agent" 'Start-ODSLemonadeDirectProcess -Contract \$launchContract -DiagnosticLogPath \$diagnosticLog' "host-agent should use the shared detached direct Lemonade fallback"
 assert_contains "$host_agent" 'Set-ODSLemonadeModernRuntimeConfig' "host-agent should configure and verify Lemonade 10.7"
+assert_contains "$host_agent" 'Invoke-ODSTaskkillViaWmi' "host-agent should clear session-0 Lemonade orphans after normal termination fails"
 assert_contains "$host_agent" '\$existingTaskMatches' "host-agent should not reuse a stale Lemonade task contract"
 assert_not_contains "$host_agent" '\$argString = "serve --port .*--no-tray' "host-agent must not embed obsolete Lemonade 10.7 arguments"
 

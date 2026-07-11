@@ -673,12 +673,26 @@ function Get-NativeInferenceStatus {
 function Stop-ODSNativeProcessId {
     param([int]$ProcessId)
 
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-    for ($i = 0; $i -lt 30; $i++) {
-        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-        if (-not $proc) { return }
-        Start-Sleep -Milliseconds 500
+    function Wait-ODSNativeProcessExit {
+        param([int]$TargetPid)
+        for ($i = 0; $i -lt 30; $i++) {
+            $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+            if (-not $proc) { return $true }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
     }
+
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    if (Wait-ODSNativeProcessExit -TargetPid $ProcessId) { return }
+    & taskkill.exe /PID $ProcessId /T /F | Out-Null
+    if (Wait-ODSNativeProcessExit -TargetPid $ProcessId) { return }
+    try {
+        $null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+            -Arguments @{ CommandLine = ("cmd.exe /c taskkill.exe /PID {0} /T /F" -f $ProcessId) } `
+            -ErrorAction Stop
+    } catch { }
+    [void](Wait-ODSNativeProcessExit -TargetPid $ProcessId)
 }
 
 function Stop-ODSOpenCodeRuntime {

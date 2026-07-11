@@ -399,28 +399,20 @@ function Start-ODSLemonadeDirectProcess {
             Join-Path $logDir "ods-lemonade-direct-$stamp.stderr.log"
         }
         $workingDirectory = Split-Path -Parent $Contract.ExecutablePath
-        $exeLiteral = ConvertTo-ODSPowerShellSingleQuotedLiteral $Contract.ExecutablePath
-        $argsLiteral = ConvertTo-ODSPowerShellSingleQuotedLiteral $Contract.ArgumentString
-        $workLiteral = ConvertTo-ODSPowerShellSingleQuotedLiteral $workingDirectory
-        $stdoutLiteral = ConvertTo-ODSPowerShellSingleQuotedLiteral $stdoutLog
-        $stderrLiteral = ConvertTo-ODSPowerShellSingleQuotedLiteral $stderrLog
-        $adminKeyLiteral = ConvertTo-ODSPowerShellSingleQuotedLiteral ([string]$Contract.AdminApiKey)
-        $launcher = @"
-`$ErrorActionPreference = 'Stop'
-if (-not [string]::IsNullOrWhiteSpace($adminKeyLiteral)) { `$env:LEMONADE_ADMIN_API_KEY = $adminKeyLiteral }
-Start-Process -FilePath $exeLiteral -ArgumentList $argsLiteral -WorkingDirectory $workLiteral -WindowStyle Hidden -RedirectStandardOutput $stdoutLiteral -RedirectStandardError $stderrLiteral | Out-Null
-"@
-        $encodedLauncher = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcher))
-        $commandLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedLauncher"
-        $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
-            -Arguments @{ CommandLine = $commandLine; CurrentDirectory = $workingDirectory } -ErrorAction Stop
-        if ([int]$result.ReturnValue -ne 0) {
-            throw "Lemonade direct process launch failed through WMI with code $($result.ReturnValue)."
+        if (-not [string]::IsNullOrWhiteSpace([string]$Contract.AdminApiKey)) {
+            $env:LEMONADE_ADMIN_API_KEY = [string]$Contract.AdminApiKey
         }
+        $process = Start-Process -FilePath $Contract.ExecutablePath `
+            -ArgumentList $Contract.ArgumentString `
+            -WorkingDirectory $workingDirectory `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -PassThru
         return [pscustomobject]@{
-            Id = [int]$result.ProcessId
-            ProcessId = [int]$result.ProcessId
-            LaunchMethod = "wmi"
+            Id = [int]$process.Id
+            ProcessId = [int]$process.Id
+            LaunchMethod = "start-process"
         }
     } finally {
         if ($null -eq $previousAdminKey) {
