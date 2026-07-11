@@ -59,7 +59,7 @@ if [[ "${1:-}" == "compose" ]]; then
     args=("$@")
     for ((i = 0; i < ${#args[@]}; i++)); do
         if [[ "${args[$i]}" == "config" && "${args[$((i + 1))]:-}" == "--services" ]]; then
-            printf '%s\n' dashboard dashboard-api
+            printf '%s\n' dashboard dashboard-api aider
             exit 0
         fi
         if [[ "${args[$i]}" == "ps" ]]; then
@@ -68,9 +68,21 @@ if [[ "${1:-}" == "compose" ]]; then
                 printf '%s\n' dashboard dashboard-api
                 exit 0
             fi
+            if [[ "$joined" == *" --all -q aider "* ]]; then
+                printf '%s\n' aider-container-id
+                exit 0
+            fi
         fi
     done
     exit 0
+fi
+
+if [[ "${1:-}" == "inspect" ]]; then
+    if [[ "${*: -1}" == "aider-container-id" ]]; then
+        printf '%s\n' 'exited 0'
+        exit 0
+    fi
+    exit 1
 fi
 
 if [[ "${1:-}" == "ps" ]]; then

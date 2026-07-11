@@ -1644,7 +1644,31 @@ cmd_update() {
         [[ -z "$service" ]] && continue
         ((++total_services))
 
-        if ! grep -Fxq "$service" <<< "$running_services"; then
+        if grep -Fxq "$service" <<< "$running_services"; then
+            continue
+        fi
+
+        # Some user extensions are one-shot jobs that legitimately exit 0
+        # after compose recreates them. Treat those as successful, but still
+        # fail missing containers and non-zero exits.
+        local ids=""
+        local completed_ok="false"
+        ids=$(docker compose "${flags[@]}" ps --all -q "$service" 2>/dev/null || true)
+        if [[ -n "$ids" ]]; then
+            completed_ok="true"
+            while IFS= read -r id; do
+                [[ -z "$id" ]] && continue
+                local state=""
+                state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$id" 2>/dev/null || true)
+                case "$state" in
+                    "running "*) ;;
+                    "exited 0") ;;
+                    *) completed_ok="false"; break ;;
+                esac
+            done <<< "$ids"
+        fi
+
+        if [[ "$completed_ok" != "true" ]]; then
             warn "Service $service is not running"
             ((++failed_services))
         fi
