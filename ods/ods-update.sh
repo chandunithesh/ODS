@@ -575,7 +575,7 @@ cmd_backup() {
         for file in "${INSTALL_DIR}"/${pattern}; do
             if [[ -f "$file" ]]; then
                 cp "$file" "$backup_path/"
-                ((files_backed_up++))
+                ((++files_backed_up))
             fi
         done
     done
@@ -583,7 +583,7 @@ cmd_backup() {
     # Backup version file
     if [[ -f "$VERSION_FILE" ]]; then
         cp "$VERSION_FILE" "$backup_path/.version"
-        ((files_backed_up++))
+        ((++files_backed_up))
     fi
     
     # Generate metadata (use jq for safe JSON construction)
@@ -604,7 +604,7 @@ cmd_backup() {
     backup_dirs=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name "backup-*" | sort -r)
     local count=0
     for dir in $backup_dirs; do
-        ((count++))
+        ((++count))
         if ((count > MAX_BACKUPS)); then
             log_info "Removing old backup: $(basename "$dir")"
             rm -rf "$dir"

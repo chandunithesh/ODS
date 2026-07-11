@@ -1627,14 +1627,14 @@ cmd_update() {
     # Check each service health
     while IFS= read -r service; do
         [[ -z "$service" ]] && continue
-        ((total_services++))
+        ((++total_services))
 
         local container
         container=$(sr_container "$service" 2>/dev/null || echo "")
         if [[ -n "$container" ]]; then
             if ! docker ps --filter "name=$container" --filter "status=running" --format "{{.Names}}" | grep -q "^$container$"; then
                 warn "Service $service ($container) is not running"
-                ((failed_services++))
+                ((++failed_services))
             fi
         fi
     done < <(sr_list_enabled)
