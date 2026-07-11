@@ -268,7 +268,6 @@ describe('useModels', () => {
   })
 
   test('keeps unrelated mutation errors separate from download start failures', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => true))
     fetch.mockImplementation((_url, options) => {
       if (options?.method === 'DELETE') {
         return Promise.resolve({
@@ -336,7 +335,7 @@ describe('useModels', () => {
   })
 
   test('deleteModel calls DELETE and refreshes', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.stubGlobal('confirm', vi.fn(() => { throw new Error('Native delete confirmation should stay in the page UI.') }))
     const target = 'org/model q4'
 
     fetch.mockImplementation((url, opts) => {
@@ -356,13 +355,12 @@ describe('useModels', () => {
       await result.current.deleteModel(target)
     })
 
-    expect(confirm).toHaveBeenCalledWith('Delete org/model q4? This cannot be undone.')
+    expect(confirm).not.toHaveBeenCalled()
     const deleteCall = fetch.mock.calls.find(c => c[1]?.method === 'DELETE')
     expect(deleteCall).toEqual(['/api/models/org%2Fmodel%20q4', { method: 'DELETE' }])
   })
 
   test('clears a pending delete when an independent refresh confirms removal', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => true))
     const deleteRequest = deferred()
     let snapshot = [{ id: 'to-delete', status: 'downloaded' }]
     fetch.mockImplementation((_url, opts) => {
@@ -392,7 +390,6 @@ describe('useModels', () => {
   })
 
   test('shows the backend delete explanation instead of a generic failure', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => true))
     fetch.mockImplementation((_url, opts) => {
       if (opts?.method === 'DELETE') {
         return Promise.resolve({
@@ -417,7 +414,6 @@ describe('useModels', () => {
 
   test('does not erase a mutation error when background list polling succeeds', async () => {
     vi.useFakeTimers()
-    vi.stubGlobal('confirm', vi.fn(() => true))
     fetch.mockImplementation((_url, opts) => {
       if (opts?.method === 'DELETE') {
         return Promise.resolve({
@@ -447,7 +443,6 @@ describe('useModels', () => {
 
   test('keeps activation working while an overlapping model mutation settles', async () => {
     vi.useFakeTimers()
-    vi.stubGlobal('confirm', vi.fn(() => true))
     const target = 'slow-model'
     const otherModel = 'other-model'
     const deleteRequest = deferred()
@@ -872,23 +867,24 @@ describe('useModels', () => {
     }
   })
 
-  test('deleteModel aborts when user cancels confirm', async () => {
+  test('deleteModel does not depend on native confirm cancellation', async () => {
     vi.stubGlobal('confirm', vi.fn(() => false))
 
-    fetch.mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ models: [{ id: 'keep-me' }], gpu: null, currentModel: null })
+    fetch.mockImplementation((_url, opts) => {
+      if (opts?.method === 'DELETE') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+      }
+      return Promise.resolve(modelsResponse([{ id: 'keep-me', status: 'downloaded' }]))
     })
 
     const { result } = renderHook(() => useModels())
     await waitFor(() => expect(result.current.loading).toBe(false))
 
-    const callCountBefore = fetch.mock.calls.length
-
     await act(async () => {
       await result.current.deleteModel('keep-me')
     })
 
-    expect(fetch.mock.calls.length).toBe(callCountBefore)
+    expect(confirm).not.toHaveBeenCalled()
+    expect(fetch.mock.calls.some(call => call[1]?.method === 'DELETE')).toBe(true)
   })
 })

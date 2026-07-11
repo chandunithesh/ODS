@@ -381,8 +381,6 @@ export function useModels() {
   }
 
   const deleteModel = async (modelId) => {
-    if (!confirm(`Delete ${modelId}? This cannot be undone.`)) return
-
     setMutationError(null)
     const action = startAction(modelId, 'delete')
     try {
