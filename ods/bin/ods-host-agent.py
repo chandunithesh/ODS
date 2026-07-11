@@ -5668,10 +5668,27 @@ $cachePrefix = if ($cacheBin) { $cacheBin.TrimEnd('\') + '\' } else { $null }
 function Test-ODSLemonadeProcess {
     param($Proc)
     if (-not $Proc) { return $false }
+    $portOwned = $false
+    if ($Proc.ProcessId) {
+        foreach ($listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+            if ([int]$listener.OwningProcess -eq [int]$Proc.ProcessId) {
+                $portOwned = $true
+                break
+            }
+        }
+    }
     $pathOwned = (
         ($Proc.ExecutablePath -and $Proc.ExecutablePath.Equals($exe, [StringComparison]::OrdinalIgnoreCase)) -or
         ($Proc.ExecutablePath -and $Proc.ExecutablePath.StartsWith($binPrefix, [StringComparison]::OrdinalIgnoreCase)) -or
         ($cachePrefix -and $Proc.ExecutablePath -and $Proc.ExecutablePath.StartsWith($cachePrefix, [StringComparison]::OrdinalIgnoreCase))
+    )
+    $nameOwned = (
+        $portOwned -and
+        $Proc.Name -and
+        (
+            $Proc.Name.Equals("LemonadeServer.exe", [StringComparison]::OrdinalIgnoreCase) -or
+            $Proc.Name.Equals("lemonade.exe", [StringComparison]::OrdinalIgnoreCase)
+        )
     )
     $commandOwned = (
         $Proc.CommandLine -and
@@ -5679,7 +5696,7 @@ function Test-ODSLemonadeProcess {
         $Proc.CommandLine.IndexOf("lemonade", [StringComparison]::OrdinalIgnoreCase) -ge 0
     )
     return (
-        $pathOwned -or $commandOwned
+        $pathOwned -or $nameOwned -or $commandOwned
     )
 }
 
