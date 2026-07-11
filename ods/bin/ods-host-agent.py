@@ -4279,6 +4279,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         # None means the snapshot was not captured, so rollback must skip it.
         env_backup: str | None = None
         ini_backup: str | None = None
+        lemonade_existed: bool | None = None
         lemonade_backup = None
         litellm_local_existed: bool | None = None
         litellm_local_backup: str | None = None
@@ -4297,8 +4298,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 env_path.write_text(env_backup, encoding="utf-8")
             if ini_backup is not None:
                 models_ini.write_text(ini_backup, encoding="utf-8")
-            if lemonade_backup is not None:
+            if lemonade_existed is True:
                 lemonade_yaml.write_text(lemonade_backup, encoding="utf-8")
+            elif lemonade_existed is False:
+                lemonade_yaml.unlink(missing_ok=True)
             if litellm_local_existed is True:
                 litellm_local_yaml.write_text(litellm_local_backup or "", encoding="utf-8")
             elif litellm_local_existed is False:
@@ -4349,9 +4352,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 restore_backups()
                 restore_previous_runtime()
                 rollback_env = load_env(env_path)
-                _restart_existing_container("ods-litellm")
+                litellm_restarted = _restart_existing_container("ods-litellm")
                 hermes_restarted = _restart_existing_container("ods-hermes")
-                _recreate_openclaw_if_present()
+                openclaw_recreated = _recreate_openclaw_if_present()
                 if perplexica_snapshot is not None:
                     _restore_perplexica_config(perplexica_snapshot)
                 previous_gguf = str(rollback_env.get("GGUF_FILE") or "")
@@ -4359,6 +4362,16 @@ class AgentHandler(BaseHTTPRequestHandler):
                     rollback_env.get("LLM_MODEL")
                     or _local_model_name_from_gguf(previous_gguf)
                 )
+                previous_windows_native = _is_windows_host_llama_server(rollback_env)
+                previous_hermes_model = previous_gguf
+                if (
+                    not previous_windows_native
+                    and str(rollback_env.get("GPU_BACKEND") or "").lower() == "amd"
+                ):
+                    previous_hermes_model = str(
+                        rollback_env.get("LEMONADE_MODEL")
+                        or f"extra.{previous_gguf}"
+                    )
                 if hermes_restarted and hermes_live_snapshot and hermes_live_snapshot.get("exists"):
                     try:
                         previous_context = int(
@@ -4368,16 +4381,6 @@ class AgentHandler(BaseHTTPRequestHandler):
                         )
                     except (TypeError, ValueError):
                         previous_context = 32768
-                    previous_windows_native = _is_windows_host_llama_server(rollback_env)
-                    previous_hermes_model = previous_gguf
-                    if (
-                        not previous_windows_native
-                        and str(rollback_env.get("GPU_BACKEND") or "").lower() == "amd"
-                    ):
-                        previous_hermes_model = (
-                            rollback_env.get("LEMONADE_MODEL")
-                            or f"extra.{previous_gguf}"
-                        )
                     previous_base_url = rollback_env.get("HERMES_LLM_BASE_URL") or (
                         "http://litellm:4000/v1"
                         if _is_windows_host_lemonade(rollback_env)
@@ -4400,6 +4403,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                     raise RuntimeError(
                         f"previous model {previous_gguf} did not pass identity and completion readiness"
                     )
+                if litellm_restarted:
+                    _verify_litellm_route(rollback_env)
+                if openclaw_recreated:
+                    _verify_openclaw_model_env(previous_hermes_model)
                 return True, ""
             except Exception as rollback_exc:
                 logger.exception("Failed to prove previous model route during rollback")
@@ -4452,7 +4459,12 @@ class AgentHandler(BaseHTTPRequestHandler):
             # Save rollback snapshot
             env_backup = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
             ini_backup = models_ini.read_text(encoding="utf-8") if models_ini.exists() else ""
-            lemonade_backup = lemonade_yaml.read_text(encoding="utf-8") if lemonade_yaml.exists() else None
+            lemonade_existed = lemonade_yaml.exists()
+            lemonade_backup = (
+                lemonade_yaml.read_text(encoding="utf-8")
+                if lemonade_existed
+                else None
+            )
             litellm_local_existed = litellm_local_yaml.exists()
             if litellm_local_existed:
                 litellm_local_backup = litellm_local_yaml.read_text(encoding="utf-8")
@@ -4686,14 +4698,14 @@ class AgentHandler(BaseHTTPRequestHandler):
                 )
 
                 # Restart dependent services so they pick up the new model
-                _restart_existing_container("ods-litellm")
+                litellm_restarted = _restart_existing_container("ods-litellm")
                 if hermes_patched and _restart_existing_container("ods-hermes"):
                     _verify_running_hermes_route(
                         hermes_model_name,
                         hermes_base_url,
                         int(context_length),
                     )
-                _recreate_openclaw_if_present()
+                openclaw_recreated = _recreate_openclaw_if_present()
                 if perplexica_snapshot is not None:
                     _update_perplexica_model(
                         env,
@@ -4701,6 +4713,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                         gguf_file=gguf_file,
                         lemonade_model_id=lemonade_model_id,
                     )
+                if litellm_restarted:
+                    _verify_litellm_route(env)
+                if openclaw_recreated:
+                    _verify_openclaw_model_env(hermes_model_name)
                 committed = True  # system state is committed before the response write
                 json_response(self, 200, {"status": "activated", "model_id": model_id})
             else:
@@ -5170,6 +5186,7 @@ def _chat_completion_ready(
     port: str,
     model_name: str,
     api_prefix: str = "/v1",
+    api_key: str = "",
 ) -> bool:
     """Require one bounded deterministic, meaningful chat completion."""
     prefix = "/" + api_prefix.strip("/")
@@ -5184,12 +5201,16 @@ def _chat_completion_ready(
         "temperature": 0,
     })
     try:
+        command = [
+            "curl", "-sf", "--max-time", "30", "--max-filesize", "65536",
+            "-X", "POST", url,
+            "-H", "Content-Type: application/json",
+        ]
+        if api_key:
+            command.extend(["-H", f"Authorization: Bearer {api_key}"])
+        command.extend(["-d", payload])
         result = subprocess.run(
-            [
-                "curl", "-sf", "--max-time", "30", "--max-filesize", "65536",
-                "-X", "POST", url,
-                "-H", "Content-Type: application/json", "-d", payload,
-            ],
+            command,
             capture_output=True,
             text=True,
             timeout=35,
@@ -5968,24 +5989,55 @@ def _patch_hermes_config_text(
     """Return Hermes YAML with its routing fields updated line-for-line."""
     lines = text.splitlines()
     in_model_block = False
+    model_block_found = False
+    model_indent = "  "
+    model_fields = set()
     changed = False
     new_lines = []
+
+    def add_missing_model_fields() -> None:
+        nonlocal changed
+        if "default" not in model_fields:
+            new_lines.append(f'{model_indent}default: "{model_name}"')
+            changed = True
+        if base_url and "base_url" not in model_fields:
+            new_lines.append(f'{model_indent}base_url: "{base_url}"')
+            changed = True
+        if context_length and "context_length" not in model_fields:
+            new_lines.append(f"{model_indent}context_length: {int(context_length)}")
+            changed = True
+
     for line in lines:
         if re.match(r"^model:\s*(?:#.*)?$", line):
             in_model_block = True
+            model_block_found = True
+            model_fields = set()
             new_lines.append(line)
             continue
         if in_model_block and line and not line.startswith((" ", "\t", "#")):
+            add_missing_model_fields()
             in_model_block = False
         if in_model_block and re.match(r"^\s+default:\s*", line):
+            model_fields.add("default")
+            model_indent = line[:len(line) - len(line.lstrip())]
             indent = line[:len(line) - len(line.lstrip())]
             new_line = f'{indent}default: "{model_name}"'
             new_lines.append(new_line)
             changed = changed or new_line != line
             continue
         if base_url and in_model_block and re.match(r"^\s+base_url:\s*", line):
+            model_fields.add("base_url")
+            model_indent = line[:len(line) - len(line.lstrip())]
             indent = line[:len(line) - len(line.lstrip())]
             new_line = f'{indent}base_url: "{base_url}"'
+            new_lines.append(new_line)
+            changed = changed or new_line != line
+            continue
+        if context_length and in_model_block and re.match(r"^\s+context_length:\s*", line):
+            model_fields.add("context_length")
+            model_indent = line[:len(line) - len(line.lstrip())]
+            indent = line[:len(line) - len(line.lstrip())]
+            new_line = f"{indent}context_length: {int(context_length)}"
             new_lines.append(new_line)
             changed = changed or new_line != line
             continue
@@ -5996,6 +6048,21 @@ def _patch_hermes_config_text(
             changed = changed or new_line != line
             continue
         new_lines.append(line)
+
+    if in_model_block:
+        add_missing_model_fields()
+    elif not model_block_found:
+        if new_lines and new_lines[-1]:
+            new_lines.append("")
+        new_lines.extend([
+            "model:",
+            f'{model_indent}default: "{model_name}"',
+        ])
+        if base_url:
+            new_lines.append(f'{model_indent}base_url: "{base_url}"')
+        if context_length:
+            new_lines.append(f"{model_indent}context_length: {int(context_length)}")
+        changed = True
 
     return "\n".join(new_lines) + "\n", changed
 
@@ -6277,6 +6344,54 @@ def _recreate_openclaw_if_present() -> bool:
     return True
 
 
+def _verify_litellm_route(env: dict) -> None:
+    """Prove the active LiteLLM default route can serve a completion."""
+    host = "ods-litellm" if os.environ.get("ODS_HOST_INSTALL_DIR") else "127.0.0.1"
+    port = str(env.get("LITELLM_PORT") or "4000")
+    api_key = str(env.get("LITELLM_KEY") or env.get("LITELLM_MASTER_KEY") or "")
+    for attempt in range(12):
+        if _chat_completion_ready(host, port, "default", "/v1", api_key):
+            return
+        if attempt < 11:
+            time.sleep(2)
+    raise RuntimeError("LiteLLM did not serve a completion through the active model route")
+
+
+def _verify_openclaw_model_env(expected_model: str) -> None:
+    """Verify recreated OpenClaw received the active persisted model identity."""
+    result = subprocess.run(
+        [
+            "docker", "inspect", "--type", "container", "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}", "ods-openclaw",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Could not verify OpenClaw model environment: {detail[:300]}")
+    values = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    actual_model = (
+        values.get("LEMONADE_MODEL")
+        or values.get("GGUF_FILE")
+        or values.get("LLM_MODEL")
+        or ""
+    )
+    if not _runtime_model_identity_matches(
+        actual_model,
+        model_id=expected_model,
+        gguf_file=expected_model,
+    ):
+        raise RuntimeError(
+            f"OpenClaw recreated with model {actual_model or '<empty>'}, expected {expected_model}"
+        )
+
+
 def _read_hermes_container_config() -> str:
     if not _container_running("ods-hermes"):
         raise RuntimeError("Hermes live config is host-inaccessible and ods-hermes is not running")
@@ -6367,13 +6482,30 @@ def _hermes_config_matches(
     base_url: str | None,
     context_length: int,
 ) -> bool:
-    expected, _changed = _patch_hermes_config_text(
-        text,
-        model_name,
-        base_url=base_url,
-        context_length=context_length,
-    )
-    return text.rstrip() == expected.rstrip()
+    values = {}
+    in_model_block = False
+    for line in text.splitlines():
+        if re.match(r"^model:\s*(?:#.*)?$", line):
+            in_model_block = True
+            continue
+        if in_model_block and line and not line.startswith((" ", "\t", "#")):
+            break
+        if not in_model_block:
+            continue
+        match = re.match(r"^\s+(default|base_url|context_length):\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        value = match.group(2).split(" #", 1)[0].strip().strip("'\"")
+        values[match.group(1)] = value
+
+    if values.get("default") != str(model_name):
+        return False
+    if base_url is not None and values.get("base_url") != str(base_url):
+        return False
+    try:
+        return int(values.get("context_length", "")) == int(context_length)
+    except (TypeError, ValueError):
+        return False
 
 
 def _verify_running_hermes_route(

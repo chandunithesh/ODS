@@ -557,6 +557,77 @@ class TestPerplexicaModelRoute:
         assert current == snapshot["values"]
 
 
+class TestDownstreamRouteVerification:
+
+    def test_completion_probe_sends_bearer_key_when_requested(self, monkeypatch):
+        commands = []
+
+        def fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({"choices": [{"message": {"content": "READY"}}]}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _mod._chat_completion_ready(
+            "127.0.0.1",
+            "4000",
+            "default",
+            "/v1",
+            "secret",
+        )
+        assert "Authorization: Bearer secret" in commands[0]
+
+    def test_litellm_probe_uses_default_route_and_master_key(self, monkeypatch):
+        calls = []
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_chat_completion_ready",
+            lambda *args: calls.append(args) or True,
+        )
+
+        _mod._verify_litellm_route({"LITELLM_PORT": "4100", "LITELLM_KEY": "secret"})
+
+        assert calls == [("127.0.0.1", "4100", "default", "/v1", "secret")]
+
+    def test_openclaw_probe_accepts_exact_lemonade_id(self, monkeypatch):
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "LLM_MODEL=logical-name\n"
+                    "GGUF_FILE=Modern-Model.gguf\n"
+                    "LEMONADE_MODEL=Modern-Model\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        _mod._verify_openclaw_model_env("Modern-Model")
+
+    def test_openclaw_probe_rejects_stale_model(self, monkeypatch):
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "run",
+            lambda cmd, **_kwargs: subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="LEMONADE_MODEL=Old-Model\nGGUF_FILE=Old-Model.gguf\n",
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="expected Modern-Model"):
+            _mod._verify_openclaw_model_env("Modern-Model")
+
+
 class TestPatchHermesModelConfig:
 
     def test_updates_model_default_only(self, tmp_path):
@@ -605,6 +676,50 @@ class TestPatchHermesModelConfig:
         assert '  base_url: "http://llama-server:8080/v1"' in text
         assert "  context_length: 131072" in text
         assert "    context_length: 131072" in text
+
+    def test_inserts_missing_required_route_fields(self, tmp_path):
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "model:\n"
+            '  provider: "custom"\n'
+            "providers:\n"
+            "  custom: {}\n",
+            encoding="utf-8",
+        )
+
+        assert _patch_hermes_model_config(
+            config,
+            "new-model.gguf",
+            base_url="http://litellm:4000/v1",
+            context_length=65536,
+        ) is True
+
+        text = config.read_text(encoding="utf-8")
+        assert '  default: "new-model.gguf"' in text
+        assert '  base_url: "http://litellm:4000/v1"' in text
+        assert "  context_length: 65536" in text
+        assert _mod._hermes_config_matches(
+            text,
+            "new-model.gguf",
+            "http://litellm:4000/v1",
+            65536,
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'model:\n  base_url: "http://litellm:4000/v1"\n  context_length: 4096\n',
+            'model:\n  default: "model"\n  context_length: 4096\n',
+            'model:\n  default: "model"\n  base_url: "http://litellm:4000/v1"\n',
+        ],
+    )
+    def test_route_verification_rejects_missing_required_fields(self, text):
+        assert not _mod._hermes_config_matches(
+            text,
+            "model",
+            "http://litellm:4000/v1",
+            4096,
+        )
 
     def test_missing_file_is_noop(self, tmp_path):
         assert _patch_hermes_model_config(tmp_path / "missing.yaml", "model.gguf") is False
@@ -1751,6 +1866,80 @@ class TestModelActivateRollback:
         assert 'default: "Modern-Model"' in hermes_live.read_text(encoding="utf-8")
         assert 'default: "Modern-Model"' in hermes_template.read_text(encoding="utf-8")
 
+    def test_windows_lemonade_rollback_removes_new_litellm_config(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, lemonade_yaml, _ = (
+            _write_model_activation_fixture(
+                tmp_path,
+                gpu_backend="amd",
+                lemonade=False,
+            )
+        )
+        env_path.write_text(
+            "ODS_MODE=lemonade\n"
+            "GPU_BACKEND=amd\n"
+            "LLM_BACKEND=lemonade\n"
+            "AMD_INFERENCE_RUNTIME=lemonade\n"
+            "AMD_INFERENCE_LOCATION=host\n"
+            "AMD_INFERENCE_PORT=8080\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
+            "LEMONADE_MODEL=Old-Model\n"
+            "CTX_SIZE=2048\n",
+            encoding="utf-8",
+        )
+        restarts = []
+        snapshot = TestPerplexicaModelRoute._snapshot()
+
+        def fake_run(cmd, **_kwargs):
+            if cmd and cmd[0] == "curl" and cmd[-1].endswith("/models"):
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=json.dumps({
+                        "data": [{
+                            "id": "Modern-Model",
+                            "checkpoint": r"C:\ods\data\models\new-model.gguf",
+                        }],
+                    }),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_restart_windows_lemonade",
+            lambda env: restarts.append(env["GGUF_FILE"]),
+        )
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(_mod, "_capture_perplexica_config", lambda _env: snapshot)
+        monkeypatch.setattr(
+            _mod,
+            "_restore_perplexica_config",
+            lambda _snapshot: None,
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_update_perplexica_model",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated downstream failure")
+            ),
+        )
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert handler.parse_response()["rolled_back"] is True
+        assert restarts == ["new-model.gguf", "old-model.gguf"]
+        assert not lemonade_yaml.exists()
+        assert "LEMONADE_MODEL=Old-Model" in env_path.read_text(encoding="utf-8")
+
     def test_windows_lemonade_already_serving_skips_native_restart(
         self, tmp_path, monkeypatch,
     ):
@@ -2376,6 +2565,7 @@ class TestModelActivateRollback:
             _write_model_activation_fixture(tmp_path)
         )
         recreates = []
+        verified_models = []
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
         monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
@@ -2391,12 +2581,18 @@ class TestModelActivateRollback:
             "docker_compose_recreate",
             lambda services: (recreates.append(list(services)) or True, ""),
         )
+        monkeypatch.setattr(
+            _mod,
+            "_verify_openclaw_model_env",
+            lambda model_name: verified_models.append(model_name),
+        )
         handler = _ResponseHandler()
 
         _mod.AgentHandler._do_model_activate(handler, "target-model")
 
         assert handler.response_code == 200
         assert recreates == [["openclaw"]]
+        assert verified_models == ["new-model.gguf"]
 
     def test_activation_updates_perplexica_after_model_readiness(
         self, tmp_path, monkeypatch,
