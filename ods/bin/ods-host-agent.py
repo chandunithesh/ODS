@@ -29,6 +29,7 @@ import socket
 import stat as stat_mod
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -1392,6 +1393,7 @@ def json_response(handler, code: int, body: dict):
         handler.send_header("Connection", "close")
     handler.end_headers()
     handler.wfile.write(payload)
+    handler.wfile.flush()
 
 
 def _split_nmcli_terse(line: str) -> list[str]:
@@ -5828,15 +5830,41 @@ if ($launchContract.RequiresRuntimeConfiguration) {
 New-Item -ItemType Directory -Path (Split-Path -Parent $pidPath) -Force | Out-Null
 Set-Content -LiteralPath $pidPath -Value $proc.ProcessId
 '''
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=ps_env,
-    )
+    def _make_launcher_log_path(suffix: str) -> Path:
+        fd, name = tempfile.mkstemp(prefix="ods-lemonade-restart-", suffix=suffix)
+        os.close(fd)
+        return Path(name)
+    stdout_path = _make_launcher_log_path(".stdout.log")
+    stderr_path = _make_launcher_log_path(".stderr.log")
+    def _read_launcher_log(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+    try:
+        with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                timeout=120,
+                env=ps_env,
+            )
+        stdout_text = _read_launcher_log(stdout_path)
+        stderr_text = _read_launcher_log(stderr_path)
+    except subprocess.TimeoutExpired as exc:
+        stdout_text = _read_launcher_log(stdout_path)
+        stderr_text = _read_launcher_log(stderr_path)
+        detail = (stderr_text or stdout_text).strip()[:500]
+        if detail:
+            raise RuntimeError(f"Windows Lemonade restart timed out after {exc.timeout} seconds: {detail}") from exc
+        raise
+    finally:
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Windows Lemonade restart failed: {(result.stderr or result.stdout).strip()[:500]}")
+        raise RuntimeError(f"Windows Lemonade restart failed: {(stderr_text or stdout_text).strip()[:500]}")
     logger.info("Windows Lemonade direct process started")
 
 
