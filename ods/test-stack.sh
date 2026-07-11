@@ -172,11 +172,11 @@ if $VOICE || $STRESS; then
     echo ""
     
     # Quick voice health
-    local auth_header=()
+    auth_header=()
     if [[ -n "${DASHBOARD_API_KEY:-}" ]]; then
         auth_header=(-H "Authorization: Bearer $DASHBOARD_API_KEY")
     fi
-    local voice_url="http://127.0.0.1:${DASHBOARD_API_PORT:-3002}/api/voice/status"
+    voice_url="http://127.0.0.1:${DASHBOARD_API_PORT:-3002}/api/voice/status"
     if curl -s "${auth_header[@]}" "$voice_url" | grep -q '"available":true'; then
         echo -e "${GREEN}✓ Voice services available${NC}"
         
