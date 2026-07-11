@@ -207,7 +207,7 @@ def test_agent_activation_does_not_retry_unrelated_lifecycle_conflict(monkeypatc
     assert exc_info.value.detail == conflict_payload
 
 
-def test_fetch_loaded_model_falls_back_to_models_when_lemonade_health_empty(monkeypatch):
+def test_fetch_loaded_model_does_not_infer_lemonade_loaded_when_health_null(monkeypatch):
     import routers.models as models_router
 
     seen_urls: list[str] = []
@@ -249,14 +249,13 @@ def test_fetch_loaded_model_falls_back_to_models_when_lemonade_health_empty(monk
     finally:
         loop.close()
 
-    assert result == "extra.Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    assert result is None
     assert seen_urls == [
         "http://host.docker.internal:8080/api/v1/health",
-        "http://host.docker.internal:8080/api/v1/models",
     ]
 
 
-def test_fetch_loaded_model_prefers_configured_lemonade_gguf_over_catalog_first(
+def test_fetch_loaded_model_does_not_prefer_configured_lemonade_gguf_when_health_null(
     monkeypatch,
     tmp_path,
 ):
@@ -319,10 +318,9 @@ def test_fetch_loaded_model_prefers_configured_lemonade_gguf_over_catalog_first(
     finally:
         loop.close()
 
-    assert result == "extra.Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    assert result is None
     assert seen_urls == [
         "http://host.docker.internal:8080/api/v1/health",
-        "http://host.docker.internal:8080/api/v1/models",
     ]
 
 

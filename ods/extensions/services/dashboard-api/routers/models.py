@@ -695,14 +695,18 @@ async def _fetch_llama_counters(host: str, port: int, model_name: str) -> dict:
 
 async def _fetch_llama_loaded_model(host: str, port: int, api_prefix: str) -> str | None:
     base_url = _configured_llm_base_url(host, port)
+    lemonade_api = api_prefix == "/api/v1"
     async with httpx.AsyncClient(timeout=10.0) as client:
-        if api_prefix == "/api/v1":
+        if lemonade_api:
             try:
                 resp = await client.get(f"{base_url}{api_prefix}/health")
                 resp.raise_for_status()
-                loaded = resp.json().get("model_loaded")
+                health = resp.json()
+                loaded = health.get("model_loaded")
                 if loaded:
                     return loaded
+                if "model_loaded" in health:
+                    return None
             except (httpx.HTTPError, ValueError):
                 pass
 
@@ -714,20 +718,8 @@ async def _fetch_llama_loaded_model(host: str, port: int, api_prefix: str) -> st
                 status = model.get("status", {})
                 if isinstance(status, dict) and status.get("value") == "loaded":
                     return model.get("id")
-            desired_tokens = (
-                _model_name_tokens(_read_active_model())
-                | _model_name_tokens(read_env_value("LLM_MODEL", INSTALL_DIR))
-            )
-            if api_prefix == "/api/v1" and desired_tokens:
-                for model in data:
-                    model_tokens = _model_name_tokens(model.get("id"))
-                    model_tokens.update(_model_name_tokens(model.get("checkpoint")))
-                    checkpoints = model.get("checkpoints")
-                    if isinstance(checkpoints, dict):
-                        for checkpoint in checkpoints.values():
-                            model_tokens.update(_model_name_tokens(checkpoint))
-                    if desired_tokens & model_tokens:
-                        return model.get("id")
+            if lemonade_api:
+                return None
             if data and data[0].get("id"):
                 return data[0]["id"]
         except (httpx.HTTPError, ValueError):
