@@ -182,8 +182,10 @@ echo "[contract] macOS bootstrap model download tolerates slow resumable transfe
 macos_ui="installers/macos/lib/ui.sh"
 assert_contains "$macos_ui" 'curl -C - -L --progress-bar' "macOS bootstrap model download should preserve curl resume support"
 assert_contains "$macos_ui" 'ODS_DOWNLOAD_CONNECT_TIMEOUT:-30' "macOS bootstrap model download should allow configurable connect timeout"
-assert_contains "$macos_ui" 'ODS_DOWNLOAD_LOW_SPEED_TIME:-300' "macOS bootstrap model download should tolerate slow but active transfers"
-assert_contains "$macos_ui" 'ODS_DOWNLOAD_LOW_SPEED_LIMIT:-1024' "macOS bootstrap model download should use a lenient low-speed threshold"
+assert_contains "$macos_ui" 'ODS_DOWNLOAD_LOW_SPEED_TIME:-120' "macOS bootstrap model download should fail/retry stalled transfers promptly"
+assert_contains "$macos_ui" 'ODS_DOWNLOAD_LOW_SPEED_LIMIT:-262144' "macOS bootstrap model download should avoid indefinite byte-trickle stalls"
+assert_contains "$macos_ui" 'ODS_DOWNLOAD_HTTP_VERSION:-' "macOS bootstrap model download should allow configurable curl HTTP transport"
+assert_contains "$macos_ui" '--http1.1' "macOS bootstrap model download should default to the hardened HTTP/1.1 path"
 assert_not_contains "$macos_ui" '--speed-time 30 --speed-limit 10240' "macOS bootstrap model download should not abort active slow transfers after 30 seconds"
 
 echo "[contract] Windows bootstrap model download uses retry wrapper"

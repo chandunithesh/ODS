@@ -81,9 +81,26 @@ download_with_progress() {
 
     local part_file="${destination}.part"
     local connect_timeout="${ODS_DOWNLOAD_CONNECT_TIMEOUT:-30}"
-    local low_speed_time="${ODS_DOWNLOAD_LOW_SPEED_TIME:-300}"
-    local low_speed_limit="${ODS_DOWNLOAD_LOW_SPEED_LIMIT:-1024}"
+    local low_speed_time="${ODS_DOWNLOAD_LOW_SPEED_TIME:-120}"
+    local low_speed_limit="${ODS_DOWNLOAD_LOW_SPEED_LIMIT:-262144}"
+    local http_version="${ODS_DOWNLOAD_HTTP_VERSION:-${ODS_BOOTSTRAP_DOWNLOAD_HTTP_VERSION:-http1.1}}"
+    local curl_http_flags=()
     local attempt=1
+
+    case "$http_version" in
+        ""|auto|AUTO|Auto)
+            ;;
+        1|1.1|http1|HTTP1|http1.1|HTTP1.1)
+            curl_http_flags=(--http1.1)
+            ;;
+        2|http2|HTTP2)
+            curl_http_flags=(--http2)
+            ;;
+        *)
+            ai_warn "Unknown ODS_DOWNLOAD_HTTP_VERSION=${http_version}; using http1.1."
+            curl_http_flags=(--http1.1)
+            ;;
+    esac
 
     while [[ $attempt -le $max_retries ]]; do
         if [[ $attempt -gt 1 ]]; then
@@ -98,6 +115,7 @@ download_with_progress() {
         if curl -C - -L --progress-bar \
             --connect-timeout "$connect_timeout" \
             --speed-time "$low_speed_time" --speed-limit "$low_speed_limit" \
+            "${curl_http_flags[@]}" \
             -o "$part_file" "$url"; then
             mv "$part_file" "$destination"
             ai_ok "${label} complete"
