@@ -122,7 +122,7 @@ test_json() {
     if [[ -n "${DASHBOARD_API_KEY:-}" && "$url" == *":${DASHBOARD_API_PORT:-3002}"* ]]; then
         args+=(-H "Authorization: Bearer $DASHBOARD_API_KEY")
     fi
-    
+
     local response
     response=$(curl "${args[@]}" "$url" 2>/dev/null) || response=""
     
