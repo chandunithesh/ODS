@@ -78,6 +78,40 @@ function Write-InfoBox {
     Write-Host " $Value" -ForegroundColor White
 }
 
+function Get-ODSPositiveIntEnv {
+    param(
+        [string]$Name,
+        [int]$Default
+    )
+
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    $parsed = 0
+    if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) {
+        return $parsed
+    }
+    return $Default
+}
+
+function Get-ODSCurlDownloadHttpArgs {
+    $httpVersion = [Environment]::GetEnvironmentVariable("ODS_DOWNLOAD_HTTP_VERSION")
+    if ([string]::IsNullOrWhiteSpace($httpVersion)) {
+        $httpVersion = [Environment]::GetEnvironmentVariable("ODS_BOOTSTRAP_DOWNLOAD_HTTP_VERSION")
+    }
+    if ([string]::IsNullOrWhiteSpace($httpVersion)) {
+        $httpVersion = "http1.1"
+    }
+
+    switch -Regex ($httpVersion) {
+        "^(auto)$" { return @() }
+        "^(1|1\.1|http1|http1\.1)$" { return @("--http1.1") }
+        "^(2|http2)$" { return @("--http2") }
+        default {
+            Write-AIWarn "Unknown ODS_DOWNLOAD_HTTP_VERSION=$httpVersion; using http1.1."
+            return @("--http1.1")
+        }
+    }
+}
+
 function Show-ProgressDownload {
     param(
         [string]$Url,
@@ -88,7 +122,20 @@ function Show-ProgressDownload {
     # Use curl.exe (ships with Windows 10+) for resume-capable download with progress
     # Direct invocation (&) instead of Start-Process so the progress bar is visible
     $partFile = "$Destination.part"
-    & curl.exe -C - -L --progress-bar -o $partFile $Url
+    $connectTimeout = Get-ODSPositiveIntEnv -Name "ODS_DOWNLOAD_CONNECT_TIMEOUT" -Default 30
+    $lowSpeedTime = Get-ODSPositiveIntEnv -Name "ODS_DOWNLOAD_LOW_SPEED_TIME" -Default 120
+    $lowSpeedLimit = Get-ODSPositiveIntEnv -Name "ODS_DOWNLOAD_LOW_SPEED_LIMIT" -Default 262144
+    $curlArgs = @(
+        "-C", "-",
+        "-L",
+        "--progress-bar",
+        "--connect-timeout", "$connectTimeout",
+        "--speed-time", "$lowSpeedTime",
+        "--speed-limit", "$lowSpeedLimit"
+    )
+    $curlArgs += Get-ODSCurlDownloadHttpArgs
+    $curlArgs += @("-o", $partFile, $Url)
+    & curl.exe @curlArgs
     $curlExit = $LASTEXITCODE
     if ($curlExit -eq 0 -and (Test-Path $partFile)) {
         Move-Item -Path $partFile -Destination $Destination -Force
