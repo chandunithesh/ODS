@@ -5978,12 +5978,28 @@ if ($launchContract.RequiresRuntimeConfiguration) {
 New-Item -ItemType Directory -Path (Split-Path -Parent $pidPath) -Force | Out-Null
 Set-Content -LiteralPath $pidPath -Value $proc.ProcessId
 '''
-    def summarize_powershell_output(result) -> str:
-        output = "\n".join(
-            part.strip()
-            for part in (getattr(result, "stderr", ""), getattr(result, "stdout", ""))
-            if part and part.strip()
-        ).strip()
+    log_dir = INSTALL_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_stamp = time.strftime("%Y%m%d-%H%M%S")
+    wrapper_stdout = log_dir / f"lemonade-restart-{log_stamp}.stdout.log"
+    wrapper_stderr = log_dir / f"lemonade-restart-{log_stamp}.stderr.log"
+
+    def summarize_powershell_output(result=None) -> str:
+        parts = []
+        for path in (wrapper_stderr, wrapper_stdout):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                text = ""
+            if text:
+                parts.append(text)
+        if result is not None:
+            parts.extend(
+                part.strip()
+                for part in (getattr(result, "stderr", ""), getattr(result, "stdout", ""))
+                if part and part.strip()
+            )
+        output = "\n".join(parts).strip()
         output = re.sub(
             r"(?i)(Authorization\s*[:=]\s*Bearer\s+|Bearer\s+)[^\s'\";]+",
             r"\1[redacted]",
@@ -5997,15 +6013,21 @@ Set-Content -LiteralPath $pidPath -Value $proc.ProcessId
         return output[-1200:] if output else "no PowerShell output captured"
 
     try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=ps_env,
-        )
+        with wrapper_stdout.open("w", encoding="utf-8") as stdout_file, \
+                wrapper_stderr.open("w", encoding="utf-8") as stderr_file:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                timeout=120,
+                env=ps_env,
+            )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Windows Lemonade restart timed out after {exc.timeout} seconds") from exc
+        details = summarize_powershell_output()
+        raise RuntimeError(
+            f"Windows Lemonade restart timed out after {exc.timeout} seconds: {details}"
+        ) from exc
     if result.returncode != 0:
         details = summarize_powershell_output(result)
         logger.error(

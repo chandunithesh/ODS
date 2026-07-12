@@ -1294,6 +1294,12 @@ class TestRestartWindowsLemonade:
             captured["capture_output"] = kwargs.get("capture_output")
             captured["stdout"] = kwargs.get("stdout")
             captured["stderr"] = kwargs.get("stderr")
+            if kwargs.get("stdout") is not None:
+                kwargs["stdout"].write("launch stdout Bearer stdout-secret")
+                kwargs["stdout"].flush()
+            if kwargs.get("stderr") is not None:
+                kwargs["stderr"].write("launch stderr LEMONADE_ADMIN_API_KEY=stderr-secret")
+                kwargs["stderr"].flush()
             return subprocess.CompletedProcess(
                 cmd,
                 1,
@@ -1316,9 +1322,9 @@ class TestRestartWindowsLemonade:
         assert "stderr-secret" not in message
         assert "stdout-secret" not in message
         assert "[redacted]" in message
-        assert captured["capture_output"] is True
-        assert captured["stdout"] is None
-        assert captured["stderr"] is None
+        assert captured["capture_output"] is None
+        assert captured["stdout"] is not None
+        assert captured["stderr"] is not None
 
 
 # --- Rollback integration ---
