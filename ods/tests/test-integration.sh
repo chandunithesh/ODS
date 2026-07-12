@@ -40,45 +40,7 @@ for arg in "$@"; do
     esac
 done
 
-# Load environment and resolve ports
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-load_env() {
-    local env_file="$ROOT_DIR/.env"
-    if [[ -f "$env_file" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            line="${line%[$'\r']}"
-            line="${line#"${line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-            [[ "$line" =~ ^# ]] && continue
-            [[ -z "$line" ]] && continue
-            if [[ "$line" == *"="* ]]; then
-                local key="${line%%=*}"
-                local val="${line#*=}"
-                key="${key#"${key%%[![:space:]]*}"}"
-                key="${key%"${key##*[![:space:]]}"}"
-                val="${val#\"}"
-                val="${val%\"}"
-                val="${val#\'}"
-                val="${val%\'}"
-                if [[ -n "$key" && -z "${!key:-}" ]]; then
-                    export "$key"="$val"
-                fi
-            fi
-        done < "$env_file"
-    fi
-}
-load_env
-
-# Retrieve DASHBOARD_API_KEY from text file if not set in .env
-if [[ -z "${DASHBOARD_API_KEY:-}" ]]; then
-    key_file="$ROOT_DIR/data/dashboard-api-key.txt"
-    if [[ -f "$key_file" ]]; then
-        DASHBOARD_API_KEY=$(cat "$key_file" | tr -d '\r\n ' || true)
-        export DASHBOARD_API_KEY
-    fi
-fi
+source "$(dirname "${BASH_SOURCE[0]}")/lib/auth-env.sh"
 
 # Logging
 log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
@@ -97,8 +59,8 @@ test_http() {
     
     local args=(-s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT")
     [[ -n "$data" ]] && args+=(-X "$method" -H "Content-Type: application/json" -d "$data")
-    if [[ -n "${DASHBOARD_API_KEY:-}" && "$url" == *":${DASHBOARD_API_PORT:-3002}"* ]]; then
-        args+=(-H "Authorization: Bearer $DASHBOARD_API_KEY")
+    if [[ "$url" == *":${DASHBOARD_API_PORT}"* ]]; then
+        args+=("${AE_AUTH_HEADER[@]}")
     fi
     
     local code
@@ -119,8 +81,8 @@ test_json() {
     local jq_filter="$3"
     
     local args=(-s --max-time "$TIMEOUT")
-    if [[ -n "${DASHBOARD_API_KEY:-}" && "$url" == *":${DASHBOARD_API_PORT:-3002}"* ]]; then
-        args+=(-H "Authorization: Bearer $DASHBOARD_API_KEY")
+    if [[ "$url" == *":${DASHBOARD_API_PORT}"* ]]; then
+        args+=("${AE_AUTH_HEADER[@]}")
     fi
 
     local response
@@ -183,10 +145,16 @@ echo ""
 # ========================================
 echo -e "${BLUE}▸ Dashboard API${NC}"
 
-test_http "API health check" "http://localhost:${DASHBOARD_API_PORT:-3002}/health"
-test_json "API status endpoint" "http://localhost:${DASHBOARD_API_PORT:-3002}/api/status" '.gpu or .services'
-test_json "GPU metrics" "http://localhost:${DASHBOARD_API_PORT:-3002}/gpu" '.name and .memory_used_mb'
-test_json "Service list" "http://localhost:${DASHBOARD_API_PORT:-3002}/services" '. | length > 0'
+test_http "API health check" "http://localhost:${DASHBOARD_API_PORT}/health"
+if _ae_require_key; then
+    test_json "API status endpoint" "http://localhost:${DASHBOARD_API_PORT}/api/status" '.gpu or .services'
+    test_json "GPU metrics" "http://localhost:${DASHBOARD_API_PORT}/gpu" '.name and .memory_used_mb'
+    test_json "Service list" "http://localhost:${DASHBOARD_API_PORT}/services" '. | length > 0'
+else
+    log_skip "API status endpoint"
+    log_skip "GPU metrics"
+    log_skip "Service list"
+fi
 
 # ========================================
 # Model API Tests
@@ -194,8 +162,13 @@ test_json "Service list" "http://localhost:${DASHBOARD_API_PORT:-3002}/services"
 echo ""
 echo -e "${BLUE}▸ Model Manager API${NC}"
 
-test_json "Model catalog" "http://localhost:${DASHBOARD_API_PORT:-3002}/api/models" '.models | length > 0'
-test_json "VRAM info in catalog" "http://localhost:${DASHBOARD_API_PORT:-3002}/api/models" '.gpu.vramTotal > 0'
+if _ae_require_key; then
+    test_json "Model catalog" "http://localhost:${DASHBOARD_API_PORT}/api/models" '.models | length > 0'
+    test_json "VRAM info in catalog" "http://localhost:${DASHBOARD_API_PORT}/api/models" '.gpu.vramTotal > 0'
+else
+    log_skip "Model catalog"
+    log_skip "VRAM info in catalog"
+fi
 
 # ========================================
 # Workflow API Tests
@@ -203,8 +176,13 @@ test_json "VRAM info in catalog" "http://localhost:${DASHBOARD_API_PORT:-3002}/a
 echo ""
 echo -e "${BLUE}▸ Workflow API${NC}"
 
-test_json "Workflow catalog" "http://localhost:${DASHBOARD_API_PORT:-3002}/api/workflows" '.workflows | length > 0'
-test_json "Workflow categories" "http://localhost:${DASHBOARD_API_PORT:-3002}/api/workflows" '.categories | keys | length > 0'
+if _ae_require_key; then
+    test_json "Workflow catalog" "http://localhost:${DASHBOARD_API_PORT}/api/workflows" '.workflows | length > 0'
+    test_json "Workflow categories" "http://localhost:${DASHBOARD_API_PORT}/api/workflows" '.categories | keys | length > 0'
+else
+    log_skip "Workflow catalog"
+    log_skip "Workflow categories"
+fi
 
 # ========================================
 # Voice API Tests
@@ -212,7 +190,11 @@ test_json "Workflow categories" "http://localhost:${DASHBOARD_API_PORT:-3002}/ap
 echo ""
 echo -e "${BLUE}▸ Voice API${NC}"
 
-test_json "Voice status" "http://localhost:${DASHBOARD_API_PORT:-3002}/api/voice/status" '.services'
+if _ae_require_key; then
+    test_json "Voice status" "http://localhost:${DASHBOARD_API_PORT}/api/voice/status" '.services'
+else
+    log_skip "Voice status"
+fi
 
 # ========================================
 # Core Service Tests
@@ -240,8 +222,8 @@ test_http "Qdrant health" "http://localhost:${QDRANT_PORT:-6333}/" || log_skip "
 echo ""
 echo -e "${BLUE}▸ Voice Services${NC}"
 
-test_http "Whisper STT" "http://localhost:${WHISPER_PORT:-9000}/health" || log_skip "Whisper not running"
-test_http "Kokoro TTS" "http://localhost:${TTS_PORT:-8880}/health" || log_skip "Kokoro not running"
+test_http "Whisper STT" "http://localhost:${WHISPER_PORT}/health" || log_skip "Whisper not running"
+test_http "Kokoro TTS" "http://localhost:${TTS_PORT}/health" || log_skip "Kokoro not running"
 test_http "LiveKit" "http://localhost:${LIVEKIT_PORT:-7880}/" || log_skip "LiveKit not running"
 
 # ========================================

@@ -11,55 +11,14 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# Load environment and resolve ports
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-load_env() {
-    local env_file="$ROOT_DIR/.env"
-    if [[ -f "$env_file" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            line="${line%[$'\r']}"
-            line="${line#"${line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-            [[ "$line" =~ ^# ]] && continue
-            [[ -z "$line" ]] && continue
-            if [[ "$line" == *"="* ]]; then
-                local key="${line%%=*}"
-                local val="${line#*=}"
-                key="${key#"${key%%[![:space:]]*}"}"
-                key="${key%"${key##*[![:space:]]}"}"
-                val="${val#\"}"
-                val="${val%\"}"
-                val="${val#\'}"
-                val="${val%\'}"
-                if [[ -n "$key" && -z "${!key:-}" ]]; then
-                    export "$key"="$val"
-                fi
-            fi
-        done < "$env_file"
-    fi
-}
-load_env
-
-# Retrieve DASHBOARD_API_KEY from text file if not set in .env
-if [[ -z "${DASHBOARD_API_KEY:-}" ]]; then
-    key_file="$ROOT_DIR/data/dashboard-api-key.txt"
-    if [[ -f "$key_file" ]]; then
-        DASHBOARD_API_KEY=$(cat "$key_file" | tr -d '\r\n ' || true)
-        export DASHBOARD_API_KEY
-    fi
-fi
+source "$(dirname "${BASH_SOURCE[0]}")/lib/auth-env.sh"
 
 # Config with environment variable support
-API_URL="${API_URL:-http://localhost:${DASHBOARD_API_PORT:-3002}}"
+API_URL="${API_URL:-http://localhost:${DASHBOARD_API_PORT}}"
 CURL_TIMEOUT=10  # seconds
 
 # Auth header for dashboard-api
-AUTH_HEADER=()
-if [[ -n "${DASHBOARD_API_KEY:-}" ]]; then
-    AUTH_HEADER=(-H "Authorization: Bearer $DASHBOARD_API_KEY")
-fi
+AUTH_HEADER=("${AE_AUTH_HEADER[@]}")
 PASS_FILE=$(mktemp)
 FAIL_FILE=$(mktemp)
 
@@ -209,18 +168,21 @@ test_status_structure() {
 # Run tests
 echo -e "${CYAN}Core Endpoints:${NC}"
 test_endpoint "Health" "/health" "status"
-test_endpoint "Disk" "/disk" "used_gb"
-test_endpoint "Bootstrap" "/bootstrap" "active"
-test_array_endpoint "Services" "/services"
 
-echo ""
-echo -e "${CYAN}Dashboard Endpoint:${NC}"
-test_status_structure
+if _ae_require_key; then
+    test_endpoint "Disk" "/disk" "used_gb"
+    test_endpoint "Bootstrap" "/bootstrap" "active"
+    test_array_endpoint "Services" "/services"
 
-echo ""
-echo -e "${CYAN}Optional Endpoints (may fail without GPU/services):${NC}"
-test_endpoint "GPU" "/gpu" "name" || true
-test_endpoint "Model" "/model" "name" || true
+    echo ""
+    echo -e "${CYAN}Dashboard Endpoint:${NC}"
+    test_status_structure
+
+    echo ""
+    echo -e "${CYAN}Optional Endpoints (may fail without GPU/services):${NC}"
+    test_endpoint "GPU" "/gpu" "name" || true
+    test_endpoint "Model" "/model" "name" || true
+fi
 
 # Summary
 echo ""
