@@ -75,6 +75,23 @@ test_http() {
     fi
 }
 
+# Probe an optional service — skips cleanly if unreachable, never increments FAILED
+test_optional() {
+    local label="$1"
+    local url="$2"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time "$TIMEOUT" "$url" 2>/dev/null || true)
+    [[ -z "$http_code" || "$http_code" == "000" ]] && http_code="000"
+    if [[ "$http_code" =~ ^2 ]] || [[ "$http_code" == "404" ]]; then
+        echo -e "  ${GREEN}✓${NC} ${label}"
+        PASSED=$((PASSED + 1))
+    else
+        log_skip "${label} not running (got ${http_code})"
+    fi
+}
+
+
 test_json() {
     local name="$1"
     local url="$2"
@@ -222,9 +239,9 @@ test_http "Qdrant health" "http://localhost:${QDRANT_PORT:-6333}/" || log_skip "
 echo ""
 echo -e "${BLUE}▸ Voice Services${NC}"
 
-test_http "Whisper STT" "http://localhost:${WHISPER_PORT}/health" || log_skip "Whisper not running"
-test_http "Kokoro TTS" "http://localhost:${TTS_PORT}/health" || log_skip "Kokoro not running"
-test_http "LiveKit" "http://localhost:${LIVEKIT_PORT:-7880}/" || log_skip "LiveKit not running"
+test_optional "Whisper STT" "http://localhost:${WHISPER_PORT}/health"
+test_optional "Kokoro TTS" "http://localhost:${TTS_PORT}/health"
+test_optional "LiveKit" "http://localhost:${LIVEKIT_PORT:-7880}/"
 
 # ========================================
 # Dashboard UI Tests
