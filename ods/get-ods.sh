@@ -48,6 +48,36 @@ success() { echo -e "${GREEN}[  ok ]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[warn ]${NC} $1"; }
 error()   { echo -e "${RED}[error]${NC} $1"; exit 1; }
 
+is_commit_ref() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]]
+}
+
+format_git_clone_error() {
+    local clone_err="$1"
+
+    case "$clone_err" in
+        *"Unable to read current working directory"*|*"getcwd"*)
+            error "git could not read the current working directory. This usually means the directory you launched from has been deleted (e.g. you uninstalled ODS and re-ran the bootstrap from the same shell). Run \`cd ~\` and re-run the bootstrap." ;;
+        *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"Network is unreachable"*)
+            error "Failed to reach github.com. Check your internet connection or proxy settings.\n  git said: $clone_err" ;;
+        *"Permission denied"*|*"could not create"*)
+            error "git failed to write to $TEMP_DIR (permissions). Check that /tmp is writable.\n  git said: $clone_err" ;;
+        *)
+            error "Failed to clone repository.\n  git said: $clone_err" ;;
+    esac
+}
+
+checkout_commit_ref() {
+    local repo_dir="$1"
+    local ref="$2"
+    local fetch_err checkout_err
+
+    fetch_err=$(git -C "$repo_dir" fetch --depth 1 origin "$ref" 2>&1) || \
+        error "Failed to fetch repository ref $ref.\n  git said: $fetch_err"
+    checkout_err=$(git -C "$repo_dir" checkout --detach FETCH_HEAD 2>&1) || \
+        error "Failed to checkout repository ref $ref.\n  git said: $checkout_err"
+}
+
 remove_install_dir() {
     local target_dir="$1"
 
@@ -305,36 +335,33 @@ TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
 clone_args=(--depth 1 --filter=blob:none --sparse)
-if [[ -n "$ODS_REF" ]]; then
+if [[ -n "$ODS_REF" ]] && ! is_commit_ref "$ODS_REF"; then
     clone_args+=(--branch "$ODS_REF")
 fi
 
 _clone_err=$(git clone "${clone_args[@]}" "$REPO_URL" "$TEMP_DIR/repo" 2>&1) || {
-    case "$_clone_err" in
-        *"Unable to read current working directory"*|*"getcwd"*)
-            error "git could not read the current working directory. This usually means the directory you launched from has been deleted (e.g. you uninstalled ODS and re-ran the bootstrap from the same shell). Run \`cd ~\` and re-run the bootstrap." ;;
-        *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"Network is unreachable"*)
-            error "Failed to reach github.com. Check your internet connection or proxy settings.\n  git said: $_clone_err" ;;
-        *"Permission denied"*|*"could not create"*)
-            error "git failed to write to $TEMP_DIR (permissions). Check that /tmp is writable.\n  git said: $_clone_err" ;;
-        *)
-            error "Failed to clone repository.\n  git said: $_clone_err" ;;
-    esac
+    format_git_clone_error "$_clone_err"
 }
 echo "$_clone_err" | tail -1
 
 cd "$TEMP_DIR/repo"
+if [[ -n "$ODS_REF" ]] && is_commit_ref "$ODS_REF"; then
+    checkout_commit_ref "$TEMP_DIR/repo" "$ODS_REF"
+fi
 git sparse-checkout set ods 2>/dev/null || {
     # Fallback: full clone if sparse checkout fails
     cd "$ODS_BOOTSTRAP_ROOT"
     rm -rf "$TEMP_DIR/repo"
     fallback_clone_args=(--depth 1)
-    if [[ -n "$ODS_REF" ]]; then
+    if [[ -n "$ODS_REF" ]] && ! is_commit_ref "$ODS_REF"; then
         fallback_clone_args+=(--branch "$ODS_REF")
     fi
     git clone "${fallback_clone_args[@]}" "$REPO_URL" "$TEMP_DIR/repo" 2>&1 | tail -1 || \
         error "Failed to clone repository (fallback full clone also failed)."
     cd "$TEMP_DIR/repo"
+    if [[ -n "$ODS_REF" ]] && is_commit_ref "$ODS_REF"; then
+        checkout_commit_ref "$TEMP_DIR/repo" "$ODS_REF"
+    fi
 }
 
 # Move ods to install location (exclude dev-only files)
