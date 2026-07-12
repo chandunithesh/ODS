@@ -126,6 +126,12 @@ pass "Windows Lemonade hot-swap restarts native inference and persists the verif
 restart_windows_lemonade_block="$(function_block restart_windows_lemonade_with_full_model | grep -v '^[[:space:]]*#')"
 grep -qF 'ODS_LEMONADE_RESTART_PS_TIMEOUT' <<<"$restart_windows_lemonade_block" \
     || fail "Windows Lemonade restart helper must be bounded by a timeout"
+grep -qF 'lemonade-bootstrap-restart.$(date +%Y%m%d-%H%M%S).$$.log' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade restart helper output must go to a file, not a command-substitution pipe"
+grep -qF '>"$ps_output_file" 2>&1' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade restart helper must not capture PowerShell through an inherited stdout pipe"
+grep -qF 'tail -c 12000 "$ps_output_file"' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade restart diagnostics must be read back from the bounded log file"
 grep -qF 'resolve_live_windows_lemonade_model_id "$lemonade_port" "$target_gguf"' <<<"$restart_windows_lemonade_block" \
     || fail "Windows Lemonade timeout/no-output fallback must resolve the live full-model ID"
 grep -qF 'PowerShell restart helper did not finish cleanly, but Lemonade live state matches' <<<"$restart_windows_lemonade_block" \

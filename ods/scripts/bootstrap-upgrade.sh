@@ -606,10 +606,12 @@ restart_windows_lemonade_with_full_model() {
     fi
 
     log "Restarting native Windows Lemonade with ${target_label}: ${target_gguf}"
-    local ps_output model_id ps_rc restart_timeout
+    local ps_output model_id ps_rc restart_timeout ps_output_file
     local -a ps_env_cmd ps_timeout_prefix
     restart_timeout="${ODS_LEMONADE_RESTART_PS_TIMEOUT:-180}"
     case "$restart_timeout" in ''|*[!0-9]*|0) restart_timeout=180 ;; esac
+    mkdir -p "$INSTALL_DIR/logs" 2>/dev/null || true
+    ps_output_file="$INSTALL_DIR/logs/lemonade-bootstrap-restart.$(date +%Y%m%d-%H%M%S).$$.log"
     ps_env_cmd=(
         env
         "ODS_WIN_PID_FILE=$(windows_path "$pid_file")"
@@ -626,8 +628,7 @@ restart_windows_lemonade_with_full_model() {
     if command -v timeout >/dev/null 2>&1; then
         ps_timeout_prefix=(timeout --foreground --kill-after=5s "${restart_timeout}s")
     fi
-    ps_output=$(
-        "${ps_env_cmd[@]}" "${ps_timeout_prefix[@]}" \
+    if "${ps_env_cmd[@]}" "${ps_timeout_prefix[@]}" \
         "$ps_cmd" -NoProfile -ExecutionPolicy Bypass -Command '
         $ErrorActionPreference = "Stop"
 
@@ -797,9 +798,12 @@ restart_windows_lemonade_with_full_model() {
             -Port $port -GgufFile $env:ODS_WIN_GGUF_FILE `
             -VersionOverride ([string]$launchContract.Version)
         Write-Output ("__ODS_LEMONADE_MODEL_ID__={0}" -f $modelId)
-    ' 2>&1
-    )
-    ps_rc=$?
+    ' >"$ps_output_file" 2>&1; then
+        ps_rc=0
+    else
+        ps_rc=$?
+    fi
+    ps_output="$(tail -c 12000 "$ps_output_file" 2>/dev/null || true)"
     if (( ps_rc != 0 )); then
         log "WARNING: native Windows Lemonade restart failed: $(printf '%s' "$ps_output" | tr '\r\n' ' ' | tail -c 800)"
         if model_id="$(resolve_live_windows_lemonade_model_id "$lemonade_port" "$target_gguf")"; then
