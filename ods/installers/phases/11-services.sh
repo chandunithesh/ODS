@@ -22,18 +22,38 @@ _phase11_build_local_images() {
     local -a failed_build_services=()
     local build_count=0 build_total=${#build_services[@]}
     local svc build_pid build_failed resolved_image
+    local attempt max_attempts retry_delay build_log label
+
+    max_attempts="${ODS_DOCKER_BUILD_MAX_ATTEMPTS:-3}"
+    [[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=3
+    (( max_attempts < 1 )) && max_attempts=1
+    retry_delay="${ODS_DOCKER_BUILD_RETRY_DELAY_SECONDS:-5}"
+    [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=5
 
     for svc in "${build_services[@]}"; do
         build_count=$((build_count + 1))
-        $DOCKER_COMPOSE_CMD "${COMPOSE_FLAGS_ARR[@]}" build --no-cache "$svc" >> "$LOG_FILE" 2>&1 &
-        build_pid=$!
-        build_failed=false
-        spin_task "$build_pid" "[$build_count/$build_total] Building $svc" || build_failed=true
+        build_log="${LOG_FILE}.${svc}.build.log"
+        : > "$build_log"
+        build_failed=true
 
-        # Cross-check that a successful build produced a tagged image. An
-        # image left by an earlier install never overrides a non-zero build.
-        resolved_image=$($DOCKER_COMPOSE_CMD "${COMPOSE_FLAGS_ARR[@]}" config --format json 2>/dev/null \
-            | python3 -c "
+        for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            {
+                echo ""
+                echo "===== $svc build attempt $attempt/$max_attempts at $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
+            } >> "$build_log"
+
+            $DOCKER_COMPOSE_CMD "${COMPOSE_FLAGS_ARR[@]}" build --no-cache "$svc" >> "$build_log" 2>&1 &
+            build_pid=$!
+            build_failed=false
+            label="[$build_count/$build_total] Building $svc"
+            (( max_attempts > 1 )) && label="$label (attempt $attempt/$max_attempts)"
+            spin_task "$build_pid" "$label" || build_failed=true
+
+            # Cross-check that a successful build produced a tagged image. An
+            # image left by an earlier install never overrides a non-zero build.
+            if ! $build_failed; then
+                resolved_image=$($DOCKER_COMPOSE_CMD "${COMPOSE_FLAGS_ARR[@]}" config --format json 2>/dev/null \
+                    | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -47,12 +67,31 @@ try:
 except Exception:
     pass
 " 2>/dev/null || echo "")
-        if [[ -n "$resolved_image" ]] && ! $DOCKER_CMD image inspect "$resolved_image" &>/dev/null; then
-            build_failed=true
-        fi
+                if [[ -n "$resolved_image" ]] && ! $DOCKER_CMD image inspect "$resolved_image" &>/dev/null; then
+                    build_failed=true
+                    echo "Built image '$resolved_image' was not found after build attempt $attempt." >> "$build_log"
+                fi
+            fi
+
+            if ! $build_failed; then
+                break
+            fi
+
+            printf "\r  ${AMB}⚠${NC} %-60s\n" "$svc build failed (attempt $attempt/$max_attempts)"
+            if (( attempt < max_attempts )); then
+                ai_warn "$svc build failed; retrying in ${retry_delay}s (attempt $((attempt + 1))/$max_attempts)..."
+                sleep "$retry_delay"
+            fi
+        done
 
         if $build_failed; then
             printf "\r  ${AMB}⚠${NC} %-60s\n" "$svc build failed or image missing"
+            {
+                echo ""
+                echo "===== $svc build log tail ($build_log) ====="
+                tail -n 120 "$build_log" 2>/dev/null || true
+            } >> "$LOG_FILE"
+            ai "Build log: $build_log"
             failed_build_services+=("$svc")
         else
             printf "\r  ${BGRN}✓${NC} %-60s\n" "$svc built"
