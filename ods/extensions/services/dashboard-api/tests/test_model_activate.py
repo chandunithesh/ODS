@@ -1235,6 +1235,24 @@ class TestRestartWindowsLemonade:
         assert "Test-ODSLemonadeLoadedModelMatches" in source
         assert "Wait-ODSLemonadeConfiguredModel -EnvVars $envVars" in source
 
+    def test_windows_cli_prefers_host_agent_for_configured_lemonade_model(self):
+        ods_root = Path(__file__).resolve().parents[4]
+        source = (ods_root / "installers" / "windows" / "ods.ps1").read_text(
+            encoding="utf-8",
+        )
+
+        assert "function Resolve-ODSModelLibraryIdForGguf" in source
+        assert "function Invoke-ODSHostAgentConfiguredModelActivation" in source
+        assert "model-library.json" in source
+        assert '$agentHealthUrl = "http://127.0.0.1:$agentPort/health"' in source
+        assert '$agentUrl = "http://127.0.0.1:$agentPort/v1/model/activate"' in source
+
+        agent_activation = source.index(
+            "Invoke-ODSHostAgentConfiguredModelActivation -EnvVars $envVars"
+        )
+        direct_start = source.index("Start-ODSLemonadeRuntime -BindAddress $bindAddr")
+        assert agent_activation < direct_start
+
     def test_windows_agent_launcher_detaches_from_host_agent(self):
         ods_root = Path(__file__).resolve().parents[4]
         source = (ods_root / "installers" / "windows" / "ods.ps1").read_text(

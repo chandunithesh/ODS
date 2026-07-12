@@ -982,6 +982,61 @@ function Wait-ODSLemonadeConfiguredModel {
     throw "Lemonade did not load configured model '$ggufFile' using request id '$modelId'. Last error: $lastError"
 }
 
+function Resolve-ODSModelLibraryIdForGguf {
+    param([string]$GgufFile)
+
+    if ([string]::IsNullOrWhiteSpace($GgufFile)) { return $null }
+    $libraryPath = Join-Path (Join-Path $InstallDir "config") "model-library.json"
+    if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) { return $null }
+    try {
+        $library = Get-Content -LiteralPath $libraryPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        foreach ($model in @($library.models)) {
+            if ([string]$model.gguf_file -and
+                ([string]$model.gguf_file).Equals($GgufFile, [StringComparison]::OrdinalIgnoreCase) -and
+                -not [string]::IsNullOrWhiteSpace([string]$model.id)) {
+                return [string]$model.id
+            }
+        }
+    } catch { }
+    return $null
+}
+
+function Invoke-ODSHostAgentConfiguredModelActivation {
+    param([hashtable]$EnvVars)
+
+    $ggufFile = $EnvVars["GGUF_FILE"]
+    if ([string]::IsNullOrWhiteSpace($ggufFile)) { return $false }
+    $modelId = Resolve-ODSModelLibraryIdForGguf -GgufFile $ggufFile
+    if ([string]::IsNullOrWhiteSpace($modelId)) { $modelId = $ggufFile }
+
+    $agentKey = $EnvVars["ODS_AGENT_KEY"]
+    if ([string]::IsNullOrWhiteSpace($agentKey)) { $agentKey = $EnvVars["DASHBOARD_API_KEY"] }
+    if ([string]::IsNullOrWhiteSpace($agentKey)) { return $false }
+
+    $agentPort = $EnvVars["ODS_AGENT_PORT"]
+    if ([string]::IsNullOrWhiteSpace($agentPort)) { $agentPort = $script:ODS_AGENT_PORT }
+    if ([string]::IsNullOrWhiteSpace($agentPort)) { $agentPort = "7710" }
+
+    $agentHealthUrl = "http://127.0.0.1:$agentPort/health"
+    $agentUrl = "http://127.0.0.1:$agentPort/v1/model/activate"
+    try {
+        $null = Invoke-WebRequest -Uri $agentHealthUrl `
+            -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        Write-AI "Loading configured Lemonade model through host agent..."
+        $body = @{ model_id = $modelId } | ConvertTo-Json -Compress
+        $headers = @{ Authorization = "Bearer $agentKey" }
+        $null = Invoke-RestMethod -Method Post -Uri $agentUrl `
+            -Headers $headers -ContentType "application/json" -Body $body `
+            -TimeoutSec 900 -ErrorAction Stop
+        Write-AISuccess "Lemonade model ready ($modelId)"
+        return $true
+    } catch {
+        Write-AIWarn "Host agent Lemonade activation unavailable: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # Backward-compat alias
 function Get-NativeLlamaStatus { return Get-NativeInferenceStatus }
 
@@ -1004,6 +1059,9 @@ function Start-NativeInferenceServer {
     if ([string]::IsNullOrWhiteSpace($bindAddr)) { $bindAddr = "127.0.0.1" }
 
     if ($backend -eq "lemonade") {
+        if (Invoke-ODSHostAgentConfiguredModelActivation -EnvVars $envVars) {
+            return
+        }
         $procId = Start-ODSLemonadeRuntime -BindAddress $bindAddr
         Write-AISuccess "Lemonade server started (PID $procId)"
         Write-AI "Waiting for health..."
