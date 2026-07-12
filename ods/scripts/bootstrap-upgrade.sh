@@ -515,6 +515,58 @@ windows_ps_command() {
     fi
 }
 
+json_has_id() {
+    local json="$1" id="$2" id_re
+    id_re="$(printf '%s' "$id" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
+    grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${id_re}\"" <<<"$json"
+}
+
+windows_lemonade_model_id_matches_gguf() {
+    local model_id="$1" target_gguf="$2"
+    [[ -n "$model_id" && -n "$target_gguf" ]] || return 1
+
+    local target_file target_stem normalized_model normalized_leaf candidate
+    target_file="$(basename "$target_gguf")"
+    target_stem="${target_file%.gguf}"
+    normalized_model="$(printf '%s' "$model_id" | tr '\\' '/')"
+    normalized_leaf="${normalized_model##*/}"
+    [[ "$normalized_leaf" == *:* ]] && normalized_leaf="${normalized_leaf##*:}"
+
+    for candidate in "$target_stem" "$target_file" "extra.$target_file"; do
+        if [[ "$normalized_model" == "$candidate" || "$normalized_leaf" == "$candidate" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_live_windows_lemonade_model_id() {
+    local port="$1" target_gguf="$2"
+    [[ -n "$port" && -n "$target_gguf" ]] || return 1
+
+    local target_file target_stem health loaded catalog candidate
+    target_file="$(basename "$target_gguf")"
+    target_stem="${target_file%.gguf}"
+
+    health="$(curl -sf --max-time 10 "http://127.0.0.1:${port}/api/v1/health" 2>/dev/null || true)"
+    loaded="$(printf '%s' "$health" \
+        | sed -n 's/.*"model_loaded"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | tail -1)"
+    if windows_lemonade_model_id_matches_gguf "$loaded" "$target_gguf"; then
+        printf '%s\n' "$loaded"
+        return 0
+    fi
+
+    catalog="$(curl -sf --max-time 10 "http://127.0.0.1:${port}/api/v1/models" 2>/dev/null || true)"
+    for candidate in "$target_stem" "$target_file" "extra.$target_file"; do
+        if json_has_id "$catalog" "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 restart_windows_lemonade_with_full_model() {
     is_windows_bash || return 1
 
@@ -554,17 +606,28 @@ restart_windows_lemonade_with_full_model() {
     fi
 
     log "Restarting native Windows Lemonade with ${target_label}: ${target_gguf}"
-    local ps_output model_id
-    if ! ps_output=$(
-        ODS_WIN_PID_FILE="$(windows_path "$pid_file")" \
-        ODS_WIN_MODELS_DIR="$(windows_path "$MODELS_DIR")" \
-        ODS_WIN_BIND_ADDR="$bind_addr" \
-        ODS_WIN_LEMONADE_PORT="$lemonade_port" \
-        ODS_WIN_LEMONADE_HELPER="$(windows_path "$helper_path")" \
-        ODS_WIN_ENV_PATH="$(windows_path "$env_path")" \
-        ODS_WIN_LEMONADE_DIAGNOSTIC_LOG="$(windows_path "$INSTALL_DIR/logs/lemonade-launch.log")" \
-        ODS_WIN_LEMONADE_TASK="ODSLemonadeRuntime" \
-        ODS_WIN_GGUF_FILE="$target_gguf" \
+    local ps_output model_id ps_rc restart_timeout
+    local -a ps_env_cmd ps_timeout_prefix
+    restart_timeout="${ODS_LEMONADE_RESTART_PS_TIMEOUT:-180}"
+    case "$restart_timeout" in ''|*[!0-9]*|0) restart_timeout=180 ;; esac
+    ps_env_cmd=(
+        env
+        "ODS_WIN_PID_FILE=$(windows_path "$pid_file")"
+        "ODS_WIN_MODELS_DIR=$(windows_path "$MODELS_DIR")"
+        "ODS_WIN_BIND_ADDR=$bind_addr"
+        "ODS_WIN_LEMONADE_PORT=$lemonade_port"
+        "ODS_WIN_LEMONADE_HELPER=$(windows_path "$helper_path")"
+        "ODS_WIN_ENV_PATH=$(windows_path "$env_path")"
+        "ODS_WIN_LEMONADE_DIAGNOSTIC_LOG=$(windows_path "$INSTALL_DIR/logs/lemonade-launch.log")"
+        "ODS_WIN_LEMONADE_TASK=ODSLemonadeRuntime"
+        "ODS_WIN_GGUF_FILE=$target_gguf"
+    )
+    ps_timeout_prefix=()
+    if command -v timeout >/dev/null 2>&1; then
+        ps_timeout_prefix=(timeout --foreground --kill-after=5s "${restart_timeout}s")
+    fi
+    ps_output=$(
+        "${ps_env_cmd[@]}" "${ps_timeout_prefix[@]}" \
         "$ps_cmd" -NoProfile -ExecutionPolicy Bypass -Command '
         $ErrorActionPreference = "Stop"
 
@@ -735,15 +798,27 @@ restart_windows_lemonade_with_full_model() {
             -VersionOverride ([string]$launchContract.Version)
         Write-Output ("__ODS_LEMONADE_MODEL_ID__={0}" -f $modelId)
     ' 2>&1
-    ); then
+    )
+    ps_rc=$?
+    if (( ps_rc != 0 )); then
         log "WARNING: native Windows Lemonade restart failed: $(printf '%s' "$ps_output" | tr '\r\n' ' ' | tail -c 800)"
-        return 1
+        if model_id="$(resolve_live_windows_lemonade_model_id "$lemonade_port" "$target_gguf")"; then
+            log "PowerShell restart helper did not finish cleanly, but Lemonade live state matches ${model_id}; continuing with strict route proof."
+        else
+            return 1
+        fi
     fi
 
-    model_id="$(printf '%s\n' "$ps_output" | sed -n 's/^__ODS_LEMONADE_MODEL_ID__=//p' | tail -1 | tr -d '\r')"
+    if [[ -z "${model_id:-}" ]]; then
+        model_id="$(printf '%s\n' "$ps_output" | sed -n 's/^__ODS_LEMONADE_MODEL_ID__=//p' | tail -1 | tr -d '\r')"
+    fi
     if [[ -z "$model_id" ]]; then
-        log "WARNING: native Windows Lemonade restart did not report a model ID."
-        return 1
+        if model_id="$(resolve_live_windows_lemonade_model_id "$lemonade_port" "$target_gguf")"; then
+            log "Resolved native Windows Lemonade model ID from live state: ${model_id}"
+        else
+            log "WARNING: native Windows Lemonade restart did not report a model ID."
+            return 1
+        fi
     fi
     log "Waiting for native Windows Lemonade to serve ${model_id} ..."
     local _swap_attempts

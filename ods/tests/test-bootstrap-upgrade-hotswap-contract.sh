@@ -123,6 +123,19 @@ grep -qF 'write_env_value LEMONADE_MODEL "$model_id"' <<<"$active_code" \
     || fail "Windows Lemonade hot-swap must persist the verified full-model ID"
 pass "Windows Lemonade hot-swap restarts native inference and persists the verified model ID"
 
+restart_windows_lemonade_block="$(function_block restart_windows_lemonade_with_full_model | grep -v '^[[:space:]]*#')"
+grep -qF 'ODS_LEMONADE_RESTART_PS_TIMEOUT' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade restart helper must be bounded by a timeout"
+grep -qF 'resolve_live_windows_lemonade_model_id "$lemonade_port" "$target_gguf"' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade timeout/no-output fallback must resolve the live full-model ID"
+grep -qF 'PowerShell restart helper did not finish cleanly, but Lemonade live state matches' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade timeout fallback must only continue after live-state proof"
+grep -qF 'Resolved native Windows Lemonade model ID from live state' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade no-output fallback must require live-state proof"
+grep -qF 'curl -sf --max-time 240 -X POST' <<<"$restart_windows_lemonade_block" \
+    || fail "Windows Lemonade live-state fallback must still prove chat completion"
+pass "Windows Lemonade restart cannot leave a half-promoted route after helper timeout"
+
 grep -qF 'patch_hermes_model_after_swap' <<<"$active_code" \
     || fail "Windows Lemonade hot-swap must patch Hermes off the bootstrap model"
 windows_activation_block="$(function_block activate_windows_lemonade_full_model | grep -v '^[[:space:]]*#')"
