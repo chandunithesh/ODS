@@ -70,6 +70,10 @@ grep -qF 'ODS_MACOS_LLM_BRIDGE_ENABLED=${macos_llm_bridge_enabled}' "$env_genera
     || fail "macOS env generator must enable the private LLM bridge for Colima"
 grep -qF 'ODS_NATIVE_LLAMA_PORT=${native_llama_port}' "$env_generator" \
     || fail "macOS env generator must persist the native loopback LLM port"
+grep -qF 'LLM_BACKEND=llama-server' "$env_generator" \
+    || fail "macOS env generator must declare the native llama-server backend"
+grep -qF 'upsert_env_value "${INSTALL_DIR}/.env" "LLM_BACKEND" "llama-server"' "$installer" \
+    || fail "macOS local reruns must heal the native llama-server backend marker"
 grep -qF 'ODS_MACOS_HOST_GATEWAY=${macos_host_gateway}' "$env_generator" \
     || fail "macOS env generator must persist the private Colima host gateway"
 grep -qF 'ODS_MACOS_VM_IP=${macos_vm_ip}' "$env_generator" \

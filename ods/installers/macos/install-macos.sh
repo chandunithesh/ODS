@@ -1684,6 +1684,7 @@ else
         upsert_env_value "${INSTALL_DIR}/.env" "CTX_SIZE" "$MAX_CONTEXT"
     else
         upsert_env_value "${INSTALL_DIR}/.env" "ODS_MODE" "local"
+        upsert_env_value "${INSTALL_DIR}/.env" "LLM_BACKEND" "llama-server"
         upsert_env_value "${INSTALL_DIR}/.env" "HERMES_LLM_API_KEY" "sk-ods-hermes-local"
         if [[ "$_previous_ods_mode" == "cloud" ]]; then
             upsert_env_value "${INSTALL_DIR}/.env" "LLM_MODEL" "$LLM_MODEL"
