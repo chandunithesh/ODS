@@ -592,6 +592,102 @@ resolve_live_windows_lemonade_model_id() {
     return 1
 }
 
+verify_windows_lemonade_loaded_context() {
+    is_windows_bash || return 0
+
+    local port="$1" model_id="$2" target_gguf="$3" expected_context="$4" ps_cmd output rc
+    [[ -n "$port" && -n "$model_id" && -n "$target_gguf" ]] || return 1
+    case "$expected_context" in ''|*[!0-9]*|0) return 0 ;; esac
+
+    ps_cmd="$(windows_ps_command)"
+    [[ -n "$ps_cmd" ]] || {
+        log "WARNING: no PowerShell executable found; cannot verify native Windows Lemonade context."
+        return 1
+    }
+
+    output="$(ODS_WIN_LEMONADE_PORT="$port" \
+        ODS_WIN_MODEL_ID="$model_id" \
+        ODS_WIN_GGUF_FILE="$target_gguf" \
+        ODS_WIN_EXPECTED_CONTEXT="$expected_context" \
+        "$ps_cmd" -NoProfile -ExecutionPolicy Bypass -Command '
+        $ErrorActionPreference = "Stop"
+
+        $port = [int]$env:ODS_WIN_LEMONADE_PORT
+        $modelId = [string]$env:ODS_WIN_MODEL_ID
+        $ggufFile = [string]$env:ODS_WIN_GGUF_FILE
+        $expectedContext = [int]$env:ODS_WIN_EXPECTED_CONTEXT
+        $targetFile = [IO.Path]::GetFileName($ggufFile)
+        $targetStem = [IO.Path]::GetFileNameWithoutExtension($targetFile)
+
+        function Add-ODSCandidate {
+            param($List, [string]$Value)
+            if ([string]::IsNullOrWhiteSpace($Value)) { return }
+            $List.Add($Value)
+            $normalized = $Value.Replace("\", "/")
+            $leaf = $normalized.Split("/")[-1]
+            if (-not [string]::IsNullOrWhiteSpace($leaf)) {
+                $List.Add($leaf)
+                $List.Add([IO.Path]::GetFileNameWithoutExtension($leaf))
+                if ($leaf.Contains(":")) {
+                    $List.Add($leaf.Split(":")[-1])
+                }
+            }
+        }
+
+        function Test-ODSLoadedModelMatch {
+            param($Entry)
+            $candidates = New-Object System.Collections.Generic.List[string]
+            foreach ($name in @("model_name", "model", "id", "checkpoint", "file")) {
+                if ($Entry.PSObject.Properties[$name]) {
+                    Add-ODSCandidate -List $candidates -Value ([string]$Entry.PSObject.Properties[$name].Value)
+                }
+            }
+            foreach ($candidate in @($candidates)) {
+                if ($candidate -eq $modelId -or
+                    $candidate -eq $targetFile -or
+                    $candidate -eq $targetStem -or
+                    $candidate -eq ("extra.{0}" -f $targetFile)) {
+                    return $true
+                }
+            }
+            return $false
+        }
+
+        $health = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/v1/health" -f $port) -TimeoutSec 10 -ErrorAction Stop
+        $entries = @()
+        if ($health.PSObject.Properties["all_models_loaded"] -and $health.all_models_loaded) {
+            $entries = @($health.all_models_loaded)
+        }
+        $match = $entries | Where-Object { Test-ODSLoadedModelMatch $_ } | Select-Object -First 1
+        if (-not $match) {
+            throw "Lemonade health did not report loaded model $modelId."
+        }
+
+        $actualContext = 0
+        if ($match.PSObject.Properties["recipe_options"] -and
+            $match.recipe_options -and
+            $match.recipe_options.PSObject.Properties["ctx_size"]) {
+            $actualContext = [int]$match.recipe_options.ctx_size
+        } elseif ($match.PSObject.Properties["ctx_size"]) {
+            $actualContext = [int]$match.ctx_size
+        }
+        if ($actualContext -le 0) {
+            throw "Lemonade health did not report ctx_size for loaded model $modelId."
+        }
+        if ($actualContext -lt $expectedContext) {
+            throw "Lemonade loaded context is below expected: expected at least $expectedContext, got $actualContext."
+        }
+        Write-Output ("__ODS_LEMONADE_CONTEXT__={0}" -f $actualContext)
+    ' 2>&1)"
+    rc=$?
+    if (( rc != 0 )); then
+        log "WARNING: native Windows Lemonade context verification failed: $(printf '%s' "$output" | tr '\r\n' ' ' | tail -c 800)"
+        return 1
+    fi
+    log "Verified native Windows Lemonade loaded context for ${model_id}: $(printf '%s\n' "$output" | sed -n 's/^__ODS_LEMONADE_CONTEXT__=//p' | tail -1 | tr -d '\r')"
+    return 0
+}
+
 restart_windows_lemonade_with_full_model() {
     is_windows_bash || return 1
 
@@ -617,12 +713,16 @@ restart_windows_lemonade_with_full_model() {
         return 1
     }
 
-    local pid_file bind_addr lemonade_port helper_path env_path
+    local pid_file bind_addr lemonade_port target_context helper_path env_path
     pid_file="$INSTALL_DIR/data/llama-server.pid"
     bind_addr="$(read_env_value BIND_ADDRESS)"
     [[ -n "$bind_addr" ]] || bind_addr="127.0.0.1"
     lemonade_port="$(read_env_value AMD_INFERENCE_PORT)"
     [[ -n "$lemonade_port" ]] || lemonade_port="8080"
+    target_context="$(read_env_value CTX_SIZE)"
+    [[ -n "$target_context" ]] || target_context="$(read_env_value MAX_CONTEXT)"
+    [[ -n "$target_context" ]] || target_context="$FULL_MAX_CONTEXT"
+    case "$target_context" in ''|*[!0-9]*) target_context="$FULL_MAX_CONTEXT" ;; esac
     helper_path="$INSTALL_DIR/installers/windows/lib/backend-contract.ps1"
     env_path="$ENV_FILE"
     if [[ ! -f "$helper_path" ]]; then
@@ -643,6 +743,7 @@ restart_windows_lemonade_with_full_model() {
         "ODS_WIN_MODELS_DIR=$(windows_path "$MODELS_DIR")"
         "ODS_WIN_BIND_ADDR=$bind_addr"
         "ODS_WIN_LEMONADE_PORT=$lemonade_port"
+        "ODS_WIN_CONTEXT_SIZE=$target_context"
         "ODS_WIN_LEMONADE_HELPER=$(windows_path "$helper_path")"
         "ODS_WIN_ENV_PATH=$(windows_path "$env_path")"
         "ODS_WIN_LEMONADE_DIAGNOSTIC_LOG=$(windows_path "$INSTALL_DIR/logs/lemonade-launch.log")"
@@ -670,6 +771,8 @@ restart_windows_lemonade_with_full_model() {
             -ExecutablePath $exe -Port $port -BindAddress $env:ODS_WIN_BIND_ADDR `
             -ModelsDir $env:ODS_WIN_MODELS_DIR -AdminApiKey $adminApiKey
         $taskName = $env:ODS_WIN_LEMONADE_TASK
+        $contextSize = 0
+        $null = [int]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)
         try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch { }
 
         $binDir = Split-Path -Parent $exe
@@ -816,8 +919,15 @@ restart_windows_lemonade_with_full_model() {
         New-Item -ItemType Directory -Path (Split-Path -Parent $pidPath) -Force | Out-Null
         Set-Content -LiteralPath $pidPath -Value $listener.OwningProcess
         if ($launchContract.RequiresRuntimeConfiguration) {
-            $null = Set-ODSLemonadeModernRuntimeConfig `
-                -Port $port -ModelsDir $env:ODS_WIN_MODELS_DIR -AdminApiKey $adminApiKey
+            $configArgs = @{
+                Port = $port
+                ModelsDir = $env:ODS_WIN_MODELS_DIR
+                AdminApiKey = $adminApiKey
+            }
+            if ($contextSize -gt 0) {
+                $configArgs.ContextSize = $contextSize
+            }
+            $null = Set-ODSLemonadeModernRuntimeConfig @configArgs
         }
         $modelId = Resolve-ODSLemonadeModelId `
             -Port $port -GgufFile $env:ODS_WIN_GGUF_FILE `
@@ -866,6 +976,10 @@ restart_windows_lemonade_with_full_model() {
                 -H "Content-Type: application/json" \
                 -d "{\"model\":\"${model_id}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1,\"temperature\":0,\"stream\":false}" \
                 >/dev/null 2>&1; then
+                if ! verify_windows_lemonade_loaded_context "$lemonade_port" "$model_id" "$target_gguf" "$target_context"; then
+                    log "Windows Lemonade completed with ${model_id}, but loaded context was not verified at ${target_context}."
+                    return 1
+                fi
                 if ! write_env_value LEMONADE_MODEL "$model_id"; then
                     log "WARNING: ${model_id} completed, but ODS could not persist LEMONADE_MODEL."
                     return 1

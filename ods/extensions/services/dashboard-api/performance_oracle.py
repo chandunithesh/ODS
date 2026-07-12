@@ -978,7 +978,14 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
         metadata = inspect_gguf(path) if path else {"exists": False, "readable": False, "quantization": model.get("quantization", "unknown")}
         runtime_profile = _matching_runtime_profile(model, gpu_info, install_ram_gb or None)
         profile_context = _effective_context_length(model, runtime_profile)
-        actual_context = context_length if is_loaded and context_length else profile_context or model.get("context_length")
+        configured_context = recommendation.get("contextLength") if is_configured else None
+        actual_context = (
+            context_length
+            if is_loaded and context_length
+            else configured_context
+            or profile_context
+            or model.get("context_length")
+        )
         vram_required = float(model["vram_required_gb"])
         selector_required = _effective_required_memory_gb({**model, "context_length": actual_context}, runtime_profile)
         if gpu_info:

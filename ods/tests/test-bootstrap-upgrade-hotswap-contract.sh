@@ -153,6 +153,26 @@ grep -qF 'curl -sf --max-time 240 -X POST' <<<"$restart_windows_lemonade_block" 
     || fail "Windows Lemonade live-state fallback must still prove chat completion"
 pass "Windows Lemonade restart cannot leave a half-promoted route after helper timeout"
 
+assert_in_order "$restart_windows_lemonade_block" "Windows Lemonade context propagation" \
+    'target_context="$(read_env_value CTX_SIZE)"' \
+    'ODS_WIN_CONTEXT_SIZE=$target_context' \
+    '$null = [int]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)' \
+    'ContextSize = $contextSize' \
+    'verify_windows_lemonade_loaded_context "$lemonade_port" "$model_id" "$target_gguf" "$target_context"' \
+    'write_env_value LEMONADE_MODEL "$model_id"'
+pass "Windows Lemonade restart propagates and verifies the promoted context before commit"
+
+verify_context_block="$(function_block verify_windows_lemonade_loaded_context | grep -v '^[[:space:]]*#')"
+grep -qF 'all_models_loaded' <<<"$verify_context_block" \
+    || fail "Windows Lemonade loaded-context verifier must inspect health all_models_loaded"
+grep -qF 'recipe_options' <<<"$verify_context_block" \
+    || fail "Windows Lemonade loaded-context verifier must inspect recipe_options"
+grep -qF 'ctx_size' <<<"$verify_context_block" \
+    || fail "Windows Lemonade loaded-context verifier must inspect ctx_size"
+grep -qF '$actualContext -lt $expectedContext' <<<"$verify_context_block" \
+    || fail "Windows Lemonade loaded-context verifier must reject undersized contexts"
+pass "Windows Lemonade loaded-context verifier rejects stale bootstrap contexts"
+
 grep -qF 'patch_hermes_model_after_swap' <<<"$active_code" \
     || fail "Windows Lemonade hot-swap must patch Hermes off the bootstrap model"
 windows_activation_block="$(function_block activate_windows_lemonade_full_model | grep -v '^[[:space:]]*#')"
