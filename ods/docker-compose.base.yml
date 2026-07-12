@@ -114,6 +114,14 @@ services:
       SEARXNG_QUERY_URL: "http://searxng:8080/search?q=<query>&format=json"
       ENABLE_SEARCH_QUERY_GENERATION: "true"
       WEB_SEARCH_RESULT_COUNT: "5"
+      # Route Open WebUI retrieval embeddings through ODS's TEI service.
+      # Otherwise Open WebUI downloads sentence-transformers/all-MiniLM-L6-v2
+      # during app startup, which can block fresh installs before port 8080 binds.
+      RAG_EMBEDDING_ENGINE: "${RAG_EMBEDDING_ENGINE:-openai}"
+      RAG_EMBEDDING_MODEL: "${RAG_EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}"
+      RAG_OPENAI_API_BASE_URL: "${RAG_OPENAI_API_BASE_URL:-http://embeddings:80/v1}"
+      RAG_OPENAI_API_KEY: "${RAG_OPENAI_API_KEY:-}"
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "${RAG_EMBEDDING_MODEL_AUTO_UPDATE:-false}"
       # ── ComfyUI Image Generation (SDXL Lightning 4-step) ──
       # Default OFF in base: ComfyUI ships only on GPU backends (amd/nvidia per
       # comfyui/manifest.yaml). The amd and nvidia overlays re-assert this as
