@@ -436,7 +436,9 @@ function Set-ODSLemonadeModernRuntimeConfig {
         [Parameter(Mandatory = $true)]
         [string]$ModelsDir,
 
-        [string]$AdminApiKey
+        [string]$AdminApiKey,
+
+        [int]$ContextSize = 0
     )
 
     $headers = @{}
@@ -449,6 +451,9 @@ function Set-ODSLemonadeModernRuntimeConfig {
         llamacpp = [ordered]@{
             backend = "vulkan"
         }
+    }
+    if ($ContextSize -gt 0) {
+        $payload.ctx_size = [int]$ContextSize
     }
     $body = $payload | ConvertTo-Json -Compress
     $null = Invoke-RestMethod -Method Post -Uri "$baseUrl/internal/set" `
@@ -470,6 +475,17 @@ function Set-ODSLemonadeModernRuntimeConfig {
     }
     if ([string]$config.llamacpp.backend -ne "vulkan") {
         throw "Lemonade llamacpp backend verification failed: expected 'vulkan', got '$($config.llamacpp.backend)'."
+    }
+    if ($ContextSize -gt 0) {
+        $actualContext = 0
+        try {
+            $actualContext = [int]$config.ctx_size
+        } catch {
+            $actualContext = 0
+        }
+        if ($actualContext -ne [int]$ContextSize) {
+            throw "Lemonade ctx_size verification failed: expected '$ContextSize', got '$($config.ctx_size)'."
+        }
     }
     return $config
 }

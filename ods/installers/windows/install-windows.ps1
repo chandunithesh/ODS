@@ -553,7 +553,8 @@ if ($dryRun) {
                         try {
                             $null = Set-ODSLemonadeModernRuntimeConfig `
                                 -Port $script:LEMONADE_PORT -ModelsDir $modelsDir `
-                                -AdminApiKey $adminApiKey
+                                -AdminApiKey $adminApiKey `
+                                -ContextSize ([int]$tierConfig.MaxContext)
                             Write-AISuccess "Lemonade 10.7+ runtime configuration verified"
                         } catch {
                             Write-AIWarn "Lemonade runtime configuration failed: $_"

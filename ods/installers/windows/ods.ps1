@@ -796,6 +796,9 @@ function Start-ODSLemonadeRuntime {
     Sync-ODSNativeInferenceConfig
     $modelsDir = Join-Path (Join-Path $InstallDir "data") "models"
     $envPath = Join-Path $InstallDir ".env"
+    $contextRaw = Get-ODSEnvValue -Name "CTX_SIZE" -Default (Get-ODSEnvValue -Name "MAX_CONTEXT" -Default "0")
+    $contextSize = 0
+    $null = [int]::TryParse([string]$contextRaw, [ref]$contextSize)
     Stop-ODSLemonadeRuntime
 
     $adminApiKey = Get-ODSLemonadeAdminApiKey -EnvPath $envPath
@@ -869,7 +872,8 @@ function Start-ODSLemonadeRuntime {
     if ($launchContract.RequiresRuntimeConfiguration) {
         try {
             $null = Set-ODSLemonadeModernRuntimeConfig `
-                -Port $script:LEMONADE_PORT -ModelsDir $modelsDir -AdminApiKey $adminApiKey
+                -Port $script:LEMONADE_PORT -ModelsDir $modelsDir `
+                -AdminApiKey $adminApiKey -ContextSize $contextSize
         } catch {
             $configDiagnostics = Get-ODSLemonadeLaunchDiagnostics `
                 -TaskName $script:LEMONADE_TASK_NAME -ChildProcess $directProcess

@@ -5263,6 +5263,7 @@ def _check_lemonade_health(
     body: str,
     expected_gguf_file: str | None = None,
     expected_model_id: str = "",
+    expected_context: int | None = None,
 ) -> bool:
     """Check if Lemonade health response indicates a model is loaded.
 
@@ -5277,15 +5278,75 @@ def _check_lemonade_health(
         if expected_gguf_file is not None or expected_model_id:
             if not isinstance(data, dict) or str(data.get("status") or "").casefold() != "ok":
                 return False
-            return _runtime_model_identity_matches(
+            if not _runtime_model_identity_matches(
                 data.get("model_loaded"),
                 model_id=expected_model_id,
                 gguf_file=expected_gguf_file or "",
+            ):
+                return False
+            return _lemonade_loaded_context_is_sufficient(
+                data,
+                expected_gguf_file=expected_gguf_file or "",
+                expected_model_id=expected_model_id,
+                expected_context=expected_context,
             )
         loaded = data.get("model_loaded")
         return isinstance(loaded, str) and bool(loaded.strip())
     except (AttributeError, json.JSONDecodeError, TypeError):
         return False
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _lemonade_version_at_least(value: object, major: int, minor: int) -> bool:
+    match = re.match(r"^\s*(\d+)\.(\d+)", str(value or ""))
+    if not match:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= (major, minor)
+
+
+def _lemonade_loaded_context_is_sufficient(
+    data: dict,
+    *,
+    expected_gguf_file: str,
+    expected_model_id: str,
+    expected_context: int | None,
+) -> bool:
+    expected_context = _positive_int(expected_context)
+    if not expected_context:
+        return True
+    loaded = data.get("all_models_loaded")
+    if not isinstance(loaded, list):
+        return not _lemonade_version_at_least(data.get("version"), 10, 7)
+    for entry in loaded:
+        if not isinstance(entry, dict):
+            continue
+        matches_entry = (
+            _runtime_model_identity_matches(
+                entry.get("model_name"),
+                model_id=expected_model_id,
+                gguf_file=expected_gguf_file,
+            )
+            or _runtime_model_identity_matches(
+                entry.get("checkpoint"),
+                model_id=expected_model_id,
+                gguf_file=expected_gguf_file,
+            )
+        )
+        if not matches_entry:
+            continue
+        recipe_options = entry.get("recipe_options")
+        if not isinstance(recipe_options, dict):
+            recipe_options = {}
+        actual_context = _positive_int(recipe_options.get("ctx_size") or entry.get("ctx_size"))
+        return bool(actual_context and actual_context >= expected_context)
+    return False
 
 
 def _completion_text(data: object) -> str:
@@ -5587,6 +5648,7 @@ def _wait_for_model_readiness(
         )
         completion_model = lemonade_model_id
         completion_prefix = str(env.get("LEMONADE_API_BASE_PATH") or "/api/v1")
+    expected_context = _positive_int(env.get("CTX_SIZE") or env.get("MAX_CONTEXT"))
 
     logger.info("Waiting for requested model identity %s at %s", gguf_file, identity_url)
     warmup_sent = False
@@ -5607,6 +5669,7 @@ def _wait_for_model_readiness(
                     body,
                     gguf_file,
                     lemonade_model_id,
+                    expected_context,
                 )
                 if not identity_ready and body and (not warmup_sent or attempt % 3 == 0):
                     warmup_sent = _send_lemonade_warmup(
@@ -5812,6 +5875,7 @@ def _restart_windows_lemonade(env: dict):
         "ODS_WIN_PID_FILE": str(INSTALL_DIR / "data" / "llama-server.pid"),
         "ODS_WIN_LEMONADE_PORT": env.get("AMD_INFERENCE_PORT", "8080") or "8080",
         "ODS_WIN_BIND_ADDR": env.get("BIND_ADDRESS", "127.0.0.1") or "127.0.0.1",
+        "ODS_WIN_CONTEXT_SIZE": str(env.get("CTX_SIZE") or env.get("MAX_CONTEXT") or "0"),
     })
     script = r'''
 $ErrorActionPreference = "Stop"
@@ -5823,6 +5887,8 @@ $modelsDir = $env:ODS_WIN_MODELS_DIR
 $pidPath = $env:ODS_WIN_PID_FILE
 $port = [int]$env:ODS_WIN_LEMONADE_PORT
 $bindAddr = $env:ODS_WIN_BIND_ADDR
+$contextSize = 0
+$null = [int]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)
 if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
     throw "Windows Lemonade launch helper not found: $helperPath"
 }
@@ -5968,7 +6034,8 @@ if (-not $proc) {
 if ($launchContract.RequiresRuntimeConfiguration) {
     try {
         $null = Set-ODSLemonadeModernRuntimeConfig `
-            -Port $port -ModelsDir $modelsDir -AdminApiKey $adminApiKey
+            -Port $port -ModelsDir $modelsDir `
+            -AdminApiKey $adminApiKey -ContextSize $contextSize
     } catch {
         $configDiagnostics = Get-ODSLemonadeLaunchDiagnostics `
             -ChildProcess $directProcess

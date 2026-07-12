@@ -140,6 +140,51 @@ class TestCheckLemonadeHealth:
             "lemonade-modern-id",
         ) is True
 
+    def test_modern_health_requires_loaded_context_at_least_expected(self):
+        body = json.dumps({
+            "status": "ok",
+            "version": "10.7.0",
+            "model_loaded": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+            "all_models_loaded": [{
+                "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+                "checkpoint": r"C:\ods\data\models\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+                "recipe_options": {"ctx_size": 131072},
+            }],
+        })
+        assert _check_lemonade_health(
+            body,
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "Qwen3.6-35B-A3B-UD-Q4_K_M",
+            131072,
+        ) is True
+
+    def test_modern_health_rejects_too_small_loaded_context(self):
+        body = json.dumps({
+            "status": "ok",
+            "version": "10.7.0",
+            "model_loaded": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+            "all_models_loaded": [{
+                "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+                "checkpoint": r"C:\ods\data\models\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+                "recipe_options": {"ctx_size": 16384},
+            }],
+        })
+        assert _check_lemonade_health(
+            body,
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "Qwen3.6-35B-A3B-UD-Q4_K_M",
+            131072,
+        ) is False
+
+    def test_legacy_health_without_context_is_not_a_false_red(self):
+        body = '{"status":"ok","version":"10.6.9","model_loaded":"extra.Model.gguf"}'
+        assert _check_lemonade_health(
+            body,
+            "Model.gguf",
+            "extra.Model.gguf",
+            131072,
+        ) is True
+
 
 class TestResolveLemonadeModelId:
 
@@ -1964,6 +2009,11 @@ class TestModelActivateRollback:
                         "status": "ok",
                         "version": "10.7.0",
                         "model_loaded": "Modern-Model",
+                        "all_models_loaded": [{
+                            "model_name": "Modern-Model",
+                            "checkpoint": r"C:\ods\data\models\new-model.gguf",
+                            "recipe_options": {"ctx_size": 4096},
+                        }],
                     }),
                     stderr="",
                 )
