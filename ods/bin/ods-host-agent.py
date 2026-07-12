@@ -4276,28 +4276,13 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
 
         llm_model_name = str(env.get("LLM_MODEL") or model_id or _local_model_name_from_gguf(target_gguf))
-        if not _wait_for_model_readiness(
-            env,
-            model_id=model_id or llm_model_name,
-            gguf_file=target_gguf,
-            llm_model_name=llm_model_name,
-            lemonade_model_id=lemonade_model_id,
-            initial_delay=0,
-        ):
-            json_response(
-                self,
-                500,
-                {"error": f"Windows Lemonade did not load configured model: {target_gguf}"},
-            )
-            return
-
         _upsert_env_value(env_path, "LEMONADE_MODEL", lemonade_model_id)
         _write_lemonade_config(INSTALL_DIR, target_gguf, lemonade_model_id)
         json_response(
             self,
             200,
             {
-                "status": "ready",
+                "status": "configured",
                 "model_id": model_id or llm_model_name,
                 "gguf_file": target_gguf,
                 "lemonade_model_id": lemonade_model_id,

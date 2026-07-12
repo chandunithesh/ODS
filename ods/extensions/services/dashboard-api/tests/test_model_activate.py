@@ -2138,7 +2138,6 @@ class TestModelActivateRollback:
             encoding="utf-8",
         )
         restarts = []
-        readiness = []
 
         def fail_dependent(*_args, **_kwargs):
             raise AssertionError("runtime ensure should leave dependents to ods.ps1 restart")
@@ -2149,11 +2148,7 @@ class TestModelActivateRollback:
         monkeypatch.setattr(_mod, "_live_runtime_has_model", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(_mod, "_restart_windows_lemonade", lambda env: restarts.append(env["GGUF_FILE"]))
         monkeypatch.setattr(_mod, "_resolve_lemonade_model_id", lambda *_args, **_kwargs: "Modern-Model")
-        monkeypatch.setattr(
-            _mod,
-            "_wait_for_model_readiness",
-            lambda *_args, **kwargs: readiness.append(kwargs) or True,
-        )
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", fail_dependent)
         monkeypatch.setattr(_mod, "_restart_existing_container", fail_dependent)
         monkeypatch.setattr(_mod, "_verify_litellm_route", fail_dependent)
         monkeypatch.setattr(_mod, "_verify_running_hermes_route", fail_dependent)
@@ -2168,12 +2163,11 @@ class TestModelActivateRollback:
 
         assert handler.response_code == 200
         assert handler.parse_response() == {
-            "status": "ready",
+            "status": "configured",
             "model_id": "target-model",
             "gguf_file": "new-model.gguf",
             "lemonade_model_id": "Modern-Model",
         }
-        assert readiness and readiness[0]["initial_delay"] == 0
         assert restarts == ["new-model.gguf"]
         assert "LEMONADE_MODEL=Modern-Model" in env_path.read_text(encoding="utf-8")
         assert "model: openai/Modern-Model" in lemonade_yaml.read_text(encoding="utf-8")

@@ -1032,7 +1032,7 @@ function Invoke-ODSHostAgentConfiguredModelActivation {
         $null = Invoke-RestMethod -Method Post -Uri $agentUrl `
             -Headers $headers -ContentType "application/json" -Body $body `
             -TimeoutSec 900 -ErrorAction Stop
-        Write-AISuccess "Lemonade model ready ($modelId)"
+        Wait-ODSLemonadeConfiguredModel -EnvVars $EnvVars
         return $true
     } catch {
         Write-AIWarn "Host agent Lemonade activation unavailable: $($_.Exception.Message)"
