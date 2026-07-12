@@ -658,6 +658,15 @@ os.replace(tmp, pid_path)
 BOOTSTRAP_LAUNCH_PY
 }
 
+_macos_native_llama_cwd_is_owned() {
+    local process_cwd="$1" home_dir="${HOME:-}"
+    [[ -n "$process_cwd" ]] || return 1
+    [[ "$process_cwd" == "$INSTALL_DIR" ]] && return 0
+    [[ -n "$home_dir" && "$process_cwd" == "$home_dir/dream-server" ]] && return 0
+    [[ -n "$home_dir" && "$process_cwd" == "$home_dir/DreamServer" ]] && return 0
+    return 1
+}
+
 _macos_native_llama_pid_is_owned() {
     local pid="$1" command_line process_name process_cwd
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -667,10 +676,16 @@ _macos_native_llama_pid_is_owned() {
     if [[ -n "${LLAMA_SERVER_BIN:-}" && "$command_line" == *"$LLAMA_SERVER_BIN"* ]]; then
         return 0
     fi
+    if [[ -n "${HOME:-}" && "$command_line" == *"$HOME/dream-server/bin/llama-server"* ]]; then
+        return 0
+    fi
+    if [[ -n "${HOME:-}" && "$command_line" == *"$HOME/DreamServer/bin/llama-server"* ]]; then
+        return 0
+    fi
     case "$command_line" in
         ./bin/llama-server*|bin/llama-server*)
             process_cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
-            [[ -n "$process_cwd" && "$process_cwd" == "$INSTALL_DIR" ]]
+            _macos_native_llama_cwd_is_owned "$process_cwd"
             ;;
         *) return 1 ;;
     esac

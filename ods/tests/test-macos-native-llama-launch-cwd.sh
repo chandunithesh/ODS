@@ -56,7 +56,9 @@ grep -qF 'lsof -a -p "$pid" -d cwd -Fn' "$installer" \
     || fail "macOS installer must inspect cwd for relative native llama-server launches"
 grep -qF './bin/llama-server*|bin/llama-server*' "$installer" \
     || fail "macOS installer must treat relative install-dir llama-server processes as owned"
-pass "macOS installer reaps relative-path native llama processes"
+grep -qF '$home_dir/dream-server' "$installer" \
+    || fail "macOS installer must reap legacy Dream Server relative native llama processes"
+pass "macOS installer reaps relative-path native llama processes, including legacy Dream Server cwd"
 
 bridge="$ROOT_DIR/bin/ods-macos-llm-bridge.py"
 bridge_manager="$ROOT_DIR/installers/macos/lib/bridge-manager.sh"
