@@ -60,6 +60,14 @@ def _write(tmp_path, name, data: bytes):
     return p
 
 
+def _nested_array(levels: int):
+    """Build a value tuple for ``levels`` nested arrays wrapping a single u8."""
+    value = (U8, [0])
+    for _ in range(levels - 1):
+        value = (ARR, [value])
+    return value
+
+
 # ── Happy path ───────────────────────────────────────────────────────────────
 
 def test_full_metadata_is_normalized(tmp_path):
@@ -170,6 +178,34 @@ def test_array_boundary_of_sample_limit_stays_inline(tmp_path):
     ]))
 
     assert inspect_gguf(path)["metadata"]["edge.ints"] == list(range(64))
+
+
+def test_shallow_nested_array_still_parses(tmp_path):
+    # Nesting is legal in the GGUF spec; a shallow chain must round-trip.
+    path = _write(tmp_path, "nested.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("nested.arr", ARR, _nested_array(4)),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is True
+    assert result["metadata"]["nested.arr"] == [[[[0]]]]
+
+
+def test_deeply_nested_array_degrades_without_recursion_error(tmp_path):
+    # A pathologically nested array must not crash the parser (RecursionError
+    # escaping the failure contract) — it degrades to a bounded-depth error.
+    path = _write(tmp_path, "deep.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("deep.arr", ARR, _nested_array(500)),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is False
+    assert result["architecture"] == "unknown"
+    assert "too deep" in result["error"]
 
 
 # ── file_type / quantization normalization ──────────────────────────────────
