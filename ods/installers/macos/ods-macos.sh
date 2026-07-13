@@ -147,6 +147,45 @@ get_compose_flags() {
     echo "$flags"
 }
 
+compose_pull_with_retry() {
+    local flags="$1"
+    local log_file
+    log_file="$(mktemp)"
+    local max_attempts="${ODS_COMPOSE_PULL_RETRY_ATTEMPTS:-3}"
+    if ! [[ "$max_attempts" =~ ^[0-9]+$ ]] || (( max_attempts < 1 )); then
+        max_attempts=3
+    fi
+
+    local attempt=1 rc=0
+    while :; do
+        : > "$log_file"
+        rc=0
+        # shellcheck disable=SC2086
+        docker compose $flags pull --ignore-buildable >"$log_file" 2>&1 || rc=$?
+        if (( rc == 0 )); then
+            rm -f "$log_file"
+            return 0
+        fi
+
+        if (( attempt >= max_attempts )) || ! grep -Eiq 'context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|connection timed out|temporary failure|network is unreachable|net/http: request canceled|unexpected EOF|failed to authorize: failed to fetch' "$log_file"; then
+            ai_err "docker compose pull failed (exit code: ${rc})"
+            tail -40 "$log_file" >&2 || true
+            rm -f "$log_file"
+            return "$rc"
+        fi
+
+        local delay
+        case "$attempt" in
+            1) delay="${ODS_COMPOSE_PULL_RETRY_DELAY_1:-5}" ;;
+            2) delay="${ODS_COMPOSE_PULL_RETRY_DELAY_2:-15}" ;;
+            *) delay="${ODS_COMPOSE_PULL_RETRY_DELAY_N:-30}" ;;
+        esac
+        ai_warn "Docker registry pull hit a transient network error; retrying (${attempt}/$((max_attempts - 1)))."
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
 read_ods_env() {
     local env_file="${INSTALL_DIR}/.env"
     if [[ ! -f "$env_file" ]]; then
@@ -737,8 +776,7 @@ cmd_update() {
     flags=$(get_compose_flags)
 
     ai "Pulling latest images..."
-    # shellcheck disable=SC2086
-    docker compose $flags pull
+    compose_pull_with_retry "$flags"
 
     ai "Recreating containers..."
     # shellcheck disable=SC2086
