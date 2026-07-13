@@ -85,6 +85,10 @@ grep -q 'ODS_BOOTSTRAP_DOWNLOAD_SPEED_LIMIT' "$TARGET" \
     || fail "bootstrap-upgrade download speed floor must be operator-configurable"
 grep -q 'ODS_BOOTSTRAP_DOWNLOAD_HTTP_VERSION' "$TARGET" \
     || fail "bootstrap-upgrade HTTP transport must be operator-configurable"
+grep -q 'ODS_BOOTSTRAP_DOWNLOAD_MAX_SECONDS' "$TARGET" \
+    || fail "bootstrap-upgrade detached download should self-retry within a bounded wall-clock budget"
+grep -q 'Retrying download in ${_download_retry_backoff_seconds}s; partial file preserved for resume.' "$TARGET" \
+    || fail "bootstrap-upgrade retry exhaustion should keep status active before the retry budget expires"
 grep -q -- '--http1.1' "$TARGET" \
     || fail "bootstrap-upgrade should prefer HTTP/1.1 after observed HuggingFace HTTP/2 stream cancels"
 if grep -q -- '--speed-time 300 --speed-limit 1024' "$TARGET"; then
@@ -142,7 +146,7 @@ grep -q "Continuing existing bootstrap model upgrade (pid $existing_pid)" \
 kill "$existing_pid" 2>/dev/null || true
 
 set +e
-PATH="$fakebin:$PATH" ODS_BOOTSTRAP_DOWNLOAD_ATTEMPTS=2 bash "$TARGET" \
+PATH="$fakebin:$PATH" ODS_BOOTSTRAP_DOWNLOAD_ATTEMPTS=2 ODS_BOOTSTRAP_DOWNLOAD_MAX_SECONDS=0 bash "$TARGET" \
     "$install_dir" \
     "Full.gguf" \
     "https://example.invalid/Full.gguf" \
@@ -177,7 +181,7 @@ printf 'bootstrap model\n' > "$unknown_install_dir/data/models/Bootstrap.gguf"
 printf '999999\n' > "$unknown_install_dir/data/.llama-server.pid"
 
 set +e
-PATH="$fakebin:$PATH" ODS_FAKE_NO_CONTENT_LENGTH=1 ODS_BOOTSTRAP_DOWNLOAD_ATTEMPTS=1 bash "$TARGET" \
+PATH="$fakebin:$PATH" ODS_FAKE_NO_CONTENT_LENGTH=1 ODS_BOOTSTRAP_DOWNLOAD_ATTEMPTS=1 ODS_BOOTSTRAP_DOWNLOAD_MAX_SECONDS=0 bash "$TARGET" \
     "$unknown_install_dir" \
     "Full.gguf" \
     "https://example.invalid/Full.gguf" \

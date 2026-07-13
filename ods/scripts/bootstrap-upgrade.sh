@@ -546,7 +546,7 @@ json_has_id() {
     grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${id_re}\"" <<<"$json"
 }
 
-windows_lemonade_model_id_matches_gguf() {
+lemonade_model_id_matches_gguf() {
     local model_id="$1" target_gguf="$2"
     [[ -n "$model_id" && -n "$target_gguf" ]] || return 1
 
@@ -565,7 +565,11 @@ windows_lemonade_model_id_matches_gguf() {
     return 1
 }
 
-resolve_live_windows_lemonade_model_id() {
+windows_lemonade_model_id_matches_gguf() {
+    lemonade_model_id_matches_gguf "$@"
+}
+
+resolve_live_lemonade_model_id() {
     local port="$1" target_gguf="$2"
     [[ -n "$port" && -n "$target_gguf" ]] || return 1
 
@@ -577,7 +581,7 @@ resolve_live_windows_lemonade_model_id() {
     loaded="$(printf '%s' "$health" \
         | sed -n 's/.*"model_loaded"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
         | tail -1)"
-    if windows_lemonade_model_id_matches_gguf "$loaded" "$target_gguf"; then
+    if lemonade_model_id_matches_gguf "$loaded" "$target_gguf"; then
         printf '%s\n' "$loaded"
         return 0
     fi
@@ -590,6 +594,10 @@ resolve_live_windows_lemonade_model_id() {
         fi
     done
     return 1
+}
+
+resolve_live_windows_lemonade_model_id() {
+    resolve_live_lemonade_model_id "$@"
 }
 
 verify_windows_lemonade_loaded_context() {
@@ -1720,13 +1728,21 @@ refresh_lemonade_after_bootstrap_cleanup() {
     lemonade_port="$(read_env_value OLLAMA_PORT)"
     [[ -n "$lemonade_port" ]] || lemonade_port="8080"
     model_id="$(read_env_value LEMONADE_MODEL)"
-    [[ -n "$model_id" ]] || model_id="extra.${FULL_GGUF_FILE//\"/\\\"}"
+    if ! lemonade_model_id_matches_gguf "$model_id" "$FULL_GGUF_FILE"; then
+        _resolved_model_id="$(resolve_live_lemonade_model_id "$lemonade_port" "$FULL_GGUF_FILE" || true)"
+        if [[ -n "$_resolved_model_id" ]]; then
+            model_id="$_resolved_model_id"
+        else
+            model_id="extra.${FULL_GGUF_FILE//\"/\\\"}"
+        fi
+        write_env_value LEMONADE_MODEL "$model_id" || \
+            log "WARNING: could not persist Lemonade cleanup model id $model_id"
+    fi
     old_model_id="extra.${BOOTSTRAP_GGUF//\"/\\\"}"
 
     for _i in $(seq 1 60); do
         models_json="$(curl -sf --max-time 5 "http://127.0.0.1:${lemonade_port}/api/v1/models" 2>/dev/null || true)"
-        if echo "$models_json" | grep -q "\"id\"[[:space:]]*:[[:space:]]*\"${model_id}\"" \
-            && ! echo "$models_json" | grep -q "\"id\"[[:space:]]*:[[:space:]]*\"${old_model_id}\""; then
+        if json_has_id "$models_json" "$model_id" && ! json_has_id "$models_json" "$old_model_id"; then
             if curl -sf --max-time 240 -X POST \
                 "http://127.0.0.1:${lemonade_port}/api/v1/chat/completions" \
                 -H "Content-Type: application/json" \
@@ -1861,6 +1877,14 @@ _download_attempts="${ODS_BOOTSTRAP_DOWNLOAD_ATTEMPTS:-6}"
 case "$_download_attempts" in
     ''|*[!0-9]*|0) _download_attempts=6 ;;
 esac
+_download_max_seconds="${ODS_BOOTSTRAP_DOWNLOAD_MAX_SECONDS:-7200}"
+case "$_download_max_seconds" in
+    ''|*[!0-9]*) _download_max_seconds=7200 ;;
+esac
+_download_retry_backoff_seconds="${ODS_BOOTSTRAP_DOWNLOAD_RETRY_BACKOFF_SECONDS:-30}"
+case "$_download_retry_backoff_seconds" in
+    ''|*[!0-9]*|0) _download_retry_backoff_seconds=30 ;;
+esac
 _download_connect_timeout="${ODS_BOOTSTRAP_DOWNLOAD_CONNECT_TIMEOUT:-30}"
 case "$_download_connect_timeout" in
     ''|*[!0-9]*|0) _download_connect_timeout=30 ;;
@@ -1925,85 +1949,112 @@ if [[ "$_dl_success" != "true" ]]; then
     # Download with resume support. curl success is not enough: finalizing the
     # .part file can fail, and checksum verification can expose a corrupt
     # resume. Keep retries inside the script so the detached upgrade can
-    # recover without leaving the user on the bootstrap model.
-    for ((_attempt=1; _attempt<=_download_attempts; _attempt++)); do
-        [[ $_attempt -gt 1 ]] && log "Retry attempt $_attempt of $_download_attempts..." && sleep 5
-
-        if [[ -f "$_part_path" && "$TOTAL_BYTES" -gt 0 ]]; then
-            _part_bytes="$(file_size "$_part_path")"
-            if [[ "$_part_bytes" -gt "$TOTAL_BYTES" ]]; then
-                log "Partial file grew larger than expected before attempt $_attempt (got $_part_bytes, expected $TOTAL_BYTES); deleting corrupt resume state."
-                rm -f "$_part_path"
-            elif [[ "$_part_bytes" -eq "$TOTAL_BYTES" ]]; then
-                log "Partial file already has the expected size; promoting it for integrity verification."
-                acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
-                if ! mv "$_part_path" "$_final_path"; then
-                    log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
-                    release_model_lifecycle_lock
-                fi
+    # recover without leaving the user on the bootstrap model. Transient
+    # low-speed failures get fresh attempt batches until a bounded wall-clock
+    # budget is exhausted; while the script owns that retry, status remains
+    # active so the UI/harness do not require a manual `ods restart`.
+    _download_started_at="$(date +%s)"
+    _download_round=1
+    while [[ "$_dl_success" != "true" ]]; do
+        for ((_attempt=1; _attempt<=_download_attempts; _attempt++)); do
+            if [[ "$_download_round" -gt 1 || "$_attempt" -gt 1 ]]; then
+                log "Retry attempt $_attempt of $_download_attempts (round $_download_round)..."
+                sleep 5
             fi
-        fi
 
-        if [[ ! -f "$_final_path" ]]; then
-            # Let this script own retry/resume. curl's internal retry path can
-            # restart the transfer from byte zero after a long connection reset,
-            # truncating an otherwise good multi-GB .part file.
-            if curl -fSL -C - --connect-timeout "$_download_connect_timeout" \
-                    --speed-time "$_download_speed_time" --speed-limit "$_download_speed_limit" \
-                    "${_download_curl_http_flags[@]}" \
-                    -o "$_part_path" "$FULL_GGUF_URL" 2>&1; then
-                if [[ ! -s "$_part_path" ]]; then
-                    log "Download attempt $_attempt reported success but produced no partial file: $_part_path"
-                else
+            if [[ -f "$_part_path" && "$TOTAL_BYTES" -gt 0 ]]; then
+                _part_bytes="$(file_size "$_part_path")"
+                if [[ "$_part_bytes" -gt "$TOTAL_BYTES" ]]; then
+                    log "Partial file grew larger than expected before attempt $_attempt (got $_part_bytes, expected $TOTAL_BYTES); deleting corrupt resume state."
+                    rm -f "$_part_path"
+                elif [[ "$_part_bytes" -eq "$TOTAL_BYTES" ]]; then
+                    log "Partial file already has the expected size; promoting it for integrity verification."
                     acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
                     if ! mv "$_part_path" "$_final_path"; then
                         log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
                         release_model_lifecycle_lock
                     fi
                 fi
-            else
-                log "Download attempt $_attempt failed"
             fi
-        fi
 
-        if [[ ! -s "$_final_path" ]]; then
-            continue
-        fi
+            if [[ ! -f "$_final_path" ]]; then
+                # Let this script own retry/resume. curl's internal retry path can
+                # restart the transfer from byte zero after a long connection reset,
+                # truncating an otherwise good multi-GB .part file.
+                if curl -fSL -C - --connect-timeout "$_download_connect_timeout" \
+                        --speed-time "$_download_speed_time" --speed-limit "$_download_speed_limit" \
+                        "${_download_curl_http_flags[@]}" \
+                        -o "$_part_path" "$FULL_GGUF_URL" 2>&1; then
+                    if [[ ! -s "$_part_path" ]]; then
+                        log "Download attempt $_attempt reported success but produced no partial file: $_part_path"
+                    else
+                        acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
+                        if ! mv "$_part_path" "$_final_path"; then
+                            log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
+                            release_model_lifecycle_lock
+                        fi
+                    fi
+                else
+                    log "Download attempt $_attempt failed"
+                fi
+            fi
 
-        if [[ "$TOTAL_BYTES" -gt 0 ]]; then
-            ACTUAL_BYTES=$(file_size "$_final_path")
-            if [[ "$ACTUAL_BYTES" -lt "$TOTAL_BYTES" ]]; then
-                mv "$_final_path" "$_part_path" 2>/dev/null || rm -f "$_final_path"
-                release_model_lifecycle_lock
-                log "Downloaded model is smaller than expected (got $ACTUAL_BYTES, expected $TOTAL_BYTES); preserving as partial for retry."
+            if [[ ! -s "$_final_path" ]]; then
                 continue
             fi
-            if [[ "$ACTUAL_BYTES" -gt "$TOTAL_BYTES" ]]; then
-                rm -f "$_final_path" "$_part_path"
-                release_model_lifecycle_lock
-                log "Downloaded model is larger than expected (got $ACTUAL_BYTES, expected $TOTAL_BYTES); deleting corrupt file and retrying from scratch."
-                continue
-            fi
-        fi
 
-        write_status "verifying" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 ""
-        log "Download complete: $FULL_GGUF_FILE"
-        if verify_model_integrity "$_final_path"; then
-            _dl_success=true
+            if [[ "$TOTAL_BYTES" -gt 0 ]]; then
+                ACTUAL_BYTES=$(file_size "$_final_path")
+                if [[ "$ACTUAL_BYTES" -lt "$TOTAL_BYTES" ]]; then
+                    mv "$_final_path" "$_part_path" 2>/dev/null || rm -f "$_final_path"
+                    release_model_lifecycle_lock
+                    log "Downloaded model is smaller than expected (got $ACTUAL_BYTES, expected $TOTAL_BYTES); preserving as partial for retry."
+                    continue
+                fi
+                if [[ "$ACTUAL_BYTES" -gt "$TOTAL_BYTES" ]]; then
+                    rm -f "$_final_path" "$_part_path"
+                    release_model_lifecycle_lock
+                    log "Downloaded model is larger than expected (got $ACTUAL_BYTES, expected $TOTAL_BYTES); deleting corrupt file and retrying from scratch."
+                    continue
+                fi
+            fi
+
+            write_status "verifying" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 ""
+            log "Download complete: $FULL_GGUF_FILE"
+            if verify_model_integrity "$_final_path"; then
+                _dl_success=true
+                break
+            fi
+
+            rm -f "$_final_path" "$_part_path"
+            release_model_lifecycle_lock
+            log "Integrity verification failed on attempt $_attempt; retrying from a clean download."
+        done
+
+        [[ "$_dl_success" == "true" ]] && break
+
+        _download_now="$(date +%s)"
+        _download_elapsed=$(( _download_now - _download_started_at ))
+        if [[ "$_download_max_seconds" -le 0 || "$_download_elapsed" -ge "$_download_max_seconds" ]]; then
             break
         fi
 
-        rm -f "$_final_path" "$_part_path"
-        release_model_lifecycle_lock
-        log "Integrity verification failed on attempt $_attempt; retrying from a clean download."
+        _downloaded_bytes=0
+        [[ -f "$_part_path" ]] && _downloaded_bytes="$(file_size "$_part_path")"
+        _download_percent="$(status_percent "$_downloaded_bytes" "$TOTAL_BYTES")"
+        write_status "downloading" "$_download_percent" "$_downloaded_bytes" "$TOTAL_BYTES" 0 \
+            "Retrying download in ${_download_retry_backoff_seconds}s; partial file preserved for resume."
+        log "Download attempts exhausted after ${_download_elapsed}s; retrying in ${_download_retry_backoff_seconds}s with partial resume."
+        sleep "$_download_retry_backoff_seconds"
+        _download_round=$(( _download_round + 1 ))
     done
 
     kill $_monitor_pid 2>/dev/null || true
     trap - TERM INT
 
     if [[ "$_dl_success" != "true" ]]; then
-        write_failed_download_status "$_part_path" "$TOTAL_BYTES" "Download failed after $_download_attempts attempts; partial file preserved for resume."
-        fail "Download failed after $_download_attempts attempts. Preserved partial file for resume: $_part_path. Bootstrap model will continue running."
+        write_failed_download_status "$_part_path" "$TOTAL_BYTES" "Download failed after bounded retry budget; partial file preserved for resume."
+        fail "Download failed after bounded retry budget. Preserved partial file for resume: $_part_path. Bootstrap model will continue running."
     fi
 fi
 
@@ -2083,6 +2134,22 @@ if [[ -f "$ENV_FILE" ]]; then
     if grep -q '^CTX_SIZE=' "$ENV_FILE"; then
         awk -v v="$FULL_MAX_CONTEXT" '{ if (index($0, "CTX_SIZE=") == 1) print "CTX_SIZE=" v; else print }' \
             "$ENV_FILE" > "${ENV_FILE}.tmp" && cat "${ENV_FILE}.tmp" > "$ENV_FILE" && rm -f "${ENV_FILE}.tmp"
+    fi
+    # Linux AMD installs route through Lemonade, whose request model id is a
+    # separate runtime alias. Keep it in lockstep with the promoted GGUF so
+    # LiteLLM/Hermes/OpenClaw do not keep targeting the deleted bootstrap id.
+    if ! is_windows_bash; then
+        _promotion_gpu_backend="$(read_env_value GPU_BACKEND | tr '[:upper:]' '[:lower:]')"
+        _promotion_llm_backend="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
+        if [[ "$_promotion_gpu_backend" == "amd" || "$_promotion_llm_backend" == "lemonade" ]]; then
+            _promotion_lemonade_model_id="extra.${FULL_GGUF_FILE}"
+            if write_env_value LEMONADE_MODEL "$_promotion_lemonade_model_id"; then
+                log "LEMONADE_MODEL updated for full model: $_promotion_lemonade_model_id"
+            else
+                log "WARNING: could not persist LEMONADE_MODEL=$_promotion_lemonade_model_id"
+            fi
+        fi
+        unset _promotion_gpu_backend _promotion_llm_backend _promotion_lemonade_model_id
     fi
     log ".env updated"
 else
@@ -2289,8 +2356,18 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
             if [[ "$_gpu_backend" == "amd" ]]; then
                 # Lemonade: verify a model is actually loaded, not just "status: ok"
                 if echo "$_resp" | grep -q '"model_loaded"' && ! echo "$_resp" | grep -q '"model_loaded": *null'; then
-                    _healthy=true
-                    break
+                    _loaded_model_id="$(printf '%s\n' "$_resp" \
+                        | sed -n 's/.*"model_loaded"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                        | tail -1)"
+                    if lemonade_model_id_matches_gguf "$_loaded_model_id" "$FULL_GGUF_FILE"; then
+                        if [[ "$(read_env_value LEMONADE_MODEL)" != "$_loaded_model_id" ]]; then
+                            write_env_value LEMONADE_MODEL "$_loaded_model_id" || \
+                                log "WARNING: could not persist live Lemonade model id $_loaded_model_id"
+                        fi
+                        _healthy=true
+                        break
+                    fi
+                    log "Lemonade loaded stale model ${_loaded_model_id:-<unknown>}; waiting for ${FULL_GGUF_FILE} (attempt $_i/60)"
                 fi
                 # Lemonade is healthy but no model loaded — send a warm-up request
                 # to trigger on-demand loading of the new model. Lemonade caches the
@@ -2303,6 +2380,18 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
                     # below stays well-formed even for non-standard library entries.
                     # Mirrors the _safe_model pattern in write_status() above.
                     _model_id="$(read_env_value LEMONADE_MODEL)"
+                    if ! lemonade_model_id_matches_gguf "$_model_id" "$FULL_GGUF_FILE"; then
+                        _resolved_model_id="$(resolve_live_lemonade_model_id "${OLLAMA_PORT:-8080}" "$FULL_GGUF_FILE" || true)"
+                        if [[ -n "$_resolved_model_id" ]]; then
+                            _model_id="$_resolved_model_id"
+                            write_env_value LEMONADE_MODEL "$_model_id" || \
+                                log "WARNING: could not persist resolved Lemonade model id $_model_id"
+                        else
+                            _model_id="extra.${FULL_GGUF_FILE//\"/\\\"}"
+                            write_env_value LEMONADE_MODEL "$_model_id" || \
+                                log "WARNING: could not persist fallback Lemonade model id $_model_id"
+                        fi
+                    fi
                     [[ -n "$_model_id" ]] || _model_id="extra.${FULL_GGUF_FILE//\"/\\\"}"
                     log "Sending warm-up request to trigger model loading: $_model_id (attempt $_i/60)"
                     if curl -sf --max-time 30 -X POST \
@@ -2374,7 +2463,16 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
         # reference the exact ID, not a wildcard passthrough.
         if $DOCKER_CMD ps --filter name=ods-litellm --format '{{.Names}}' 2>/dev/null | grep -q ods-litellm; then
             _lemonade_model_id="$(read_env_value LEMONADE_MODEL)"
-            [[ -n "$_lemonade_model_id" ]] || _lemonade_model_id="extra.${FULL_GGUF_FILE}"
+            if ! lemonade_model_id_matches_gguf "$_lemonade_model_id" "$FULL_GGUF_FILE"; then
+                _resolved_lemonade_model_id="$(resolve_live_lemonade_model_id "${OLLAMA_PORT:-8080}" "$FULL_GGUF_FILE" || true)"
+                if [[ -n "$_resolved_lemonade_model_id" ]]; then
+                    _lemonade_model_id="$_resolved_lemonade_model_id"
+                else
+                    _lemonade_model_id="extra.${FULL_GGUF_FILE}"
+                fi
+                write_env_value LEMONADE_MODEL "$_lemonade_model_id" || \
+                    log "WARNING: could not persist Lemonade model id $_lemonade_model_id before config render"
+            fi
             log "Updating LiteLLM config for new model: ${_lemonade_model_id}"
             # Read per-install lemonade key from .env; fall back to literal so
             # older installs without the key still produce a valid config (lemonade
@@ -2458,7 +2556,7 @@ litellm_settings:
   stream_timeout: 900
 LITELLM_UPGRADE_EOF
             fi
-            unset _renderer_ok _renderer_script _renderer_py _lemonade_api_base _lemonade_model_id _amd_location _amd_port
+            unset _renderer_ok _renderer_script _renderer_py _lemonade_api_base _lemonade_model_id _resolved_lemonade_model_id _amd_location _amd_port
             log "Restarting LiteLLM to pick up model change..."
             $DOCKER_CMD restart ods-litellm 2>&1 || log "WARNING: LiteLLM restart failed (non-fatal)"
         fi

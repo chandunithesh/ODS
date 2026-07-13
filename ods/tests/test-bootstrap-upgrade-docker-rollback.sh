@@ -59,6 +59,12 @@ printf 'Linux\n'
 EOF
 chmod +x "$fakebin/uname"
 
+cat > "$fakebin/flock" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$fakebin/flock"
+
 cat > "$fakebin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
