@@ -2516,6 +2516,101 @@ class TestModelActivateRollback:
         assert "    context_length: 4096" in hermes_live.read_text(encoding="utf-8")
         assert '  base_url: "http://host.docker.internal:8080/v1"' in hermes_live.read_text(encoding="utf-8")
 
+    def test_activation_preserves_matching_recommended_context(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        env_path.write_text(
+            "GPU_BACKEND=nvidia\n"
+            "GGUF_FILE=Phi-4-mini-instruct-Q4_K_M.gguf\n"
+            "LLM_MODEL=phi-4-mini\n"
+            "CTX_SIZE=128000\n"
+            "MAX_CONTEXT=128000\n"
+            "MODEL_RECOMMENDED_MODEL=new-model\n"
+            "MODEL_RECOMMENDED_GGUF=new-model.gguf\n"
+            "MODEL_RECOMMENDED_CONTEXT=65536\n"
+            "OLLAMA_PORT=8080\n",
+            encoding="utf-8",
+        )
+        hermes_live = install_dir / "data" / "hermes" / "config.yaml"
+        hermes_template = install_dir / "extensions" / "services" / "hermes" / "cli-config.yaml.template"
+        hermes_live.parent.mkdir(parents=True)
+        hermes_template.parent.mkdir(parents=True)
+        hermes_text = (
+            "model:\n"
+            "  default: \"Phi-4-mini-instruct-Q4_K_M.gguf\"\n"
+            "  provider: \"custom\"\n"
+            "  context_length: 128000\n"
+            "auxiliary:\n"
+            "  compression:\n"
+            "    context_length: 128000\n"
+        )
+        hermes_live.write_text(hermes_text, encoding="utf-8")
+        hermes_template.write_text(hermes_text, encoding="utf-8")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+
+        def fake_run(cmd, **_kwargs):
+            stdout = _llama_identity_response("new-model.gguf") if cmd and cmd[0] == "curl" else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        env_text = env_path.read_text(encoding="utf-8")
+        assert "MAX_CONTEXT=65536" in env_text
+        assert "CTX_SIZE=65536" in env_text
+        assert "n-ctx = 65536" in models_ini.read_text(encoding="utf-8")
+        assert "  context_length: 65536" in hermes_live.read_text(encoding="utf-8")
+        assert "    context_length: 65536" in hermes_live.read_text(encoding="utf-8")
+        assert "  context_length: 65536" in hermes_template.read_text(encoding="utf-8")
+
+    def test_activation_ignores_recommended_context_for_other_model(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        env_path.write_text(
+            "GPU_BACKEND=nvidia\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
+            "CTX_SIZE=131072\n"
+            "MAX_CONTEXT=131072\n"
+            "MODEL_RECOMMENDED_MODEL=other-model\n"
+            "MODEL_RECOMMENDED_GGUF=other-model.gguf\n"
+            "MODEL_RECOMMENDED_CONTEXT=65536\n"
+            "OLLAMA_PORT=8080\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+
+        def fake_run(cmd, **_kwargs):
+            stdout = _llama_identity_response("new-model.gguf") if cmd and cmd[0] == "curl" else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        env_text = env_path.read_text(encoding="utf-8")
+        assert "MAX_CONTEXT=4096" in env_text
+        assert "CTX_SIZE=4096" in env_text
+
     def test_activation_updates_uid_owned_hermes_config_through_container(
         self, tmp_path, monkeypatch,
     ):

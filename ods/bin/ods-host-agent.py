@@ -4593,6 +4593,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                     pass
                 llama_server_image = runtime_profile.get("llama_server_image") or llama_server_image
                 runtime_env = runtime_profile.get("env") if isinstance(runtime_profile.get("env"), dict) else {}
+            recommended_context = _recommended_activation_context(
+                model_id,
+                model,
+                env_pre,
+            )
+            if recommended_context is not None:
+                context_length = recommended_context
 
             # Save rollback snapshot
             env_backup = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
@@ -5302,6 +5309,29 @@ def _positive_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _recommended_activation_context(model_id: str, model: dict, env: dict) -> int | None:
+    """Return installer-persisted context when activating that recommendation."""
+    context = _positive_int(env.get("MODEL_RECOMMENDED_CONTEXT"))
+    if context is None:
+        return None
+
+    gguf_file = str(model.get("gguf_file") or "")
+    llm_model_name = str(model.get("llm_model_name") or model_id or "")
+    recommended_values = (
+        env.get("MODEL_RECOMMENDED_GGUF"),
+        env.get("MODEL_RECOMMENDED_MODEL"),
+    )
+    for value in recommended_values:
+        if _runtime_model_identity_matches(
+            value,
+            model_id=model_id,
+            gguf_file=gguf_file,
+            llm_model_name=llm_model_name,
+        ):
+            return context
+    return None
 
 
 def _lemonade_version_at_least(value: object, major: int, minor: int) -> bool:
