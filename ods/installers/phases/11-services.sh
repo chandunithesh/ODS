@@ -122,8 +122,10 @@ _phase11_download_hf_artifact() {
     [[ -n "$python_cmd" ]] || return 2
 
     if ! "$python_cmd" -c "import huggingface_hub, hf_xet" >/dev/null 2>&1; then
-        "$python_cmd" -m pip install --user -q "huggingface_hub[hf_xet]>=0.27" \
-            >> "$log_file" 2>&1 || true
+        if ods_ensure_python_pip "$python_cmd" "Hugging Face downloader"; then
+            "$python_cmd" -m pip install --user -q "huggingface_hub[hf_xet]>=0.27" \
+                >> "$log_file" 2>&1 || true
+        fi
     fi
 
     "$python_cmd" "$helper" "$url" "$destination" >> "$log_file" 2>&1

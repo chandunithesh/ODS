@@ -121,6 +121,59 @@ assert_contains "$runtime_calls" 'pkg_install:python3' "Python guard did not ins
 assert_contains "$runtime_calls" 'pkg_install:python3-pyyaml' "Python guard did not install PyYAML after python3"
 assert_contains "$runtime_out" 'OK PyYAML available' "Python guard did not re-check PyYAML after install"
 
+echo "[contract] Linux Python guard installs missing pip before user-site packages"
+pip_runtime_out="$tmpdir/python-pip-runtime.out"
+pip_runtime_calls="$tmpdir/python-pip-runtime.calls"
+bash -c '
+  set -euo pipefail
+  ROOT_DIR="$1"
+  tmpdir="$2"
+  calls="$3"
+  cd "$ROOT_DIR"
+
+  SCRIPT_DIR="$ROOT_DIR"
+  LOG_FILE=/dev/null
+  DRY_RUN=false
+  INTERACTIVE=false
+  PKG_MANAGER=apt
+
+  ai() { echo "AI $*"; }
+  ai_ok() { echo "OK $*"; }
+  ai_warn() { echo "WARN $*"; }
+  ai_bad() { echo "BAD $*"; }
+  error() { echo "ERROR $*" >&2; exit 1; }
+  pkg_update() { echo "pkg_update" >>"$calls"; }
+  pkg_install() {
+    local pkg
+    for pkg in "$@"; do
+      echo "pkg_install:$pkg" >>"$calls"
+      case "$pkg" in
+        python3-pip) touch "$tmpdir/pip-ready" ;;
+      esac
+    done
+  }
+
+  fake_py="$tmpdir/fake-python-pip"
+  cat > "$fake_py" <<PYEOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-m" && "\${2:-}" == "pip" && "\${3:-}" == "--version" ]]; then
+  [[ -f "$tmpdir/pip-ready" ]] && exit 0 || exit 1
+fi
+if [[ "\${1:-}" == "-m" && "\${2:-}" == "ensurepip" ]]; then
+  touch "$tmpdir/pip-ready"
+  exit 0
+fi
+exit 0
+PYEOF
+  chmod +x "$fake_py"
+
+  source installers/lib/python-runtime.sh
+  ods_ensure_python_pip "$fake_py" "Test"
+' bash "$ROOT_DIR" "$tmpdir" "$pip_runtime_calls" >"$pip_runtime_out"
+assert_contains "$pip_runtime_calls" 'pkg_update' "Python pip guard did not update package metadata before installing"
+assert_contains "$pip_runtime_calls" 'pkg_install:python3-pip' "Python pip guard did not install missing python3-pip"
+assert_contains "$pip_runtime_out" 'OK Test pip available' "Python pip guard did not re-check pip after install"
+
 echo "[contract] public bootstrap supports non-gnu Linux OSTYPE and zypper prerequisites"
 bootstrap="get-ods.sh"
 assert_contains "$bootstrap" '\$\{OSTYPE:-\}' "bootstrap should guard OSTYPE when detecting Linux"
@@ -183,6 +236,8 @@ linux_services="installers/phases/11-services.sh"
 macos_ui="installers/macos/lib/ui.sh"
 macos_installer="installers/macos/install-macos.sh"
 assert_contains "$linux_services" 'download-hf-artifact.py' "Linux bootstrap model download should fall back to Hugging Face client for Xet-backed artifacts"
+assert_contains "$linux_services" 'ods_ensure_python_pip' "Linux Hugging Face fallback should install pip before Python package dependencies"
+assert_contains "installers/phases/07-devtools.sh" 'ods_ensure_python_pip' "Linux host-agent downloader dependency install should install pip first"
 assert_contains "$macos_ui" 'curl -C - -L --progress-bar' "macOS bootstrap model download should preserve curl resume support"
 assert_contains "$macos_ui" 'ODS_DOWNLOAD_CONNECT_TIMEOUT:-30' "macOS bootstrap model download should allow configurable connect timeout"
 assert_contains "$macos_ui" 'ODS_DOWNLOAD_LOW_SPEED_TIME:-120' "macOS bootstrap model download should fail/retry stalled transfers promptly"
@@ -560,7 +615,8 @@ assert_contains "installers/windows/ods.ps1" 'Resolve-ODSHostAgentPython' "ods.p
 assert_contains "installers/windows/ods.ps1" 'WindowsApps' "ods.ps1 agent start does not reject Microsoft Store Python aliases"
 assert_contains "installers/windows/ods.ps1" 'PrefixArgs' "ods.ps1 agent start does not support py launcher -3 arguments"
 assert_contains "installers/windows/ods.ps1" 'Register-ScheduledTask -TaskName \$script:ODS_AGENT_TASK_NAME' "ods.ps1 agent start should use Scheduled Tasks so SSH-launched agents persist"
-assert_contains "installers/windows/ods.ps1" 'RedirectStandardError .* -Wait' "ods.ps1 agent task should wait on Python instead of spawning a transient child"
+assert_contains "installers/windows/ods.ps1" 'RedirectStandardError' "ods.ps1 agent task should redirect stderr away from SSH/CLI parents"
+assert_not_contains "installers/windows/ods.ps1" 'RedirectStandardError .* -Wait' "ods.ps1 agent task should detach from host-agent callers"
 assert_contains "lib/python-cmd.sh" 'windowsapps/python3' "Bash Python resolver should reject WindowsApps python3 aliases"
 
 fake_winapps="$tmpdir/Local/Microsoft/WindowsApps"
