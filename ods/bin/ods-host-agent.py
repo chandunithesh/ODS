@@ -36,7 +36,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib import request as urllib_request
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 VERSION = "1.0.0"
 ODS_VERSION = VERSION
@@ -307,6 +307,119 @@ def _end_model_activation() -> None:
 def _download_status_model_token(value: object) -> str:
     """Return the catalog filename embedded in a progress label."""
     return str(value or "").split(" (", 1)[0].strip()
+
+
+def _format_curl_download_error(returncode: int | None, stderr_text: object) -> str:
+    """Return a bounded user-facing curl failure with the useful server reason."""
+    message = f"curl exited with code {returncode}"
+    details = str(stderr_text or "").strip()
+    if not details:
+        return message
+    details = " ".join(details.split())
+    if len(details) > 500:
+        details = details[:497].rstrip() + "..."
+    return f"{message}: {details}"
+
+
+def _parse_huggingface_resolve_url(url: object) -> tuple[str, str, str] | None:
+    """Return repo_id, revision, and filename for a Hugging Face resolve URL."""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.netloc.lower() not in {"huggingface.co", "www.huggingface.co", "hf.co"}:
+        return None
+    parts = [unquote(part) for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 5 or parts[2] != "resolve":
+        return None
+    repo_id = f"{parts[0]}/{parts[1]}"
+    revision = parts[3]
+    filename = "/".join(parts[4:])
+    if not repo_id or not revision or not filename:
+        return None
+    return repo_id, revision, filename
+
+
+def _download_huggingface_artifact(part_url: str, part_tmp: Path, cancel_event: threading.Event) -> tuple[bool, str]:
+    """Download a Hugging Face artifact with huggingface_hub for Xet-backed files."""
+    global _model_download_proc
+    parsed = _parse_huggingface_resolve_url(part_url)
+    if parsed is None:
+        return False, "not a Hugging Face resolve URL"
+
+    repo_id, revision, filename = parsed
+    cache_dir = INSTALL_DIR / "data" / "hf-cache"
+    code = r'''
+import shutil
+import sys
+from pathlib import Path
+
+repo_id, revision, filename, dest, cache_dir = sys.argv[1:6]
+try:
+    from huggingface_hub import hf_hub_download
+except Exception as exc:
+    print(
+        "huggingface_hub is not installed; install with: "
+        "python -m pip install 'huggingface_hub[hf_xet]'",
+        file=sys.stderr,
+    )
+    raise
+
+path = hf_hub_download(
+    repo_id=repo_id,
+    filename=filename,
+    revision=revision,
+    cache_dir=cache_dir,
+    local_files_only=False,
+)
+dest_path = Path(dest)
+dest_path.parent.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(path, dest_path)
+'''
+    cmd = [
+        sys.executable,
+        "-c",
+        code,
+        repo_id,
+        revision,
+        filename,
+        str(part_tmp),
+        str(cache_dir),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _model_download_proc = proc
+        try:
+            stdout_text, stderr_text = proc.communicate(timeout=14400)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                stdout_text, stderr_text = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+                stdout_text, stderr_text = "", "Hugging Face Hub download timed out"
+        finally:
+            _model_download_proc = None
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"Hugging Face Hub fallback could not start: {exc}"
+
+    if cancel_event.is_set():
+        return False, "Download cancelled by user"
+    if proc.returncode == 0 and _model_file_ready(part_tmp):
+        return True, ""
+    details = stderr_text or stdout_text
+    if proc.returncode == 0:
+        return False, "Hugging Face Hub fallback finished but model file is missing or empty"
+    return False, _format_curl_download_error(proc.returncode, details).replace(
+        "curl exited",
+        "Hugging Face Hub fallback exited",
+        1,
+    )
 
 
 def _artifact_expected_size(metadata: dict) -> int | None:
@@ -3968,22 +4081,54 @@ class AgentHandler(BaseHTTPRequestHandler):
                                     if _model_download_cancel.is_set():
                                         break
                                 proc = subprocess.Popen(
-                                    ["curl", "-fSL", "-C", "-", "--connect-timeout", "30",
+                                    ["curl", "-fSL", "-sS", "-C", "-", "--connect-timeout", "30",
                                      "-o", str(part_tmp), part_url],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE,
+                                    text=True,
                                 )
                                 _model_download_proc = proc
+                                stderr_text = ""
                                 try:
-                                    proc.wait(timeout=14400)
+                                    _, stderr_text = proc.communicate(timeout=14400)
                                 except subprocess.TimeoutExpired:
                                     proc.kill()
-                                    proc.wait(timeout=5)
+                                    try:
+                                        _, stderr_text = proc.communicate(timeout=5)
+                                    except subprocess.TimeoutExpired:
+                                        proc.kill()
+                                        proc.wait(timeout=5)
                                 finally:
                                     _model_download_proc = None
 
                                 if _model_download_cancel.is_set():
                                     break
-                                if proc.returncode == 0:
+                                downloaded = proc.returncode == 0
+                                if not downloaded:
+                                    curl_error = _format_curl_download_error(proc.returncode, stderr_text)
+                                    if _parse_huggingface_resolve_url(part_url) is not None:
+                                        _write_model_status(
+                                            status_path,
+                                            "downloading",
+                                            part_label,
+                                            0,
+                                            part_total,
+                                            f"Retry {attempt}/3: {curl_error}; trying Hugging Face Hub fallback",
+                                        )
+                                        hub_ok, hub_error = _download_huggingface_artifact(
+                                            part_url,
+                                            part_tmp,
+                                            _model_download_cancel,
+                                        )
+                                        downloaded = hub_ok
+                                        if not hub_ok:
+                                            last_error = f"{curl_error}; {hub_error}"
+                                    else:
+                                        last_error = curl_error
+
+                                if _model_download_cancel.is_set():
+                                    break
+                                if downloaded:
                                     try:
                                         part_tmp.replace(part_target)
                                         created_final_paths.add(part_target)
@@ -3996,8 +4141,6 @@ class AgentHandler(BaseHTTPRequestHandler):
                                         last_error = "Download finished but model file is missing or empty"
                                         part_target.unlink(missing_ok=True)
                                         created_final_paths.discard(part_target)
-                                else:
-                                    last_error = f"curl exited with code {proc.returncode}"
                                 _write_model_status(
                                     status_path,
                                     "downloading",

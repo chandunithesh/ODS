@@ -4225,6 +4225,10 @@ class TestModelDownloadFileIntegrity:
                 self.returncode = 0
                 return 0
 
+            def communicate(self, timeout=None):
+                self.wait(timeout=timeout)
+                return "", ""
+
             def kill(self):
                 self.returncode = -9
 
@@ -4313,6 +4317,92 @@ class TestModelDownloadFileIntegrity:
         status = json.loads((install_dir / "data" / "model-download-status.json").read_text(encoding="utf-8"))
         assert status["status"] == "failed"
         assert "missing or empty" in status["error"]
+
+    def test_curl_failure_status_includes_stderr(self, tmp_path, monkeypatch):
+        install_dir = self._setup_env(tmp_path, monkeypatch)
+
+        class FailingProc:
+            def __init__(self, cmd, *args, **kwargs):
+                self.returncode = None
+
+            def communicate(self, timeout=None):
+                self.returncode = 22
+                return "", "curl: (22) The requested URL returned error: 403"
+
+            def wait(self, timeout=None):
+                self.returncode = 22
+                return 22
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(_mod.subprocess, "Popen", FailingProc)
+
+        handler = _FakeHandler(self._body())
+        _mod.AgentHandler._handle_model_download(handler)
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["status"] == "started"
+        _mod._model_download_thread.join(timeout=2)
+        assert not _mod._model_download_thread.is_alive()
+        status = json.loads((install_dir / "data" / "model-download-status.json").read_text(encoding="utf-8"))
+        assert status["status"] == "failed"
+        assert "curl exited with code 22" in status["error"]
+        assert "requested URL returned error: 403" in status["error"]
+
+    def test_huggingface_resolve_download_falls_back_to_hub_client(self, tmp_path, monkeypatch):
+        payload = b"downloaded through hf hub"
+        model = {
+            "gguf_file": "hf-model.gguf",
+            "gguf_url": "https://huggingface.co/org/model-GGUF/resolve/main/subdir/hf-model.gguf",
+            "gguf_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        install_dir = self._setup_env(
+            tmp_path,
+            monkeypatch,
+            library_models=[model],
+            expected_payload=payload,
+        )
+        calls = []
+
+        class FallbackProc:
+            def __init__(self, cmd, *args, **kwargs):
+                self.cmd = cmd
+                self.returncode = None
+                calls.append(cmd)
+
+            def communicate(self, timeout=None):
+                if self.cmd and self.cmd[0] == "curl":
+                    self.returncode = 22
+                    return "", "curl: (22) The requested URL returned error: 403"
+                dest = Path(self.cmd[6])
+                dest.write_bytes(payload)
+                self.returncode = 0
+                return "", ""
+
+            def wait(self, timeout=None):
+                return self.returncode if self.returncode is not None else 0
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(_mod.subprocess, "Popen", FallbackProc)
+
+        handler = _FakeHandler(json.dumps({
+            "gguf_file": model["gguf_file"],
+            "gguf_url": model["gguf_url"],
+        }).encode("utf-8"))
+        _mod.AgentHandler._handle_model_download(handler)
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["status"] == "started"
+        _mod._model_download_thread.join(timeout=2)
+        assert not _mod._model_download_thread.is_alive()
+        assert (install_dir / "data" / "models" / "hf-model.gguf").read_bytes() == payload
+        assert any(cmd and cmd[0] == "curl" for cmd in calls)
+        assert any(cmd and cmd[0] == sys.executable for cmd in calls)
+        status = json.loads((install_dir / "data" / "model-download-status.json").read_text(encoding="utf-8"))
+        assert status["status"] == "complete"
 
     def test_split_download_skips_existing_non_empty_parts(self, tmp_path, monkeypatch):
         parts = [
@@ -4588,6 +4678,10 @@ class TestModelDownloadFileIntegrity:
                     cancel_event.set()
                     self.returncode = -9
                 return self.returncode
+
+            def communicate(self, timeout=None):
+                self.wait(timeout=timeout)
+                return "", ""
 
             def kill(self):
                 self.returncode = -9
