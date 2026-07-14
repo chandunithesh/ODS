@@ -2058,14 +2058,14 @@ function Invoke-Model {
                     return
                 }
                 $tier = $tier.ToUpperInvariant()
-                
+
                 # Retrieve the model config using tier-map functions
                 $model = ConvertTo-ModelFromTier -Tier $tier
                 if ([string]::IsNullOrWhiteSpace($model)) {
                     Write-AIError "Unknown tier: $tier"
                     return
                 }
-                
+
                 # Normalize aliases for Resolve-TierConfig (T0->0, T1->1, SH->SH_COMPACT)
                 $normTier = $tier
                 if ($normTier -match "^T([0-9]+)$") {
@@ -2074,10 +2074,10 @@ function Invoke-Model {
                 if ($normTier -eq "SH") {
                     $normTier = "SH_COMPACT"
                 }
-                
+
                 # Resolve tier config to obtain GGUF details
                 $tierConfig = Resolve-TierConfig -Tier $normTier
-                
+
                 # Set in .env
                 Set-ODSEnvValue -Key "LLM_MODEL" -Value $model
                 Set-ODSEnvValue -Key "TIER" -Value $normTier
@@ -2085,7 +2085,7 @@ function Invoke-Model {
                 Set-ODSEnvValue -Key "GGUF_URL" -Value $tierConfig.GgufUrl
                 Set-ODSEnvValue -Key "CTX_SIZE" -Value $tierConfig.MaxContext
                 Set-ODSEnvValue -Key "MAX_CONTEXT" -Value $tierConfig.MaxContext
-                
+
                 Write-AISuccess "Model set to $model (tier $tier, ctx=$($tierConfig.MaxContext)). Run '.\ods.ps1 restart' to apply."
             }
             default {
