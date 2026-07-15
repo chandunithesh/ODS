@@ -618,6 +618,8 @@ def get_model_info() -> Optional[ModelInfo]:
                     if "=" not in line or line.lstrip().startswith("#"):
                         continue
                     key, value = line.split("=", 1)
+                    if not key.strip():
+                        continue
                     env_values[key.strip()] = value.strip().strip('"\'')
 
             model_name = env_values.get("LLM_MODEL")
