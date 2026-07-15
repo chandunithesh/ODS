@@ -196,7 +196,7 @@ function Resolve-QwenTierConfig {
                 LlmModel   = "qwen3-30b-a3b"
                 GgufFile   = "Qwen3-30B-A3B-Q4_K_M.gguf"
                 GgufUrl    = "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
-                GgufSha256 = "84b5f7f112156d63836a01a69dc3f11a6ba63b10a23b8ca7a7efaf52d5a2d806"
+                GgufSha256 = "9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48"
                 MaxContext = 32768
                 ModelProfileRequested = "qwen"
                 ModelProfileEffective = "qwen"
