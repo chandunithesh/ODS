@@ -84,6 +84,18 @@
       "tokens_per_sec_estimate": 160,
       "llm_model_name": "qwen2.5-1.5b-instruct",
       "llama_server_image": null,
+      "app_compatibility": {
+        "agent_viability": {
+          "status": "not_agent_viable",
+          "reason": "Fleet model-UI run 2026-07-16T22-53Z on windows-laptop loaded this model successfully and runtime reported qwen2.5-1.5b-instruct-q4, but ODS Talk returned a generic tool-style response instead of the requested verification phrase; keep it out of agent-required release coverage until revalidated.",
+          "evidence": "dream-fleet-test/runs/2026-07-16T22-53-30Z-release-affected-product-223c18ff-harness-1faf0d8-windows-laptop/model-ui/cycle-002/windows-laptop"
+        },
+        "hermes_talk": {
+          "status": "unsupported_until_revalidated",
+          "reason": "Fleet model-UI run 2026-07-16T22-53Z on windows-laptop loaded this model successfully and runtime reported qwen2.5-1.5b-instruct-q4, but ODS Talk returned a generic tool-style response instead of the requested verification phrase; keep it out of ODS Talk release coverage until revalidated.",
+          "evidence": "dream-fleet-test/runs/2026-07-16T22-53-30Z-release-affected-product-223c18ff-harness-1faf0d8-windows-laptop/model-ui/cycle-002/windows-laptop"
+        }
+      },
       "install_recommendation": false
     },
     {
