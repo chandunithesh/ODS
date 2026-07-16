@@ -37,6 +37,8 @@ const welcomeMessage = {
   status: 'done',
 }
 
+const TALK_STATUS_RETRY_MS = 1000
+
 function makeId(prefix) {
   if (globalThis.crypto?.randomUUID) return `${prefix}-${globalThis.crypto.randomUUID()}`
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -52,6 +54,7 @@ export default function ODSTalk() {
   const [input, setInput] = useState('')
   const [status, setStatus] = useState('loading')
   const [statusText, setStatusText] = useState('Connecting to ODS Talk...')
+  const [retryStatusRefresh, setRetryStatusRefresh] = useState(false)
   const [sending, setSending] = useState(false)
   const [recording, setRecording] = useState(false)
   const [spokenReplies, setSpokenReplies] = useState(() => {
@@ -109,12 +112,14 @@ export default function ODSTalk() {
   }, [])
 
   const refreshStatus = useCallback(async () => {
+    setRetryStatusRefresh(false)
     setStatus('loading')
     try {
       const resp = await fetch('/api/talk/status', { credentials: 'same-origin' })
       if (resp.status === 401) {
         setStatus('expired')
         setStatusText('Session expired. Scan the owner card again.')
+        setRetryStatusRefresh(false)
         return
       }
       if (!resp.ok) throw new Error(await parseError(resp, 'ODS Talk is not ready.'))
@@ -129,17 +134,26 @@ export default function ODSTalk() {
       if (!capabilities.text_chat) {
         setStatus('offline')
         setStatusText(compatibilityReason || 'ODS Talk text chat is not available.')
+        setRetryStatusRefresh(!compatibilityReason)
         return
       }
       setStatus('ready')
       setStatusText('Ready')
+      setRetryStatusRefresh(false)
     } catch (err) {
       setStatus('offline')
       setStatusText(err.message || 'ODS Talk is offline.')
+      setRetryStatusRefresh(true)
     }
   }, [liveMicSupported])
 
   useEffect(() => { refreshStatus() }, [refreshStatus])
+
+  useEffect(() => {
+    if (!retryStatusRefresh || status !== 'offline') return undefined
+    const timer = setTimeout(refreshStatus, TALK_STATUS_RETRY_MS)
+    return () => clearTimeout(timer)
+  }, [refreshStatus, retryStatusRefresh, status])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView?.({ block: 'end' })

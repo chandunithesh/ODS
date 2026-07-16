@@ -130,6 +130,29 @@ describe('ODSTalk', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  test('refreshes transient offline status until text chat becomes ready', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        const ready = fetchMock.mock.calls.length > 1
+        return response({
+          capabilities: {
+            text_chat: ready,
+            tts: false,
+            audio_message: false,
+          },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect((await screen.findAllByText('ODS Talk text chat is not available.')).length).toBeGreaterThan(0)
+    expect(await screen.findByText('Ready', {}, { timeout: 2500 })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   test('accumulates SSE deltas across split chunks', async () => {
     // Transport may split a single SSE frame across chunk boundaries. The
     // reader has to buffer the partial frame across reads, not drop bytes.
