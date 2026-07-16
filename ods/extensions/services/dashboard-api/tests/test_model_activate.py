@@ -2982,6 +2982,60 @@ class TestModelActivateRollback:
             "litellm-route",
         ]
 
+    def test_activation_restarts_hermes_when_route_config_already_matches(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, _env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        hermes_live = install_dir / "data" / "hermes" / "config.yaml"
+        hermes_template = install_dir / "extensions" / "services" / "hermes" / "cli-config.yaml.template"
+        hermes_live.parent.mkdir(parents=True)
+        hermes_template.parent.mkdir(parents=True)
+        hermes_text = (
+            "model:\n"
+            "  default: \"new-model.gguf\"\n"
+            "  provider: \"custom\"\n"
+            "  context_length: 4096\n"
+            "auxiliary:\n"
+            "  compression:\n"
+            "    context_length: 4096\n"
+        )
+        hermes_live.write_text(hermes_text, encoding="utf-8")
+        hermes_template.write_text(hermes_text, encoding="utf-8")
+        events = []
+
+        def restart_dependent(container):
+            events.append(f"dependent:{container}")
+            return container == "ods-hermes"
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: events.append("runtime"))
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(_mod, "_restart_existing_container", restart_dependent)
+        monkeypatch.setattr(
+            _mod,
+            "_verify_running_hermes_route",
+            lambda model, *_args: events.append(f"hermes-route:{model}"),
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_verify_hermes_dashboard_ready",
+            lambda: events.append("hermes-dashboard-ready"),
+        )
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        assert events == [
+            "runtime",
+            "dependent:ods-litellm",
+            "dependent:ods-hermes",
+            "hermes-route:new-model.gguf",
+            "hermes-dashboard-ready",
+        ]
+
     def test_activation_succeeds_without_optional_dependents(self, tmp_path, monkeypatch):
         install_dir, _env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
             _write_model_activation_fixture(tmp_path)

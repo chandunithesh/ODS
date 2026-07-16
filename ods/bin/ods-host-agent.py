@@ -4962,6 +4962,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                     hermes_live_snapshot and hermes_live_snapshot.get("exists")
                 )
                 hermes_live_patched = False
+                hermes_live_verified = False
                 if hermes_live_exists:
                     patched_live, hermes_live_patched = _patch_hermes_config_text(
                         str(hermes_live_snapshot.get("text") or ""),
@@ -4976,12 +4977,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                             hermes_live_snapshot.get("source"),
                         )
                     verified_live = _capture_hermes_live_config(hermes_live_config)
-                    if not _hermes_config_matches(
+                    hermes_live_verified = _hermes_config_matches(
                         str(verified_live.get("text") or ""),
                         hermes_model_name,
                         hermes_base_url,
                         int(context_length),
-                    ):
+                    )
+                    if not hermes_live_verified:
                         raise RuntimeError(
                             "Hermes persisted model route could not be verified"
                         )
@@ -4991,15 +4993,27 @@ class AgentHandler(BaseHTTPRequestHandler):
                     base_url=hermes_base_url,
                     context_length=context_length,
                 )
+                hermes_template_verified = False
+                if not hermes_live_exists and not hermes_template_patched:
+                    try:
+                        hermes_template_verified = _hermes_config_matches(
+                            hermes_template_config.read_text(encoding="utf-8"),
+                            hermes_model_name,
+                            hermes_base_url,
+                            int(context_length),
+                        )
+                    except FileNotFoundError:
+                        hermes_template_verified = False
                 # A missing live file can be seeded from the patched template
                 # on the next Hermes start. An existing file was verified above.
-                hermes_patched = hermes_live_patched or (
-                    hermes_template_patched and not hermes_live_exists
+                hermes_route_configured = hermes_live_verified or (
+                    not hermes_live_exists
+                    and (hermes_template_patched or hermes_template_verified)
                 )
 
                 # Restart dependent services so they pick up the new model
                 litellm_restarted = _restart_existing_container("ods-litellm")
-                if hermes_patched and _restart_existing_container("ods-hermes"):
+                if hermes_route_configured and _restart_existing_container("ods-hermes"):
                     _verify_running_hermes_route(
                         hermes_model_name,
                         hermes_base_url,
