@@ -35,6 +35,9 @@ test: ## Run unit and contract tests
 	@bash tests/test-linux-install-preflight.sh
 	@bash tests/test-linux-host-agent-stop.sh
 	@echo ""
+	@echo "=== ods-doctor rootless subordinate IDs ==="
+	@bash tests/test-ods-doctor-rootless-subid.sh
+	@echo ""
 	@echo "=== AMD/Lemonade contracts ==="
 	@bash tests/contracts/test-amd-lemonade-contracts.sh
 	@bash tests/test-litellm-amd-auth-enforced.sh
