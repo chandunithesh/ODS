@@ -1,6 +1,7 @@
 """Tests for config.py — manifest loading and service discovery."""
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -193,6 +194,15 @@ class TestLoadExtensionManifests:
         assert llm["probe"]["kind"] == "chat"
         assert llm["swap_safe"] is False
         assert llm["badge"] == "not-swap-safe"
+
+    def test_builtin_llm_probe_paths_match_live_service_routes(self):
+        services_dir = Path(__file__).resolve().parents[2]
+
+        services, _, _ = load_extension_manifests(services_dir, "nvidia")
+
+        assert services["open-webui"]["llm"]["probe"]["path"] == "/api/chat/completions"
+        assert services["perplexica"]["llm"]["probe"]["path"] == "/api/chat"
+        assert services["privacy-shield"]["llm"]["probe"]["path"] == "/chat/completions"
 
     def test_external_port_default_zero_disables_external_port_fallback(self, tmp_path):
         svc_dir = tmp_path / "internal-service"
