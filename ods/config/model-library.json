@@ -85,6 +85,18 @@
       "tokens_per_sec_estimate": 110,
       "llm_model_name": "phi-4-mini-reasoning",
       "llama_server_image": null,
+      "app_compatibility": {
+        "agent_viability": {
+          "status": "not_agent_viable",
+          "reason": "Fleet model-UI run 2026-07-17T00-45Z on windows-laptop loaded this model successfully and the runtime reported phi4-mini-reasoning-q4, but ODS Talk timed out after the model returned no usable agent response; keep it out of agent-required release coverage until revalidated.",
+          "evidence": "dream-fleet-test/runs/2026-07-17T00-45-33Z/model-ui/cycle-002/windows-laptop"
+        },
+        "hermes_talk": {
+          "status": "unsupported_until_revalidated",
+          "reason": "Fleet model-UI run 2026-07-17T00-45Z on windows-laptop loaded this model successfully and direct route readiness passed, but ODS Talk did not complete the streamed verification prompt before timeout; keep it out of ODS Talk release coverage until revalidated.",
+          "evidence": "dream-fleet-test/runs/2026-07-17T00-45-33Z/model-ui/cycle-002/windows-laptop"
+        }
+      },
       "install_recommendation": false
     },
     {
@@ -176,6 +188,25 @@
           "evidence": "dream-fleet-test/runs/2026-07-16T18-10-30Z-release-affected-product-bc4f77d-harness-7630b69-windows-laptop/model-ui/cycle-003/windows-laptop"
         }
       },
+      "install_recommendation": false
+    },
+    {
+      "id": "granite4.0-h-micro-q4",
+      "name": "Granite 4.0 H-Micro",
+      "family": "granite",
+      "gguf_file": "granite-4.0-h-micro-Q4_K_M.gguf",
+      "gguf_url": "https://huggingface.co/ibm-granite/granite-4.0-h-micro-GGUF/resolve/main/granite-4.0-h-micro-Q4_K_M.gguf",
+      "gguf_sha256": "bcc78b9b25450101d1ad90d4b9a264e1bac892f534dfb76066f4eec792fdf023",
+      "size_bytes": 1942564512,
+      "size_mb": 1943,
+      "vram_required_gb": 4,
+      "context_length": 131072,
+      "quantization": "Q4_K_M",
+      "specialty": "Chat",
+      "description": "IBM's compact Granite 4 hybrid instruction model with long-context support. A low-VRAM alternative family for agent and chat validation.",
+      "tokens_per_sec_estimate": 115,
+      "llm_model_name": "granite-4.0-h-micro",
+      "llama_server_image": null,
       "install_recommendation": false
     },
     {
