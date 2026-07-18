@@ -82,6 +82,7 @@ def test_release_model_switchboard_catalog_ids_exist():
         "llama3.2-1b-instruct-q4",
         "llama3.2-3b-instruct-q4",
         "qwen2.5-3b-instruct-q4",
+        "qwen3-4b-q4",
         "qwen2.5-coder-3b-128k-q4",
         "qwen2.5-7b-instruct-q4",
         "llama3.1-8b-instruct-q4",
@@ -138,14 +139,15 @@ def test_phi35_mini_is_direct_chat_unsupported_until_revalidated():
     assert not _agent_viable_for_release(by_id["phi3.5-mini-q4"])
 
 
-def test_qwen25_15b_replaces_phi35_in_low_vram_agent_viable_pool():
+def test_qwen25_15b_is_not_agent_viable_until_revalidated():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
+    compatibility = by_id["qwen2.5-1.5b-instruct-q4"]["app_compatibility"]
 
-    replacement = by_id["qwen2.5-1.5b-instruct-q4"]
-    assert replacement["vram_required_gb"] <= 4
-    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
-    assert _agent_viable_for_release(replacement)
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert compatibility["agent_viability"]["evidence"]
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert not _agent_viable_for_release(by_id["qwen2.5-1.5b-instruct-q4"])
 
 
 def test_qwen25_05b_is_not_agent_viable_until_revalidated():
@@ -180,14 +182,18 @@ def test_granite33_2b_is_not_agent_viable_until_revalidated():
     assert not _agent_viable_for_release(by_id["granite3.3-2b-instruct-q4"])
 
 
-def test_smollm3_3b_is_low_vram_agent_viable_candidate():
+def test_smollm3_3b_is_not_agent_viable_until_app_revalidated():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
+    compatibility = by_id["smollm3-3b-q4"]["app_compatibility"]
 
-    replacement = by_id["smollm3-3b-q4"]
-    assert replacement["vram_required_gb"] <= 4
-    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
-    assert _agent_viable_for_release(replacement)
+    assert compatibility["openai_chat"]["status"] == "verified"
+    assert "cycle-003" in compatibility["openai_chat"]["evidence"]
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert "Perplexica" in compatibility["agent_viability"]["reason"]
+    assert "Privacy Shield" in compatibility["agent_viability"]["reason"]
+    assert "cycle-003" in compatibility["agent_viability"]["evidence"]
+    assert not _agent_viable_for_release(by_id["smollm3-3b-q4"])
 
 
 def test_qwen25_3b_is_low_vram_agent_viable_candidate():
@@ -197,6 +203,18 @@ def test_qwen25_3b_is_low_vram_agent_viable_candidate():
     replacement = by_id["qwen2.5-3b-instruct-q4"]
     assert replacement["vram_required_gb"] <= 4
     assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
+    assert _agent_viable_for_release(replacement)
+
+
+def test_qwen3_4b_is_low_vram_agent_viable_candidate():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+
+    replacement = by_id["qwen3-4b-q4"]
+    assert replacement["vram_required_gb"] <= 5
+    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
+    assert replacement["gguf_sha256"] == "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+    assert replacement["gguf_url"].startswith("https://huggingface.co/Qwen/Qwen3-4B-GGUF/")
     assert _agent_viable_for_release(replacement)
 
 
@@ -239,6 +257,7 @@ def test_new_switchboard_models_do_not_change_install_recommendations():
         "llama3.2-1b-instruct-q4",
         "llama3.2-3b-instruct-q4",
         "qwen2.5-3b-instruct-q4",
+        "qwen3-4b-q4",
         "qwen2.5-coder-3b-128k-q4",
         "qwen2.5-7b-instruct-q4",
         "llama3.1-8b-instruct-q4",
