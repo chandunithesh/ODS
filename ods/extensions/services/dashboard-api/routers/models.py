@@ -1039,6 +1039,13 @@ def load_model(model_id: str, api_key: str = Depends(verify_api_key)):
     if already_active:
         return {"status": "already_active", "model_id": model_id, "loadedModel": loaded_model}
 
+    bootstrap_conflict = _bootstrap_upgrade_download_conflict()
+    if bootstrap_conflict is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={**bootstrap_conflict, "requestedModelId": model_id},
+        )
+
     # Long timeout — model loading can take minutes
     result = _call_agent_model(
         "/v1/model/activate",

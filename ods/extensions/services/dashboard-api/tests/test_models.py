@@ -684,6 +684,56 @@ def test_download_model_rejects_while_bootstrap_upgrade_active(test_client, monk
     }
 
 
+def test_load_model_rejects_while_bootstrap_upgrade_active(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [
+        {
+            "id": "qwen3.5-9b-q4",
+            "name": "Qwen 3.5 9B",
+            "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+            "size_mb": 5760,
+            "vram_required_gb": 8,
+            "context_length": 32768,
+            "quantization": "Q4_K_M",
+            "specialty": "General",
+            "description": "Balanced default.",
+            "llm_model_name": "qwen3.5-9b",
+        },
+    ])
+    (data_dir / "models" / "Qwen3.5-9B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (False, None))
+    monkeypatch.setattr(
+        models_router,
+        "get_bootstrap_status",
+        lambda: BootstrapStatus(
+            active=True,
+            model_name="Qwen3.5-9B-Q4_K_M.gguf",
+            percent=100.0,
+        ),
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("bootstrap-busy load reached host agent")
+        ),
+    )
+
+    resp = test_client.post(
+        "/api/models/qwen3.5-9b-q4/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "Cannot start model download while bootstrap full-model upgrade is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "bootstrap_upgrade",
+        "activeTarget": "Qwen3.5-9B-Q4_K_M.gguf",
+        "requestedModelId": "qwen3.5-9b-q4",
+    }
+
+
 def test_download_model_rejects_while_bootstrap_upgrade_retry_pending(test_client, monkeypatch, tmp_path):
     models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
     _write_model_library(install_dir, [

@@ -428,6 +428,15 @@ docker_timeout_block="$(awk '
     in_block { print }
     in_block && /exit 1/ { exit }
 ' "$TARGET" | grep -v '^[[:space:]]*#')"
+grep -qF 'ODS_BOOTSTRAP_HEALTH_ATTEMPTS' <<<"$active_code" \
+    || fail "Docker hot-swap health wait must expose a bounded attempt override"
+grep -qF 'ODS_BOOTSTRAP_CONTAINER_FAILURE_GRACE_ATTEMPTS' <<<"$active_code" \
+    || fail "Docker hot-swap must expose a bounded failed-container grace override"
+grep -qF 'is_windows_bash' <<<"$active_code" \
+    || fail "Docker hot-swap restart grace must account for slower Windows Docker Desktop transitions"
+grep -qF 'continuing within restart grace' <<<"$active_code" \
+    || fail "Docker hot-swap must tolerate transient failed/restarting container states before rollback"
+pass "Docker hot-swap restart grace is bounded and visible"
 grep -qF 'write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES"' <<<"$docker_timeout_block" \
     || fail "Docker hot-swap timeout must mark bootstrap status failed with real byte counts"
 grep -qF 'exit 1' <<<"$docker_timeout_block" \

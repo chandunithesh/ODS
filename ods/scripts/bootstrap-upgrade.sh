@@ -2373,10 +2373,28 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
     # for discovery but loads on-demand. We send a warm-up request to trigger loading.
     # For llama.cpp: a simple 200 check is sufficient — the server only starts
     # after loading the model specified in --model.
-    log "Waiting for llama-server health at $_health_url ..."
+    _bootstrap_health_attempts="${ODS_BOOTSTRAP_HEALTH_ATTEMPTS:-}"
+    if ! [[ "$_bootstrap_health_attempts" =~ ^[0-9]+$ ]] || (( _bootstrap_health_attempts < 1 )); then
+        if is_windows_bash; then
+            _bootstrap_health_attempts=120
+        else
+            _bootstrap_health_attempts=60
+        fi
+    fi
+    _failed_state_grace_attempts="${ODS_BOOTSTRAP_CONTAINER_FAILURE_GRACE_ATTEMPTS:-}"
+    if ! [[ "$_failed_state_grace_attempts" =~ ^[0-9]+$ ]] || (( _failed_state_grace_attempts < 1 )); then
+        if is_windows_bash; then
+            _failed_state_grace_attempts=36
+        else
+            _failed_state_grace_attempts=12
+        fi
+    fi
+
+    log "Waiting for llama-server health at $_health_url (${_bootstrap_health_attempts} attempts) ..."
     _healthy=false
     _warmup_sent=false
-    for _i in $(seq 1 60); do
+    _failed_state_attempts=0
+    for _i in $(seq 1 "$_bootstrap_health_attempts"); do
         _resp=$(curl -sf --max-time 5 "$_health_url" 2>/dev/null || echo "")
         if [[ -n "$_resp" ]]; then
             if [[ "$_gpu_backend" == "amd" ]]; then
@@ -2437,8 +2455,14 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
             fi
         fi
         if [[ "$_gpu_backend" != "amd" ]] && docker_llama_server_container_failed_after_swap; then
-            log "llama-server container exited or is restarting while loading the full model; treating Docker hot-swap as failed."
-            break
+            _failed_state_attempts=$(( _failed_state_attempts + 1 ))
+            if (( _failed_state_attempts >= _failed_state_grace_attempts )); then
+                log "llama-server container exited or is restarting while loading the full model for ${_failed_state_attempts} consecutive checks; treating Docker hot-swap as failed."
+                break
+            fi
+            log "llama-server container exited or is restarting while loading the full model; continuing within restart grace (${_failed_state_attempts}/${_failed_state_grace_attempts})."
+        else
+            _failed_state_attempts=0
         fi
         sleep 5
     done
