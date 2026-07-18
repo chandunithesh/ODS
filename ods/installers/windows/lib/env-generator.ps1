@@ -688,6 +688,9 @@ model_list:
         chat_template_kwargs:
           enable_thinking: false
 
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
 litellm_settings:
   drop_params: true
   set_verbose: false

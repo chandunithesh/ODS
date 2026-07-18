@@ -624,6 +624,9 @@ if command -v pwsh >/dev/null 2>&1; then
         if ($localText -notmatch "(?m)^  request_timeout: 900$" -or $localText -notmatch "(?m)^  stream_timeout: 900$") {
             throw "Windows local LiteLLM config must keep long-model proxy timeouts at 900s"
         }
+        if ($localText -notmatch "(?m)^general_settings:$" -or $localText -notmatch "(?m)^  master_key: os\.environ/LITELLM_MASTER_KEY$") {
+            throw "Windows local LiteLLM config must enforce the generated LiteLLM master key"
+        }
     '; then
         pass "env-generator.ps1: Windows local writes local.yaml and repairs malformed bind-mount directories"
     else
