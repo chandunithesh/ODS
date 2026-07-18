@@ -258,6 +258,13 @@ snapshot_pre_update() {
         files_saved=$(( files_saved + 1 ))
     done
 
+    # Cached compose flags — records which overlays were active, so rollback
+    # can bring the restored stack up with the same file selection
+    if [[ -f "${INSTALL_DIR}/.compose-flags" ]]; then
+        cp "${INSTALL_DIR}/.compose-flags" "${snap_dir}/"
+        files_saved=$(( files_saved + 1 ))
+    fi
+
     # Per-extension config directories
     for ext_dir in litellm n8n openclaw searxng; do
         local src="${INSTALL_DIR}/config/${ext_dir}"
@@ -765,12 +772,21 @@ cmd_rollback() {
         log_info "Snapshot time    : ${btime}"
     fi
 
-    # Stop services
+    # Stop services using the currently active compose stack
     log_info "Stopping services..."
     cd "$INSTALL_DIR"
-    if ! docker compose down; then
-        log_warn "docker compose v2 down failed, trying v1..."
-        docker-compose down
+    local compose_flags=""
+    compose_flags=$(resolve_compose_flags 2>/dev/null || true)
+    if [[ -n "${compose_flags}" ]]; then
+        if ! docker compose ${compose_flags} down; then
+            log_warn "docker compose v2 down failed, trying v1..."
+            docker-compose ${compose_flags} down
+        fi
+    else
+        if ! docker compose down; then
+            log_warn "docker compose v2 down failed, trying v1..."
+            docker-compose down
+        fi
     fi
 
     # Restore — use _restore_snapshot for pre-update snapshots (they include
@@ -793,11 +809,29 @@ cmd_rollback() {
         shopt -u dotglob
     fi
 
-    # Restart services
+    # The restored .env and compose files may select a different backend or
+    # overlay than the stack that was just stopped.  If the snapshot predates
+    # .compose-flags, drop the stale cache so resolution falls back to the
+    # restored .env.
+    if [[ ! -f "${backup_path}/.compose-flags" && -f "${INSTALL_DIR}/.compose-flags" ]]; then
+        log_info "Snapshot has no .compose-flags; clearing stale cached stack."
+        rm -f "${INSTALL_DIR}/.compose-flags"
+    fi
+
+    # Restart services using the restored compose stack
     log_info "Restarting services..."
-    if ! docker compose up -d; then
-        log_warn "docker compose v2 up failed, trying v1..."
-        docker-compose up -d
+    local restored_flags=""
+    restored_flags=$(resolve_compose_flags 2>/dev/null || true)
+    if [[ -n "${restored_flags}" ]]; then
+        if ! docker compose ${restored_flags} up -d; then
+            log_warn "docker compose v2 up failed, trying v1..."
+            docker-compose ${restored_flags} up -d
+        fi
+    else
+        if ! docker compose up -d; then
+            log_warn "docker compose v2 up failed, trying v1..."
+            docker-compose up -d
+        fi
     fi
 
     # Verify health using the same timeout-aware poller as cmd_update
