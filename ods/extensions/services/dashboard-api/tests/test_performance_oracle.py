@@ -368,15 +368,19 @@ def test_real_catalog_has_six_windows_8gb_release_swap_candidates(data_dir, tmp_
 
     assert len(candidates) >= 6
     assert {
+        "granite4.0-h-350m-q4",
+        "granite4.0-h-1b-q4",
+        "granite4.0-1b-q4",
         "granite4.0-h-micro-q4",
         "granite4.0-h-tiny-q4",
         "gemma3-4b-it-q4",
-        "qwen2.5-3b-instruct-q4",
-        "qwen3-4b-q4",
-        "qwen3-1.7b-q4",
     }.issubset(candidate_ids)
     assert "phi4-mini-q4" not in candidate_ids
+    assert "granite3.3-8b-instruct-q4" not in candidate_ids
     assert "smollm3-3b-q4" not in candidate_ids
+    assert "qwen2.5-3b-instruct-q4" not in candidate_ids
+    assert "qwen3-4b-q4" not in candidate_ids
+    assert "qwen3-1.7b-q4" not in candidate_ids
 
 
 def test_installer_recommended_model_survives_bootstrap_env(data_dir, tmp_path):

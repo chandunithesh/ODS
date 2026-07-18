@@ -79,6 +79,9 @@ def test_release_model_switchboard_catalog_ids_exist():
         "qwen2.5-1.5b-instruct-q4",
         "granite3.3-2b-instruct-q4",
         "smollm3-3b-q4",
+        "granite4.0-h-1b-q4",
+        "granite4.0-1b-q4",
+        "granite4.0-h-350m-q4",
         "llama3.2-1b-instruct-q4",
         "llama3.2-3b-instruct-q4",
         "qwen2.5-3b-instruct-q4",
@@ -162,14 +165,20 @@ def test_qwen25_05b_is_not_agent_viable_until_revalidated():
     assert not _agent_viable_for_release(by_id["qwen2.5-0.5b-instruct-q4"])
 
 
-def test_qwen25_3b_replaces_llama31_in_low_vram_agent_viable_pool():
+def test_qwen25_3b_runtime_context_conflict_blocks_agent_coverage():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
 
-    replacement = by_id["qwen2.5-3b-instruct-q4"]
-    assert replacement["vram_required_gb"] <= 4
-    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
-    assert _agent_viable_for_release(replacement)
+    model = by_id["qwen2.5-3b-instruct-q4"]
+    compatibility = model["app_compatibility"]
+
+    assert model["vram_required_gb"] <= 4
+    assert model["context_length"] == 32768
+    assert compatibility["openai_chat"]["status"] == "verified"
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert "32,768" in compatibility["agent_viability"]["reason"]
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert not _agent_viable_for_release(model)
 
 
 def test_granite33_2b_is_not_agent_viable_until_revalidated():
@@ -197,38 +206,66 @@ def test_smollm3_3b_is_not_agent_viable_until_app_revalidated():
     assert not _agent_viable_for_release(by_id["smollm3-3b-q4"])
 
 
-def test_qwen25_3b_is_low_vram_agent_viable_candidate():
+def test_granite4_1b_models_are_low_vram_agent_viable_candidates():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
 
-    replacement = by_id["qwen2.5-3b-instruct-q4"]
-    assert replacement["vram_required_gb"] <= 4
-    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
-    assert _agent_viable_for_release(replacement)
+    expected = {
+        "granite4.0-h-1b-q4": (
+            "https://huggingface.co/ibm-granite/granite-4.0-h-1b-GGUF/",
+            "da3d737121a96f3c9a316685212376257a7f167b74380855666dd488d6af3bcb",
+        ),
+        "granite4.0-1b-q4": (
+            "https://huggingface.co/ibm-granite/granite-4.0-1b-GGUF/",
+            "22ec0f9cc99a90185312de3c882c84e7bd6789bdd050389844380a01a831d7f1",
+        ),
+        "granite4.0-h-350m-q4": (
+            "https://huggingface.co/ibm-granite/granite-4.0-h-350m-GGUF/",
+            "0a8d6a7373602fadfba274a640ba784b86cc6847f1c67f1b0a90fa2ec266b7fb",
+        ),
+    }
+
+    for model_id, (url_prefix, sha256) in expected.items():
+        model = by_id[model_id]
+        assert model["vram_required_gb"] <= 3
+        assert model["context_length"] >= HERMES_CONTEXT_FLOOR
+        assert model["gguf_sha256"] == sha256
+        assert model["gguf_url"].startswith(url_prefix)
+        assert _agent_viable_for_release(model)
 
 
-def test_qwen3_4b_is_low_vram_agent_viable_candidate():
+def test_qwen3_4b_is_blocked_after_windows_talk_timeout():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
 
-    replacement = by_id["qwen3-4b-q4"]
-    assert replacement["vram_required_gb"] <= 5
-    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
-    assert replacement["gguf_sha256"] == "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
-    assert replacement["gguf_url"].startswith("https://huggingface.co/Qwen/Qwen3-4B-GGUF/")
-    assert _agent_viable_for_release(replacement)
+    model = by_id["qwen3-4b-q4"]
+    compatibility = model["app_compatibility"]
+
+    assert model["vram_required_gb"] <= 5
+    assert model["context_length"] == 40960
+    assert model["gguf_sha256"] == "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+    assert model["gguf_url"].startswith("https://huggingface.co/Qwen/Qwen3-4B-GGUF/")
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert "0.5 tok/s" in compatibility["agent_viability"]["reason"]
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert not _agent_viable_for_release(model)
 
 
-def test_qwen3_17b_is_low_vram_agent_viable_candidate():
+def test_qwen3_17b_is_below_release_context_floor_without_yarn_policy():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
 
-    replacement = by_id["qwen3-1.7b-q4"]
-    assert replacement["vram_required_gb"] <= 3
-    assert replacement["context_length"] >= HERMES_CONTEXT_FLOOR
-    assert replacement["gguf_sha256"] == "d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5"
-    assert replacement["gguf_url"].startswith("https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF/")
-    assert _agent_viable_for_release(replacement)
+    model = by_id["qwen3-1.7b-q4"]
+    compatibility = model["app_compatibility"]
+
+    assert model["vram_required_gb"] <= 3
+    assert model["context_length"] == 40960
+    assert model["gguf_sha256"] == "d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5"
+    assert model["gguf_url"].startswith("https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF/")
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert "max_position_embeddings=40960" in compatibility["agent_viability"]["reason"]
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert not _agent_viable_for_release(model)
 
 
 def test_qwen25_coder_3b_is_not_agent_viable_until_revalidated():
@@ -267,6 +304,9 @@ def test_new_switchboard_models_do_not_change_install_recommendations():
         "qwen2.5-1.5b-instruct-q4",
         "granite3.3-2b-instruct-q4",
         "smollm3-3b-q4",
+        "granite4.0-h-1b-q4",
+        "granite4.0-1b-q4",
+        "granite4.0-h-350m-q4",
         "llama3.2-1b-instruct-q4",
         "llama3.2-3b-instruct-q4",
         "qwen2.5-3b-instruct-q4",

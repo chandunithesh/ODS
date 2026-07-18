@@ -279,6 +279,61 @@
       "install_recommendation": false
     },
     {
+      "id": "granite4.0-h-1b-q4",
+      "name": "Granite 4.0 H-1B",
+      "family": "granite",
+      "gguf_file": "granite-4.0-h-1b-Q4_K_M.gguf",
+      "gguf_url": "https://huggingface.co/ibm-granite/granite-4.0-h-1b-GGUF/resolve/main/granite-4.0-h-1b-Q4_K_M.gguf",
+      "gguf_sha256": "da3d737121a96f3c9a316685212376257a7f167b74380855666dd488d6af3bcb",
+      "size_mb": 901,
+      "vram_required_gb": 3,
+      "context_length": 131072,
+      "quantization": "Q4_K_M",
+      "specialty": "Fast",
+      "description": "IBM's small Granite 4 hybrid instruction model with validated long-context support. A very low-VRAM Granite-family candidate for app and agent validation.",
+      "tokens_per_sec_estimate": 155,
+      "llm_model_name": "granite-4.0-h-1b",
+      "llama_server_image": null,
+      "install_recommendation": false
+    },
+    {
+      "id": "granite4.0-1b-q4",
+      "name": "Granite 4.0 1B",
+      "family": "granite",
+      "gguf_file": "granite-4.0-1b-Q4_K_M.gguf",
+      "gguf_url": "https://huggingface.co/ibm-granite/granite-4.0-1b-GGUF/resolve/main/granite-4.0-1b-Q4_K_M.gguf",
+      "gguf_sha256": "22ec0f9cc99a90185312de3c882c84e7bd6789bdd050389844380a01a831d7f1",
+      "size_mb": 1020,
+      "vram_required_gb": 3,
+      "context_length": 131072,
+      "quantization": "Q4_K_M",
+      "specialty": "Fast",
+      "description": "IBM's compact Granite 4 dense instruction model with validated long-context support. A second small Granite-family candidate for low-VRAM app and agent validation.",
+      "tokens_per_sec_estimate": 150,
+      "llm_model_name": "granite-4.0-1b",
+      "llama_server_image": null,
+      "install_recommendation": false
+    },
+    {
+      "id": "granite4.0-h-350m-q4",
+      "name": "Granite 4.0 H-350M",
+      "family": "granite",
+      "gguf_file": "granite-4.0-h-350m-Q4_K_M.gguf",
+      "gguf_url": "https://huggingface.co/ibm-granite/granite-4.0-h-350m-GGUF/resolve/main/granite-4.0-h-350m-Q4_K_M.gguf",
+      "gguf_sha256": "0a8d6a7373602fadfba274a640ba784b86cc6847f1c67f1b0a90fa2ec266b7fb",
+      "size_bytes": 222662560,
+      "size_mb": 223,
+      "vram_required_gb": 2,
+      "context_length": 131072,
+      "quantization": "Q4_K_M",
+      "specialty": "Fast",
+      "description": "IBM's tiny Granite 4 hybrid instruction model. A smallest-footprint long-context candidate for low-VRAM app and agent validation.",
+      "tokens_per_sec_estimate": 190,
+      "llm_model_name": "granite-4.0-h-350m",
+      "llama_server_image": null,
+      "install_recommendation": false
+    },
+    {
       "id": "ministral-3b-instruct-q4",
       "name": "Ministral 3B Instruct",
       "family": "mistral",
@@ -381,13 +436,30 @@
       "size_bytes": 2104932768,
       "size_mb": 2105,
       "vram_required_gb": 4,
-      "context_length": 128000,
+      "context_length": 32768,
       "quantization": "Q4_K_M",
       "specialty": "Chat",
-      "description": "Compact general-purpose Qwen instruction model with 128K context. A low-VRAM chat fallback distinct from the code-specialized Qwen Coder entry.",
+      "description": "Compact general-purpose Qwen instruction model with 32K runtime context in the current ODS llama.cpp path. Useful for direct chat, but below the 64K floor for agent-required release coverage.",
       "tokens_per_sec_estimate": 112,
       "llm_model_name": "qwen2.5-3b-instruct",
       "llama_server_image": null,
+      "app_compatibility": {
+        "openai_chat": {
+          "status": "verified",
+          "reason": "Fleet model-UI run 2026-07-18T21-03Z on windows-laptop loaded this model and completed the required OpenAI-compatible app probes, but runtime metadata reported 32,768 context instead of the previous cataloged 128K value.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T21-03-13Z-model-ui-product-137d335d3231-harness-46275424f31d-hosts-windows-laptop/cycle-004/windows-laptop"
+        },
+        "agent_viability": {
+          "status": "not_agent_viable",
+          "reason": "The same fleet run reported only 32,768 runtime context for this GGUF on the Windows llama.cpp path, below the 64K ODS agent-release floor; keep it out of agent-required release coverage until the context source of truth is resolved.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T21-03-13Z-model-ui-product-137d335d3231-harness-46275424f31d-hosts-windows-laptop/cycle-004/windows-laptop"
+        },
+        "hermes_talk": {
+          "status": "unsupported_until_revalidated",
+          "reason": "Runtime context is below the 64K ODS Talk release floor on the Windows llama.cpp path, even though short app probes completed.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T21-03-13Z-model-ui-product-137d335d3231-harness-46275424f31d-hosts-windows-laptop/cycle-004/windows-laptop"
+        }
+      },
       "install_recommendation": false
     },
     {
@@ -399,13 +471,25 @@
       "gguf_sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
       "size_mb": 2500,
       "vram_required_gb": 5,
-      "context_length": 131072,
+      "context_length": 40960,
       "quantization": "Q4_K_M",
       "specialty": "Chat",
-      "description": "Qwen's compact 4B chat model with 32K native context and 131K YaRN long-context support. A Qwen-family low-VRAM candidate for app and agent validation.",
-      "tokens_per_sec_estimate": 105,
+      "description": "Qwen's compact 4B chat model with a 40K runtime context cap in the current ODS llama.cpp path. It remains available for manual testing, but is blocked from agent-required release coverage until long-context and app behavior are revalidated.",
+      "tokens_per_sec_estimate": 1,
       "llm_model_name": "qwen3-4b",
       "llama_server_image": null,
+      "app_compatibility": {
+        "agent_viability": {
+          "status": "not_agent_viable",
+          "reason": "Fleet model-UI run 2026-07-18T21-03Z on windows-laptop loaded and routed this model correctly, but llama.cpp capped context at 40,960 and ODS Talk timed out after 180s while runtime decode was about 0.5 tok/s; keep it out of agent-required release coverage until revalidated.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T21-03-13Z-model-ui-product-137d335d3231-harness-46275424f31d-hosts-windows-laptop/cycle-005/windows-laptop"
+        },
+        "hermes_talk": {
+          "status": "unsupported_until_revalidated",
+          "reason": "ODS Talk timed out after the model loaded and routed correctly on windows-laptop, with runtime context capped at 40,960 and decode around 0.5 tok/s.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T21-03-13Z-model-ui-product-137d335d3231-harness-46275424f31d-hosts-windows-laptop/cycle-005/windows-laptop"
+        }
+      },
       "install_recommendation": false
     },
     {
@@ -417,13 +501,25 @@
       "gguf_sha256": "d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5",
       "size_mb": 1282,
       "vram_required_gb": 3,
-      "context_length": 131072,
+      "context_length": 40960,
       "quantization": "Q4_K_M",
       "specialty": "Fast",
-      "description": "Qwen3's compact 1.7B chat model in Q4_K_M quantization. A very small Qwen-family candidate for low-VRAM app and agent validation.",
+      "description": "Qwen3's compact 1.7B chat model in Q4_K_M quantization. The upstream config advertises 40K default context without YaRN, below the 64K ODS agent-release floor.",
       "tokens_per_sec_estimate": 145,
       "llm_model_name": "qwen3-1.7b",
       "llama_server_image": null,
+      "app_compatibility": {
+        "agent_viability": {
+          "status": "not_agent_viable",
+          "reason": "Upstream Qwen3 1.7B config reports max_position_embeddings=40960 and no rope_scaling; keep it out of agent-required release coverage until ODS has a product-visible YaRN/runtime policy for this model family.",
+          "evidence": "https://huggingface.co/Qwen/Qwen3-1.7B/blob/main/config.json"
+        },
+        "hermes_talk": {
+          "status": "unsupported_until_revalidated",
+          "reason": "Default runtime context is below the 64K ODS Talk release floor until a YaRN/runtime policy is implemented and fleet-validated.",
+          "evidence": "https://huggingface.co/Qwen/Qwen3-1.7B/blob/main/config.json"
+        }
+      },
       "install_recommendation": false
     },
     {
