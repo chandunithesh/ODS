@@ -29,6 +29,7 @@ _DEFAULT_RECOMMENDATION_POLICY = "catalog-fit-pre-download"
 _VRAM_FIT_TOLERANCE_GB = 0.25
 _MODEL_SELECTOR_POLICY = "context-aware-largest-capable-general-v1"
 _RUNTIME_MODEL_PREFIXES = ("extra.", "user.")
+_AGENT_MIN_LOCAL_TOKENS_PER_SEC = 2.0
 
 
 def normalize_key(value: Any) -> str:
@@ -222,14 +223,52 @@ def _app_compatibility_entry(raw: Any, default_label: str) -> dict[str, Any]:
     return payload
 
 
-def model_app_compatibility(model: dict[str, Any]) -> dict[str, Any]:
+def _local_performance_agent_block(performance: Optional[dict[str, Any]]) -> dict[str, Any] | None:
+    if not isinstance(performance, dict):
+        return None
+    if performance.get("source") != "measured_local":
+        return None
+    try:
+        tokens_per_sec = float(performance.get("tokensPerSec") or 0)
+    except (TypeError, ValueError):
+        return None
+    if tokens_per_sec <= 0 or tokens_per_sec >= _AGENT_MIN_LOCAL_TOKENS_PER_SEC:
+        return None
+
+    return {
+        "tokensPerSec": round(tokens_per_sec, 1),
+        "reason": (
+            f"Local measured throughput is {tokens_per_sec:.1f} tok/s, below the "
+            f"{_AGENT_MIN_LOCAL_TOKENS_PER_SEC:.1f} tok/s floor for ODS Talk and "
+            "agent-required workflows on this machine."
+        ),
+    }
+
+
+def model_app_compatibility(
+    model: dict[str, Any],
+    performance: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     raw = model.get("app_compatibility") if isinstance(model.get("app_compatibility"), dict) else {}
     hermes_talk = _app_compatibility_entry(raw.get("hermes_talk"), "ODS Talk untested")
-    return {
+    compatibility = {
         "openaiChat": _app_compatibility_entry(raw.get("openai_chat"), "Direct chat untested"),
         "hermesTalk": hermes_talk,
         "agentViability": _agent_viability_entry(raw.get("agent_viability"), hermes_talk),
     }
+    local_speed_block = _local_performance_agent_block(performance)
+    if local_speed_block:
+        compatibility["hermesTalk"] = {
+            "status": "unsupported_until_revalidated",
+            "label": "Too slow for ODS Talk",
+            "reason": local_speed_block["reason"],
+        }
+        compatibility["agentViability"] = {
+            "status": "not_agent_viable",
+            "label": "Too slow for agents",
+            "reason": local_speed_block["reason"],
+        }
+    return compatibility
 
 
 def _agent_viability_entry(raw: Any, hermes_talk: dict[str, Any]) -> dict[str, Any]:
@@ -1125,7 +1164,7 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
                 "expertCount": metadata.get("expert_count"),
                 "expertUsedCount": metadata.get("expert_used_count"),
             },
-            "appCompatibility": model_app_compatibility(model),
+            "appCompatibility": model_app_compatibility(model, perf),
             "status": "loaded" if is_loaded else status_if_not_loaded,
             "recommended": is_recommended,
             "configured": is_configured,
