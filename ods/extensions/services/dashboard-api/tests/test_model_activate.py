@@ -34,6 +34,17 @@ _restart_windows_native_llama_server = _mod._restart_windows_native_llama_server
 _write_windows_native_litellm_config = _mod._write_windows_native_litellm_config
 
 
+@pytest.fixture(autouse=True)
+def _isolate_opencode_config(monkeypatch, tmp_path):
+    """Never let model-activation tests mutate the developer's real config."""
+    config_dir = tmp_path / "isolated-home" / ".config" / "opencode"
+    monkeypatch.setattr(
+        _mod,
+        "_opencode_config_paths",
+        lambda: (config_dir / "opencode.json", config_dir / "config.json"),
+    )
+
+
 def test_host_agent_backlog_handles_dashboard_poll_bursts():
     assert _mod.ThreadedHTTPServer.request_queue_size >= 64
 
@@ -469,6 +480,60 @@ class TestWriteLemonadeConfig:
         litellm_dir.mkdir(parents=True)
         _write_lemonade_config(tmp_path, "model.gguf")
         assert (litellm_dir / "lemonade.yaml").exists()
+
+
+class TestOpenCodeModelRoute:
+    def test_lemonade_uses_authenticated_host_litellm_route(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod, "_is_windows_host_llama_server", lambda _env: False)
+
+        assert _mod._opencode_route({
+            "GPU_BACKEND": "amd",
+            "LITELLM_PORT": "4400",
+            "LITELLM_KEY": "secret-key",
+        }) == ("http://127.0.0.1:4400/v1", "secret-key")
+
+    def test_windows_lemonade_uses_native_api_route(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+
+        assert _mod._opencode_route({
+            "GPU_BACKEND": "amd",
+            "LLM_BACKEND": "lemonade",
+            "AMD_INFERENCE_RUNTIME": "lemonade",
+            "AMD_INFERENCE_LOCATION": "host",
+            "AMD_INFERENCE_PORT": "8090",
+        }) == ("http://127.0.0.1:8090/api/v1", "no-key")
+
+    def test_linux_managed_service_is_restarted_with_user_bus(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod.os, "getuid", lambda: 1001, raising=False)
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _mod._restart_managed_opencode() is True
+        assert [call[0] for call in calls] == [
+            ["systemctl", "--user", "is-active", "--quiet", "opencode-web.service"],
+            ["systemctl", "--user", "restart", "opencode-web.service"],
+        ]
+        assert calls[0][1]["env"]["XDG_RUNTIME_DIR"] == "/run/user/1001"
+        assert calls[0][1]["env"]["DBUS_SESSION_BUS_ADDRESS"] == (
+            "unix:path=/run/user/1001/bus"
+        )
+
+    def test_windows_on_demand_runtime_is_not_force_restarted(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("Windows OpenCode is not ODS-managed"),
+        )
+
+        assert _mod._restart_managed_opencode() is False
 
 
 class TestPerplexicaModelRoute:
@@ -1233,10 +1298,17 @@ class TestRestartWindowsLemonade:
 
 
 class _ResponseHandler:
-    def __init__(self, wfile=None):
+    def __init__(self, wfile=None, request_body=None, api_key="test-agent-key"):
         self.wfile = wfile or io.BytesIO()
         self.response_code = None
         self.response_headers = []
+        if request_body is not None:
+            payload = json.dumps(request_body).encode("utf-8")
+            self.rfile = io.BytesIO(payload)
+            self.headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Length": str(len(payload)),
+            }
 
     def send_response(self, code):
         self.response_code = code
@@ -1249,6 +1321,51 @@ class _ResponseHandler:
 
     def parse_response(self):
         return json.loads(self.wfile.getvalue().decode("utf-8"))
+
+
+class TestModelActivateRequest:
+    def test_validates_and_forwards_cli_metadata(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-agent-key")
+        monkeypatch.setattr(_mod, "_begin_model_activation", lambda _model: (True, None))
+        monkeypatch.setattr(_mod, "_end_model_activation", lambda: None)
+        handler = _ResponseHandler(request_body={
+            "model_id": "qwen3.5-9b-q4",
+            "context_length": 16384,
+            "tier": "sh_compact",
+        })
+        handler._do_model_activate = (
+            lambda model_id, **kwargs: calls.append((model_id, kwargs))
+        )
+
+        _mod.AgentHandler._handle_model_activate(handler)
+
+        assert calls == [(
+            "qwen3.5-9b-q4",
+            {"requested_context_length": 16384, "requested_tier": "SH_COMPACT"},
+        )]
+
+    @pytest.mark.parametrize(
+        "request_body",
+        [
+            {"model_id": "target", "context_length": True},
+            {"model_id": "target", "context_length": 512},
+            {"model_id": "target", "tier": "UNKNOWN"},
+            {"model_id": "target", "tier": "../1"},
+        ],
+    )
+    def test_rejects_invalid_cli_metadata(self, monkeypatch, request_body):
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-agent-key")
+        monkeypatch.setattr(
+            _mod.AgentHandler,
+            "_do_model_activate",
+            lambda *_args, **_kwargs: pytest.fail("invalid metadata must not activate"),
+        )
+        handler = _ResponseHandler(request_body=request_body)
+
+        _mod.AgentHandler._handle_model_activate(handler)
+
+        assert handler.response_code == 400
 
 
 class _BrokenPipeWriter:
@@ -2593,6 +2710,197 @@ class TestModelActivateRollback:
         assert handler.response_code == 200
         assert recreates == [["openclaw"]]
         assert verified_models == ["new-model.gguf"]
+
+    @pytest.mark.parametrize(
+        ("system_name", "expected_model_id"),
+        [
+            ("Linux", "new-model"),
+            ("Windows", "new-model.gguf"),
+        ],
+    )
+    def test_activation_updates_both_opencode_configs_without_losing_user_settings(
+        self, tmp_path, monkeypatch, system_name, expected_model_id,
+    ):
+        install_dir, _env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        config_dir = tmp_path / "home" / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        primary = config_dir / "opencode.json"
+        compat = config_dir / "config.json"
+        primary.write_text(
+            json.dumps({
+                "model": "llama-server/old-model",
+                "small_model": "llama-server/old-model",
+                "theme": "system",
+                "provider": {
+                    "custom-cloud": {"npm": "@ai-sdk/openai"},
+                    "llama-server": {
+                        "options": {
+                            "baseURL": "http://127.0.0.1:8080/v1",
+                            "apiKey": "no-key",
+                            "timeout": 900,
+                        },
+                        "models": {"old-model": {"name": "old-model"}},
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        compat.write_text(
+            json.dumps({
+                "model": "llama-server/old-model",
+                "compat_only": True,
+                "provider": {},
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_opencode_config_paths", lambda: (primary, compat))
+        monkeypatch.setattr(_mod.platform, "system", lambda: system_name)
+        monkeypatch.setattr(_mod, "_restart_managed_opencode", lambda: False)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", lambda *_args, **_kwargs: True)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        for path in (primary, compat):
+            config = json.loads(path.read_text(encoding="utf-8"))
+            assert config["model"] == f"llama-server/{expected_model_id}"
+            assert config["small_model"] == f"llama-server/{expected_model_id}"
+            provider = config["provider"]["llama-server"]
+            assert provider["options"]["baseURL"] == "http://127.0.0.1:8080/v1"
+            assert provider["options"]["apiKey"] == "no-key"
+            assert provider["models"][expected_model_id]["limit"] == {
+                "context": 4096,
+                "output": 4096,
+            }
+        primary_config = json.loads(primary.read_text(encoding="utf-8"))
+        compat_config = json.loads(compat.read_text(encoding="utf-8"))
+        assert primary_config["theme"] == "system"
+        assert primary_config["provider"]["custom-cloud"] == {
+            "npm": "@ai-sdk/openai"
+        }
+        assert primary_config["provider"]["llama-server"]["options"]["timeout"] == 900
+        assert compat_config["compat_only"] is True
+
+    def test_opencode_update_failure_restores_exact_files(self, tmp_path, monkeypatch):
+        install_dir, _env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        config_dir = tmp_path / "home" / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        primary = config_dir / "opencode.json"
+        compat = config_dir / "config.json"
+        original = '{"model":"llama-server/old-model","provider":{}}\n'
+        primary.write_text(original, encoding="utf-8")
+        perplexica_snapshot = TestPerplexicaModelRoute._snapshot()
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_opencode_config_paths", lambda: (primary, compat))
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(
+            _mod, "_capture_perplexica_config", lambda _env: perplexica_snapshot
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_update_perplexica_model",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated downstream failure")
+            ),
+        )
+        monkeypatch.setattr(_mod, "_restore_perplexica_config", lambda _snapshot: None)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert handler.parse_response()["rolled_back"] is True
+        assert primary.read_text(encoding="utf-8") == original
+        assert not compat.exists()
+
+    def test_activation_rejects_unrecoverable_opencode_config(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        config_dir = tmp_path / "home" / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        primary = config_dir / "opencode.json"
+        compat = config_dir / "config.json"
+        primary.write_text("not-json", encoding="utf-8")
+        compat.write_text("[]", encoding="utf-8")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_opencode_config_paths", lambda: (primary, compat))
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", lambda *_args, **_kwargs: True)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert "OpenCode config is malformed" in handler.parse_response()["error"]
+        assert env_path.read_text(encoding="utf-8") == env_text
+
+    def test_cli_activation_metadata_persists_tier_and_bounded_context(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", lambda *_args, **_kwargs: True)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=2048,
+            requested_tier="0",
+        )
+
+        assert handler.response_code == 200
+        assert handler.parse_response() == {
+            "status": "activated",
+            "model_id": "target-model",
+        }
+        env = _mod.load_env(env_path)
+        assert env["TIER"] == "0"
+        assert env["CTX_SIZE"] == "2048"
+        assert env["MAX_CONTEXT"] == "2048"
+        assert env["GGUF_URL"] == "https://example.test/new-model.gguf"
+        assert env["GGUF_SHA256"] == hashlib.sha256(b"model").hexdigest()
+
+    def test_activation_rejects_context_above_catalog_limit(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        restarts = []
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(
+            _mod, "_compose_restart_llama_server", lambda _env: restarts.append(True)
+        )
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=8192,
+            requested_tier="4",
+        )
+
+        assert handler.response_code == 400
+        assert "exceeds the catalog limit" in handler.parse_response()["error"]
+        assert env_path.read_text(encoding="utf-8") == env_text
+        assert restarts == []
 
     def test_activation_updates_perplexica_after_model_readiness(
         self, tmp_path, monkeypatch,

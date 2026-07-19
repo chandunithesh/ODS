@@ -36,6 +36,17 @@ _split_nmcli_terse = _mod._split_nmcli_terse
 _request_server_shutdown = _mod._request_server_shutdown
 
 
+@pytest.fixture(autouse=True)
+def _isolate_opencode_config(monkeypatch, tmp_path):
+    """Keep host-agent integration tests out of the user's OpenCode config."""
+    config_dir = tmp_path / "isolated-home" / ".config" / "opencode"
+    monkeypatch.setattr(
+        _mod,
+        "_opencode_config_paths",
+        lambda: (config_dir / "opencode.json", config_dir / "config.json"),
+    )
+
+
 def can_create_symlinks(tmp_path: Path) -> bool:
     target = tmp_path / "symlink-target"
     link = tmp_path / "symlink-probe"

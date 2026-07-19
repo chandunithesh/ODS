@@ -79,6 +79,13 @@ USER_EXTENSIONS_DIR: Path = Path()
 EXTENSIONS_DIR: Path = Path()
 _ODS_MODES = frozenset({"local", "cloud", "hybrid", "lemonade"})
 _LOCAL_MODEL_MODES = frozenset({"local", "hybrid", "lemonade"})
+_MODEL_TIER_RE = re.compile(r"^[A-Z0-9_]{1,32}$")
+_MODEL_TIERS = frozenset({
+    "0", "1", "2", "3", "4", "ARC", "ARC_LITE",
+    "NV_ULTRA", "SH_COMPACT", "SH_LARGE",
+})
+_MIN_MODEL_CONTEXT = 1024
+_MAX_MODEL_CONTEXT = 1048576
 
 # Per-service locks to prevent concurrent start+stop races on the same service
 _service_locks: dict[str, threading.Lock] = collections.defaultdict(threading.Lock)
@@ -4127,6 +4134,38 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 400, {"error": "model_id is required"})
             return
 
+        requested_context_length = body.get("context_length")
+        if requested_context_length is not None:
+            if (
+                isinstance(requested_context_length, bool)
+                or not isinstance(requested_context_length, int)
+                or not _MIN_MODEL_CONTEXT <= requested_context_length <= _MAX_MODEL_CONTEXT
+            ):
+                json_response(
+                    self,
+                    400,
+                    {
+                        "error": (
+                            f"context_length must be an integer between "
+                            f"{_MIN_MODEL_CONTEXT} and {_MAX_MODEL_CONTEXT}"
+                        )
+                    },
+                )
+                return
+
+        requested_tier = body.get("tier")
+        if requested_tier is not None:
+            if not isinstance(requested_tier, str):
+                json_response(self, 400, {"error": "tier must be a string"})
+                return
+            requested_tier = requested_tier.strip().upper()
+            if (
+                not _MODEL_TIER_RE.fullmatch(requested_tier)
+                or requested_tier not in _MODEL_TIERS
+            ):
+                json_response(self, 400, {"error": "tier is not supported"})
+                return
+
         acquired, active_model_id = _begin_model_activation(model_id)
         if not acquired:
             with _model_lifecycle_state_lock:
@@ -4148,11 +4187,22 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            self._do_model_activate(model_id)
+            activation_options = {}
+            if requested_context_length is not None:
+                activation_options["requested_context_length"] = requested_context_length
+            if requested_tier is not None:
+                activation_options["requested_tier"] = requested_tier
+            self._do_model_activate(model_id, **activation_options)
         finally:
             _end_model_activation()
 
-    def _do_model_activate(self, model_id: str):
+    def _do_model_activate(
+        self,
+        model_id: str,
+        *,
+        requested_context_length: int | None = None,
+        requested_tier: str | None = None,
+    ):
         """Inner activate logic — called with _model_activate_lock held."""
         env_path = INSTALL_DIR / ".env"
         try:
@@ -4232,7 +4282,25 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         gguf_file = model.get("gguf_file", "")
         llm_model_name = model.get("llm_model_name", model_id)
-        context_length = model.get("context_length", 32768)
+        try:
+            catalog_context_length = int(model.get("context_length") or 32768)
+        except (TypeError, ValueError):
+            catalog_context_length = 32768
+        context_length = catalog_context_length
+        if requested_context_length is not None:
+            if model_from_catalog and requested_context_length > catalog_context_length:
+                json_response(
+                    self,
+                    400,
+                    {
+                        "error": (
+                            f"Requested context {requested_context_length} exceeds the "
+                            f"catalog limit {catalog_context_length} for {model_id}"
+                        )
+                    },
+                )
+                return
+            context_length = requested_context_length
         llama_server_image = model.get("llama_server_image")
 
         # Verify GGUF exists on disk (with path traversal protection)
@@ -4285,10 +4353,12 @@ class AgentHandler(BaseHTTPRequestHandler):
         litellm_local_backup: str | None = None
         hermes_live_snapshot: dict | None = None
         hermes_backups: dict[Path, str] = {}
+        opencode_snapshot: dict | None = None
         perplexica_snapshot: dict | None = None
         committed = False
         rollback_attempted = False
         runtime_restart_strategy: str | None = None
+        opencode_restarted = False
         apple_llama_bin: Path | None = None
         apple_llama_log: Path | None = None
         apple_pid_file: Path | None = None
@@ -4316,6 +4386,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 )
             elif hermes_live_snapshot is not None:
                 _remove_hermes_live_config(hermes_live_config)
+            if opencode_snapshot is not None:
+                _restore_opencode_config(opencode_snapshot)
 
         def restore_previous_runtime():
             rollback_env = load_env(env_path)
@@ -4357,6 +4429,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 openclaw_recreated = _recreate_openclaw_if_present()
                 if perplexica_snapshot is not None:
                     _restore_perplexica_config(perplexica_snapshot)
+                if opencode_restarted and not _restart_managed_opencode():
+                    raise RuntimeError("managed OpenCode disappeared during rollback")
                 previous_gguf = str(rollback_env.get("GGUF_FILE") or "")
                 previous_model = str(
                     rollback_env.get("LLM_MODEL")
@@ -4455,6 +4529,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     pass
                 llama_server_image = runtime_profile.get("llama_server_image") or llama_server_image
                 runtime_env = runtime_profile.get("env") if isinstance(runtime_profile.get("env"), dict) else {}
+            if requested_context_length is not None:
+                context_length = min(int(context_length), requested_context_length)
 
             # Save rollback snapshot
             env_backup = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
@@ -4478,6 +4554,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 )
             except FileNotFoundError:
                 pass
+            opencode_snapshot = _capture_opencode_config()
             perplexica_snapshot = _capture_perplexica_config(env_pre)
 
             # Update .env
@@ -4485,6 +4562,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 lines = env_path.read_text(encoding="utf-8").splitlines()
                 updates = {
                     "GGUF_FILE": gguf_file,
+                    "GGUF_URL": str(model.get("gguf_url") or ""),
+                    "GGUF_SHA256": str(model.get("gguf_sha256") or ""),
                     "LLM_MODEL": llm_model_name,
                     "CTX_SIZE": str(context_length),
                     "MAX_CONTEXT": str(context_length),
@@ -4492,6 +4571,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     "MODEL_RUNTIME_PROFILE_LABEL": runtime_profile.get("label", "") if runtime_profile else "",
                     "MODEL_RUNTIME_PROFILE_SOURCE": runtime_profile.get("source_url", "") if runtime_profile else "",
                 }
+                if requested_tier:
+                    updates["TIER"] = requested_tier
                 if lemonade_runtime:
                     updates["LEMONADE_MODEL"] = (
                         str(env_pre.get("LEMONADE_MODEL") or "")
@@ -4696,6 +4777,19 @@ class AgentHandler(BaseHTTPRequestHandler):
                 hermes_patched = hermes_live_patched or (
                     hermes_template_patched and not hermes_live_exists
                 )
+
+                if opencode_snapshot is not None:
+                    opencode_model_id = (
+                        gguf_file if platform.system() == "Windows" else llm_model_name
+                    )
+                    _update_opencode_config(
+                        env,
+                        opencode_snapshot,
+                        opencode_model_id,
+                        int(context_length),
+                        display_name=llm_model_name,
+                    )
+                    opencode_restarted = _restart_managed_opencode()
 
                 # Restart dependent services so they pick up the new model
                 litellm_restarted = _restart_existing_container("ods-litellm")
@@ -6151,6 +6245,262 @@ def _restart_existing_container(container: str) -> bool:
     return True
 
 
+def _opencode_config_paths() -> tuple[Path, Path]:
+    """Return the native OpenCode config paths used by every ODS installer."""
+    config_dir = Path.home() / ".config" / "opencode"
+    return config_dir / "opencode.json", config_dir / "config.json"
+
+
+def _capture_opencode_config() -> dict | None:
+    """Snapshot OpenCode config, using either compatibility file as a source."""
+    paths = _opencode_config_paths()
+    files: dict[Path, dict] = {}
+    source = None
+    parse_errors = []
+    for path in paths:
+        if not path.exists():
+            files[path] = {
+                "exists": False,
+                "text": None,
+                "mode": None,
+                "parsed": None,
+            }
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            mode = stat_mod.S_IMODE(path.stat().st_mode)
+        except OSError as exc:
+            raise RuntimeError(f"Could not snapshot OpenCode config {path}: {exc}") from exc
+        parsed = None
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("root value is not an object")
+            if source is None:
+                source = parsed
+        except (json.JSONDecodeError, ValueError) as exc:
+            parsed = None
+            parse_errors.append(f"{path.name}: {exc}")
+        files[path] = {
+            "exists": True,
+            "text": text,
+            "mode": mode,
+            "parsed": parsed,
+        }
+
+    if not any(item["exists"] for item in files.values()):
+        return None
+    if source is None:
+        raise RuntimeError(
+            "OpenCode config is malformed in every compatibility path: "
+            + "; ".join(parse_errors)
+        )
+    return {"files": files, "source": source}
+
+
+def _atomic_write_json(path: Path, value: dict, mode: int = 0o600) -> None:
+    """Atomically replace a JSON file with explicit owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _opencode_route(env: dict) -> tuple[str, str]:
+    """Return the host-visible OpenAI-compatible endpoint and API key."""
+    gpu_backend = str(env.get("GPU_BACKEND") or "nvidia").lower()
+    if _is_windows_host_lemonade(env):
+        port = str(env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080")
+        return f"http://127.0.0.1:{port}/api/v1", "no-key"
+    windows_native = _is_windows_host_llama_server(env)
+    if gpu_backend == "amd" and not windows_native:
+        port = str(env.get("LITELLM_PORT") or "4000")
+        api_key = str(env.get("LITELLM_KEY") or "")
+        if not api_key:
+            raise RuntimeError("LITELLM_KEY is required to update the OpenCode Lemonade route")
+        return f"http://127.0.0.1:{port}/v1", api_key
+
+    if gpu_backend == "apple":
+        host = _native_llama_health_host(env)
+        port = str(env.get("ODS_NATIVE_LLAMA_PORT") or env.get("OLLAMA_PORT") or "8080")
+    elif windows_native:
+        host = "127.0.0.1"
+        port = str(env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080")
+    else:
+        host = "127.0.0.1"
+        port = str(env.get("OLLAMA_PORT") or "8080")
+    return f"http://{host}:{port}/v1", "no-key"
+
+
+def _opencode_config_matches(
+    config: object,
+    model_name: str,
+    base_url: str,
+    api_key: str,
+    context_length: int,
+) -> bool:
+    if not isinstance(config, dict):
+        return False
+    provider = config.get("provider")
+    llama_provider = provider.get("llama-server") if isinstance(provider, dict) else None
+    options = llama_provider.get("options") if isinstance(llama_provider, dict) else None
+    models = llama_provider.get("models") if isinstance(llama_provider, dict) else None
+    model = models.get(model_name) if isinstance(models, dict) else None
+    limit = model.get("limit") if isinstance(model, dict) else None
+    return bool(
+        config.get("model") == f"llama-server/{model_name}"
+        and config.get("small_model") == f"llama-server/{model_name}"
+        and isinstance(options, dict)
+        and options.get("baseURL") == base_url
+        and options.get("apiKey") == api_key
+        and isinstance(limit, dict)
+        and limit.get("context") == context_length
+    )
+
+
+def _update_opencode_config(
+    env: dict,
+    snapshot: dict,
+    model_id: str,
+    context_length: int,
+    display_name: str | None = None,
+) -> None:
+    """Update both OpenCode compatibility files and verify persisted routing."""
+    base_url, api_key = _opencode_route(env)
+    display_name = display_name or model_id
+
+    for path, previous in snapshot["files"].items():
+        source = previous.get("parsed") or snapshot["source"]
+        config = json.loads(json.dumps(source))
+        config["model"] = f"llama-server/{model_id}"
+        config["small_model"] = f"llama-server/{model_id}"
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+
+        providers = config.setdefault("provider", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            config["provider"] = providers
+        provider = providers.setdefault("llama-server", {})
+        if not isinstance(provider, dict):
+            provider = {}
+            providers["llama-server"] = provider
+        provider["npm"] = "@ai-sdk/openai-compatible"
+        provider["name"] = "llama-server (local)"
+        options = provider.setdefault("options", {})
+        if not isinstance(options, dict):
+            options = {}
+            provider["options"] = options
+        options["baseURL"] = base_url
+        options["apiKey"] = api_key
+        models = provider.setdefault("models", {})
+        if not isinstance(models, dict):
+            models = {}
+            provider["models"] = models
+        model = models.setdefault(model_id, {})
+        if not isinstance(model, dict):
+            model = {}
+            models[model_id] = model
+        model["name"] = display_name
+        limit = model.setdefault("limit", {})
+        if not isinstance(limit, dict):
+            limit = {}
+            model["limit"] = limit
+        limit["context"] = context_length
+        limit["output"] = min(32768, context_length)
+
+        _atomic_write_json(path, config, 0o600)
+        try:
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not verify OpenCode config {path}: {exc}") from exc
+        if not _opencode_config_matches(
+            persisted, model_id, base_url, api_key, context_length
+        ):
+            raise RuntimeError(f"OpenCode persisted model route is stale in {path}")
+
+
+def _restore_opencode_config(snapshot: dict) -> None:
+    """Restore exact OpenCode files after a failed downstream activation."""
+    for path, previous in snapshot["files"].items():
+        if previous["exists"]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{threading.get_ident()}.rollback.tmp"
+            )
+            try:
+                tmp_path.write_text(str(previous["text"]), encoding="utf-8")
+                os.chmod(tmp_path, previous.get("mode") or 0o600)
+                os.replace(tmp_path, path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _restart_managed_opencode() -> bool:
+    """Restart the ODS-managed OpenCode Web UI when it is currently loaded."""
+    system = platform.system()
+    if system == "Darwin":
+        getuid = getattr(os, "getuid", None)
+        if not callable(getuid):
+            return False
+        target = f"gui/{getuid()}/com.ods.opencode-web"
+        status = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if status.returncode != 0:
+            return False
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", target],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    elif system == "Linux":
+        getuid = getattr(os, "getuid", None)
+        if not callable(getuid):
+            return False
+        uid = getuid()
+        user_env = os.environ.copy()
+        user_env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        user_env.setdefault(
+            "DBUS_SESSION_BUS_ADDRESS",
+            f"unix:path=/run/user/{uid}/bus",
+        )
+        status = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", "opencode-web.service"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=user_env,
+        )
+        if status.returncode != 0:
+            return False
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "opencode-web.service"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=user_env,
+        )
+    else:
+        # Windows installs OpenCode as an on-demand native application rather
+        # than an ODS-managed daemon. The verified config applies on launch.
+        return False
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Could not restart managed OpenCode: {detail[:300]}")
+    return True
+
+
 def _perplexica_config_url(env: dict) -> str:
     """Return the Perplexica config endpoint reachable from this process."""
     if os.environ.get("ODS_HOST_INSTALL_DIR"):
@@ -6182,7 +6532,13 @@ def _perplexica_http_json(url: str, payload: dict | None = None) -> dict:
 
 def _capture_perplexica_config(env: dict) -> dict | None:
     """Snapshot mutable Perplexica routing state when the service is running."""
+    if not _container_exists("ods-perplexica"):
+        return None
     if not _container_running("ods-perplexica"):
+        logger.info(
+            "Perplexica exists but is stopped; its next compose activation will "
+            "reconcile the model from the updated .env"
+        )
         return None
     url = _perplexica_config_url(env)
     payload = _perplexica_http_json(url)
