@@ -525,6 +525,10 @@ class TestOpenCodeModelRoute:
         calls = []
         monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
         monkeypatch.setattr(_mod.os, "getuid", lambda: 1001, raising=False)
+        # _opencode_user_service_env() honors an ambient session bus via
+        # setdefault; clear the host's values so the derived uid path is tested.
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         monkeypatch.setattr(_mod, "_wait_for_opencode_health", lambda: None)
 
         def fake_run(command, **kwargs):
