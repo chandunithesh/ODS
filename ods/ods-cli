@@ -3124,13 +3124,77 @@ cmd_model() {
             [[ "$TIER" =~ ^T([0-9]+)$ ]] && TIER="${BASH_REMATCH[1]}"
             [[ "$TIER" == "SH" ]] && TIER="SH_COMPACT"
             resolve_tier_config
-            _env_set "LLM_MODEL" "$model"
-            _env_set "TIER" "$TIER"
-            _env_set "GGUF_FILE" "$GGUF_FILE"
-            _env_set "GGUF_URL" "$GGUF_URL"
-            _env_set "CTX_SIZE" "$MAX_CONTEXT"
-            _env_set "MAX_CONTEXT" "$MAX_CONTEXT"
-            success "Model set to $model (tier $tier, ctx=$MAX_CONTEXT). Run 'ods restart llama-server' to apply."
+
+            local model_path="$INSTALL_DIR/data/models/$GGUF_FILE"
+            [[ -s "$model_path" ]] || error "Model file is not downloaded: $model_path"
+
+            local model_id="$GGUF_FILE"
+            local library="$INSTALL_DIR/config/model-library.json"
+            if [[ -f "$library" ]] && command -v jq >/dev/null 2>&1; then
+                local catalog_id
+                catalog_id=$(jq -r --arg file "$GGUF_FILE" \
+                    '[.models[]? | select(.gguf_file == $file) | .id][0] // empty' \
+                    "$library" 2>/dev/null || true)
+                [[ -n "$catalog_id" ]] && model_id="$catalog_id"
+            fi
+
+            local agent_key
+            agent_key=$(grep -m1 '^ODS_AGENT_KEY=' .env 2>/dev/null | cut -d= -f2- || true)
+            [[ -z "$agent_key" ]] && \
+                agent_key=$(grep -m1 '^DASHBOARD_API_KEY=' .env 2>/dev/null | cut -d= -f2- || true)
+            [[ -n "$agent_key" ]] || error "ODS host-agent API key is missing from .env"
+            [[ "$agent_key" != *$'\n'* && "$agent_key" != *$'\r'* ]] || \
+                error "ODS host-agent API key contains invalid newline characters"
+
+            local agent_port
+            agent_port=$(grep -m1 '^ODS_AGENT_PORT=' .env 2>/dev/null | cut -d= -f2- || true)
+            [[ "$agent_port" =~ ^[0-9]+$ ]] || agent_port="7710"
+            local activate_url="http://127.0.0.1:${agent_port}/v1/model/activate"
+            if ! curl -sf --max-time 3 "http://127.0.0.1:${agent_port}/health" >/dev/null; then
+                error "ODS host agent is not reachable. Run 'ods agent restart' and retry."
+            fi
+
+            local request_json response_file http_code curl_status
+            request_json=$(jq -nc \
+                --arg model_id "$model_id" \
+                --arg tier "$TIER" \
+                --argjson context_length "$MAX_CONTEXT" \
+                '{model_id: $model_id, tier: $tier, context_length: $context_length}') || \
+                error "Could not build the model activation request"
+            response_file=$(mktemp "${TMPDIR:-/tmp}/ods-model-activate.XXXXXX") || \
+                error "Could not create a model activation response file"
+            chmod 600 "$response_file"
+
+            # Feed the bearer header over stdin so the key is never exposed in
+            # process arguments or left in a temporary file after interruption.
+            if http_code=$(printf 'Authorization: Bearer %s\n' "$agent_key" | \
+                curl --silent --show-error --max-time 1200 \
+                    --output "$response_file" --write-out '%{http_code}' \
+                    --request POST --header @- \
+                    --header 'Content-Type: application/json' \
+                    --data "$request_json" "$activate_url"); then
+                curl_status=0
+            else
+                curl_status=$?
+            fi
+            if [[ $curl_status -ne 0 ]]; then
+                rm -f "$response_file"
+                error "Model activation request failed before the host agent completed"
+            fi
+
+            if [[ "$http_code" != "200" ]]; then
+                local activation_error
+                activation_error=$(jq -r '.error // empty' "$response_file" 2>/dev/null || true)
+                [[ -z "$activation_error" ]] && activation_error=$(head -c 500 "$response_file")
+                rm -f "$response_file"
+                error "Model activation failed (HTTP $http_code): ${activation_error:-unknown error}"
+            fi
+            if [[ "$(jq -r '.status // empty' "$response_file" 2>/dev/null)" != "activated" ]]; then
+                rm -f "$response_file"
+                error "Host agent returned an invalid model activation receipt"
+            fi
+            rm -f "$response_file"
+            success "Model activated everywhere: $model (tier $tier, ctx=$MAX_CONTEXT)."
             ;;
         *)
             error "Usage: ods model <current|list|swap>"
