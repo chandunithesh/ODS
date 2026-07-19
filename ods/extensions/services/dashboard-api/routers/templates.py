@@ -146,6 +146,7 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
     results = {}
     enabled_services = []
     library_installed: list[str] = []
+    warnings: list[str] = []
 
     for svc_id in template.get("services", []):
         # Skip services already healthy
@@ -159,6 +160,15 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
         if svc_id in _BASE_COMPOSE_SERVICES:
             results[svc_id] = "core_service"
             continue
+
+        svc_config = SERVICES.get(svc_id)
+        if svc_config:
+            gpu_backends = svc_config.get("gpu_backends", ["amd", "nvidia", "apple"])
+            if GPU_BACKEND != "apple" and GPU_BACKEND not in gpu_backends and "all" not in gpu_backends:
+                detail = f"requires one of {gpu_backends}; current backend is {GPU_BACKEND}"
+                results[svc_id] = f"skipped: incompatible GPU backend: {detail}"
+                warnings.append(f"{svc_id}: {detail}")
+                continue
 
         try:
             _validate_service_id(svc_id)
@@ -206,36 +216,50 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
             logger.warning("Template apply skipped %s: %s", svc_id, detail)
             results[svc_id] = f"skipped: {detail}"
 
-    # Start enabled services via agent (outside locks)
-    for svc_id in enabled_services:
-        # Host agent can only start user-installed extensions
-        user_ext_dir = USER_EXTENSIONS_DIR / svc_id
-        if user_ext_dir.is_dir():
-            await asyncio.to_thread(_call_agent_hook, svc_id, "pre_start")
-            start_ok = await asyncio.to_thread(_call_agent, "start", svc_id)
-            if not start_ok:
-                # Preserve library_installed label — user-visible install succeeded,
-                # only the start call failed.
-                if results.get(svc_id) != "library_installed":
-                    results[svc_id] = "enabled_but_start_failed"
-                else:
-                    logger.warning("Library-installed extension %s failed to start via agent", svc_id)
-            await asyncio.to_thread(_call_agent_hook, svc_id, "post_start")
-        elif svc_id not in library_installed:
-            # Built-in extension: compose file toggled, needs stack restart
-            results[svc_id] = "enabled"
+    # A dependency may also appear later as a top-level template service.
+    # Start each service once while preserving dependency order.
+    enabled_services = list(dict.fromkeys(enabled_services))
 
-    any_builtin = any(
-        not (USER_EXTENSIONS_DIR / svc_id).is_dir()
-        for svc_id in enabled_services
-    )
-    # Library installs add new services to the compose stack → restart needed
-    restart_required = any_builtin or bool(library_installed)
+    # Start enabled services via the same host-agent lifecycle used by the
+    # individual extension endpoint. Built-in extensions are valid host-agent
+    # targets too; the old user-extension-only gate left them enabled on disk
+    # but stopped until a manual full-stack restart.
+    failed_services: list[str] = []
+    for svc_id in enabled_services:
+        pre_start_ok = await asyncio.to_thread(_call_agent_hook, svc_id, "pre_start")
+        if not pre_start_ok:
+            results[svc_id] = "enabled_but_pre_start_failed"
+            failed_services.append(svc_id)
+            warnings.append(f"{svc_id}: pre_start hook failed; service was not started")
+            continue
+
+        start_ok = await asyncio.to_thread(_call_agent, "start", svc_id)
+        if not start_ok:
+            if svc_id in library_installed:
+                results[svc_id] = "library_installed_but_start_failed"
+            else:
+                results[svc_id] = "enabled_but_start_failed"
+            failed_services.append(svc_id)
+
+        post_start_ok = await asyncio.to_thread(_call_agent_hook, svc_id, "post_start")
+        if not post_start_ok:
+            warnings.append(f"{svc_id}: post_start hook failed; manual configuration may be needed")
+
+    skipped_services = [
+        service_id
+        for service_id, outcome in results.items()
+        if isinstance(outcome, str) and outcome.startswith("skipped:")
+    ]
+    restart_required = bool(failed_services)
 
     return {
         "template_id": template_id,
         "results": results,
         "enabled_count": len(enabled_services),
+        "started_count": len(enabled_services) - len(failed_services),
         "library_installed": library_installed,
+        "failed_services": failed_services,
+        "skipped_services": skipped_services,
+        "warnings": warnings,
         "restart_required": restart_required,
     }

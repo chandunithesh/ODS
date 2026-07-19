@@ -358,8 +358,40 @@ async def test_template_apply_incompatible_skipped():
 
 
 @pytest.mark.asyncio
+async def test_template_apply_enforces_gpu_compatibility():
+    """Apply cannot bypass the GPU compatibility check performed by preview."""
+    mock_templates = [{
+        "id": "test-tmpl",
+        "name": "Test",
+        "services": ["cuda-only"],
+    }]
+    mock_activate = MagicMock()
+
+    with (
+        patch("routers.templates.TEMPLATES", mock_templates),
+        patch("routers.templates._BASE_COMPOSE_SERVICES", frozenset()),
+        patch("routers.templates.SERVICES", {"cuda-only": {"gpu_backends": ["nvidia"]}}),
+        patch("routers.templates.GPU_BACKEND", "amd"),
+        patch("helpers.get_cached_services", return_value=[]),
+        patch("routers.extensions._activate_service", mock_activate),
+        patch("routers.extensions._validate_service_id"),
+    ):
+        from routers.templates import apply_template
+        result = await apply_template("test-tmpl", api_key="test")
+
+    mock_activate.assert_not_called()
+    assert result["enabled_count"] == 0
+    assert result["started_count"] == 0
+    assert result["skipped_services"] == ["cuda-only"]
+    assert "incompatible GPU backend" in result["results"]["cuda-only"]
+    assert result["warnings"] == [
+        "cuda-only: requires one of ['nvidia']; current backend is amd",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_template_apply_builtin_extension(tmp_path):
-    """Apply with a built-in extension skips host agent start and sets restart_required."""
+    """Apply starts built-in extensions through the host agent."""
     mock_templates = [{
         "id": "test-tmpl",
         "name": "Test",
@@ -380,6 +412,8 @@ async def test_template_apply_builtin_extension(tmp_path):
     user_ext = tmp_path / "user-ext"
     user_ext.mkdir()
 
+    mock_agent = MagicMock(return_value=True)
+
     with (
         patch("routers.templates.TEMPLATES", mock_templates),
         patch("routers.templates._BASE_COMPOSE_SERVICES", frozenset()),
@@ -388,7 +422,7 @@ async def test_template_apply_builtin_extension(tmp_path):
         patch("routers.extensions._activate_service", mock_activate),
         patch("routers.extensions._extensions_lock", return_value=mock_lock),
         patch("routers.extensions._get_missing_deps_transitive", return_value=[]),
-        patch("routers.extensions._call_agent", return_value=True),
+        patch("routers.extensions._call_agent", mock_agent),
         patch("routers.extensions._call_agent_hook", return_value=True),
         patch("routers.extensions._validate_service_id"),
     ):
@@ -396,8 +430,80 @@ async def test_template_apply_builtin_extension(tmp_path):
         result = await apply_template("test-tmpl", api_key="test")
 
     assert result["results"]["builtin-svc"] == "enabled"
-    assert result["restart_required"] is True
+    mock_agent.assert_called_once_with("start", "builtin-svc")
+    assert result["restart_required"] is False
+    assert result["failed_services"] == []
+    assert result["started_count"] == 1
     assert result["enabled_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_template_apply_reports_builtin_start_failure(tmp_path):
+    """A failed targeted start is explicit and requests manual recovery."""
+    mock_templates = [{
+        "id": "test-tmpl",
+        "name": "Test",
+        "services": ["builtin-svc"],
+    }]
+    mock_activate = MagicMock(return_value={"id": "builtin-svc", "action": "enabled"})
+    mock_lock = MagicMock()
+    mock_lock.__enter__ = MagicMock(return_value=None)
+    mock_lock.__exit__ = MagicMock(return_value=False)
+
+    with (
+        patch("routers.templates.TEMPLATES", mock_templates),
+        patch("routers.templates._BASE_COMPOSE_SERVICES", frozenset()),
+        patch("routers.templates.USER_EXTENSIONS_DIR", tmp_path / "user-ext"),
+        patch("helpers.get_cached_services", return_value=[]),
+        patch("routers.extensions._activate_service", mock_activate),
+        patch("routers.extensions._extensions_lock", return_value=mock_lock),
+        patch("routers.extensions._get_missing_deps_transitive", return_value=[]),
+        patch("routers.extensions._call_agent", return_value=False),
+        patch("routers.extensions._call_agent_hook", return_value=True),
+        patch("routers.extensions._validate_service_id"),
+    ):
+        from routers.templates import apply_template
+        result = await apply_template("test-tmpl", api_key="test")
+
+    assert result["results"]["builtin-svc"] == "enabled_but_start_failed"
+    assert result["failed_services"] == ["builtin-svc"]
+    assert result["started_count"] == 0
+    assert result["restart_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_template_apply_does_not_start_after_pre_start_failure(tmp_path):
+    """A terminal pre_start hook failure blocks the service start."""
+    mock_templates = [{
+        "id": "test-tmpl",
+        "name": "Test",
+        "services": ["svc-a"],
+    }]
+    mock_activate = MagicMock(return_value={"id": "svc-a", "action": "enabled"})
+    mock_agent = MagicMock(return_value=True)
+    mock_lock = MagicMock()
+    mock_lock.__enter__ = MagicMock(return_value=None)
+    mock_lock.__exit__ = MagicMock(return_value=False)
+
+    with (
+        patch("routers.templates.TEMPLATES", mock_templates),
+        patch("routers.templates._BASE_COMPOSE_SERVICES", frozenset()),
+        patch("routers.templates.USER_EXTENSIONS_DIR", tmp_path / "user-ext"),
+        patch("helpers.get_cached_services", return_value=[]),
+        patch("routers.extensions._activate_service", mock_activate),
+        patch("routers.extensions._extensions_lock", return_value=mock_lock),
+        patch("routers.extensions._get_missing_deps_transitive", return_value=[]),
+        patch("routers.extensions._call_agent", mock_agent),
+        patch("routers.extensions._call_agent_hook", return_value=False),
+        patch("routers.extensions._validate_service_id"),
+    ):
+        from routers.templates import apply_template
+        result = await apply_template("test-tmpl", api_key="test")
+
+    mock_agent.assert_not_called()
+    assert result["results"]["svc-a"] == "enabled_but_pre_start_failed"
+    assert result["failed_services"] == ["svc-a"]
+    assert result["restart_required"] is True
 
 
 @pytest.mark.asyncio
@@ -445,8 +551,8 @@ async def test_template_apply_auto_installs_library_extension(tmp_path):
     assert install_calls == ["lib-svc"]
     assert result["results"]["lib-svc"] == "library_installed"
     assert result["library_installed"] == ["lib-svc"]
-    # Library install → compose stack grew → restart required
-    assert result["restart_required"] is True
+    # A successful targeted host-agent start does not require a stack restart.
+    assert result["restart_required"] is False
     assert result["enabled_count"] == 1
 
 
@@ -594,8 +700,8 @@ async def test_template_apply_mixed_builtin_and_library(tmp_path):
     assert result["results"]["lib-svc"] == "library_installed"
     # Both count as enabled
     assert result["enabled_count"] == 2
-    # Either the built-in toggle or the library install forces a restart
-    assert result["restart_required"] is True
+    # Both services were started through the host agent.
+    assert result["restart_required"] is False
 
 
 @pytest.mark.asyncio
