@@ -577,20 +577,23 @@ cmd_backup() {
     mkdir -p "$backup_path"
     
     # Backup compose files
+    # NB: x=$((x + 1)) not ((x++)) — the post-increment form evaluates to 0
+    # on the first increment, which set -e treats as failure and aborts the
+    # backup after copying a single file.
     local files_backed_up=0
     for pattern in "docker-compose*.yml" "docker-compose*.yaml" ".env" ".env.*"; do
         for file in "${INSTALL_DIR}"/${pattern}; do
             if [[ -f "$file" ]]; then
                 cp "$file" "$backup_path/"
-                ((files_backed_up++))
+                files_backed_up=$((files_backed_up + 1))
             fi
         done
     done
-    
+
     # Backup version file
     if [[ -f "$VERSION_FILE" ]]; then
         cp "$VERSION_FILE" "$backup_path/.version"
-        ((files_backed_up++))
+        files_backed_up=$((files_backed_up + 1))
     fi
     
     # Generate metadata (use jq for safe JSON construction)
@@ -611,7 +614,7 @@ cmd_backup() {
     backup_dirs=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name "backup-*" | sort -r)
     local count=0
     for dir in $backup_dirs; do
-        ((count++))
+        count=$((count + 1))
         if ((count > MAX_BACKUPS)); then
             log_info "Removing old backup: $(basename "$dir")"
             rm -rf "$dir"
@@ -772,15 +775,20 @@ cmd_rollback() {
         log_info "Snapshot time    : ${btime}"
     fi
 
-    # Stop services using the currently active compose stack
+    local compose_flags=""
+    local -a compose_args=()
+    compose_flags=$(resolve_compose_flags 2>/dev/null || true)
+    if [[ -n "$compose_flags" ]]; then
+        read -ra compose_args <<< "$compose_flags"
+    fi
+
+    # Stop services using the currently active compose stack.
     log_info "Stopping services..."
     cd "$INSTALL_DIR"
-    local compose_flags=""
-    compose_flags=$(resolve_compose_flags 2>/dev/null || true)
-    if [[ -n "${compose_flags}" ]]; then
-        if ! docker compose ${compose_flags} down; then
+    if [[ ${#compose_args[@]} -gt 0 ]]; then
+        if ! docker compose "${compose_args[@]}" down; then
             log_warn "docker compose v2 down failed, trying v1..."
-            docker-compose ${compose_flags} down
+            docker-compose "${compose_args[@]}" down
         fi
     else
         if ! docker compose down; then
@@ -820,12 +828,17 @@ cmd_rollback() {
 
     # Restart services using the restored compose stack
     log_info "Restarting services..."
-    local restored_flags=""
-    restored_flags=$(resolve_compose_flags 2>/dev/null || true)
-    if [[ -n "${restored_flags}" ]]; then
-        if ! docker compose ${restored_flags} up -d; then
+    local restored_compose_flags=""
+    local -a restored_compose_args=()
+    restored_compose_flags=$(resolve_compose_flags 2>/dev/null || true)
+    if [[ -n "$restored_compose_flags" ]]; then
+        read -ra restored_compose_args <<< "$restored_compose_flags"
+    fi
+
+    if [[ ${#restored_compose_args[@]} -gt 0 ]]; then
+        if ! docker compose "${restored_compose_args[@]}" up -d; then
             log_warn "docker compose v2 up failed, trying v1..."
-            docker-compose ${restored_flags} up -d
+            docker-compose "${restored_compose_args[@]}" up -d
         fi
     else
         if ! docker compose up -d; then
@@ -942,8 +955,6 @@ cmd_health() {
     dashboard_api_port="${dashboard_api_port:-3002}"
     if curl -sf "http://127.0.0.1:${dashboard_api_port}/health" &>/dev/null; then
         log_ok "Dashboard API: healthy"
-    elif curl -sf "http://127.0.0.1:${dashboard_api_port}/api/status" &>/dev/null; then
-        log_ok "Dashboard API: responding"
     else
         log_warn "Dashboard API: not responding on port ${dashboard_api_port}"
     fi
