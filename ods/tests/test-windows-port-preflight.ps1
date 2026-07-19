@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $phasePath = Join-Path $root "installers\windows\phases\04-requirements.ps1"
+. (Join-Path $root "installers\windows\lib\llm-endpoint.ps1")
 $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -54,6 +55,27 @@ try {
 
     Remove-Item Env:OLLAMA_PORT
     Assert-Equal (Resolve-WindowsLlmPreflightPort -GpuBackend "none") 31434 "LLAMA_SERVER_PORT fallback"
+
+    Remove-Item Env:AMD_INFERENCE_PORT -ErrorAction SilentlyContinue
+    Remove-Item Env:LLAMA_SERVER_PORT -ErrorAction SilentlyContinue
+    $installDir = Join-Path ([IO.Path]::GetTempPath()) "ods-port-preflight-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $installDir | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $installDir ".env") -Value @(
+            "AMD_INFERENCE_PORT=19080",
+            "OLLAMA_PORT=22434"
+        )
+        Assert-Equal (Resolve-WindowsLlmPreflightPort -GpuBackend "amd" -InstallDir $installDir) `
+            19080 "Persisted AMD port"
+        Assert-Equal (Resolve-WindowsLlmPreflightPort -GpuBackend "nvidia" -InstallDir $installDir) `
+            22434 "Persisted Docker port"
+
+        $env:AMD_INFERENCE_PORT = "29080"
+        Assert-Equal (Resolve-WindowsLlmPreflightPort -GpuBackend "amd" -InstallDir $installDir) `
+            29080 "Process override wins over persisted AMD port"
+    } finally {
+        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     $listener = [System.Net.Sockets.TcpListener]::new(
         [System.Net.IPAddress]::Loopback,

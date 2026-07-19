@@ -79,20 +79,32 @@ function Resolve-WindowsLlmPreflightPort {
     param(
         [string]$GpuBackend,
         [switch]$CloudMode,
-        [int]$LemonadeDefaultPort = 8080
+        [int]$LemonadeDefaultPort = 8080,
+        [string]$InstallDir = ""
     )
 
     if ($CloudMode) { return 0 }
 
     $defaultPort = 11434
     $candidate = $null
+    $persistedEnv = @{}
+    if ($InstallDir -and (Get-Command Get-WindowsODSEnvMap -ErrorAction SilentlyContinue)) {
+        $persistedEnv = Get-WindowsODSEnvMap -InstallDir $InstallDir
+    }
     if ($GpuBackend -eq "amd") {
         $defaultPort = $LemonadeDefaultPort
         $candidate = $env:AMD_INFERENCE_PORT
+        if (-not $candidate -and $persistedEnv.ContainsKey("AMD_INFERENCE_PORT")) {
+            $candidate = $persistedEnv["AMD_INFERENCE_PORT"]
+        }
     } elseif ($env:OLLAMA_PORT) {
         $candidate = $env:OLLAMA_PORT
     } elseif ($env:LLAMA_SERVER_PORT) {
         $candidate = $env:LLAMA_SERVER_PORT
+    } elseif ($persistedEnv.ContainsKey("OLLAMA_PORT")) {
+        $candidate = $persistedEnv["OLLAMA_PORT"]
+    } elseif ($persistedEnv.ContainsKey("LLAMA_SERVER_PORT")) {
+        $candidate = $persistedEnv["LLAMA_SERVER_PORT"]
     }
 
     if ($candidate) {
@@ -258,7 +270,8 @@ $_portsToCheck = [ordered]@{
 $_llmPortToCheck = Resolve-WindowsLlmPreflightPort `
     -GpuBackend ([string]$gpuInfo.Backend) `
     -CloudMode:$cloudMode `
-    -LemonadeDefaultPort ([int]$script:LEMONADE_PORT)
+    -LemonadeDefaultPort ([int]$script:LEMONADE_PORT) `
+    -InstallDir $installDir
 if ($_llmPortToCheck -gt 0) {
     $_llmServiceLabel = $(if ($gpuInfo.Backend -eq "amd") { "Lemonade (LLM)" } else { "llama-server (LLM)" })
     $_portsToCheck[$_llmServiceLabel] = $_llmPortToCheck
