@@ -5517,9 +5517,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                         hermes_template_verified = False
                 # A missing live file can be seeded from the patched template
                 # on the next Hermes start. An existing file was verified above.
-                hermes_route_configured = hermes_live_verified or (
-                    not hermes_live_exists
-                    and (hermes_template_patched or hermes_template_verified)
+                hermes_patched = hermes_live_patched or (
+                    hermes_template_patched and not hermes_live_exists
                 )
                 hermes_config_mutated = hermes_live_patched or hermes_template_patched
 

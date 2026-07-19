@@ -694,8 +694,6 @@ _macos_native_llama_cwd_is_owned() {
     local process_cwd="$1" home_dir="${HOME:-}"
     [[ -n "$process_cwd" ]] || return 1
     [[ "$process_cwd" == "$INSTALL_DIR" ]] && return 0
-    [[ -n "$home_dir" && "$process_cwd" == "$home_dir/dream-server" ]] && return 0
-    [[ -n "$home_dir" && "$process_cwd" == "$home_dir/DreamServer" ]] && return 0
     return 1
 }
 
@@ -706,12 +704,6 @@ _macos_native_llama_pid_is_owned() {
     command_line="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
     [[ "${process_name##*/}" == "llama-server" ]] || return 1
     if [[ -n "${LLAMA_SERVER_BIN:-}" && "$command_line" == *"$LLAMA_SERVER_BIN"* ]]; then
-        return 0
-    fi
-    if [[ -n "${HOME:-}" && "$command_line" == *"$HOME/dream-server/bin/llama-server"* ]]; then
-        return 0
-    fi
-    if [[ -n "${HOME:-}" && "$command_line" == *"$HOME/DreamServer/bin/llama-server"* ]]; then
         return 0
     fi
     case "$command_line" in
