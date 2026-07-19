@@ -104,6 +104,13 @@ grep -q 'gpuBackend\|gpu-backend' "$ODS_PS1" \
     || fail "Update-ComposeFlags does not pass GPU_BACKEND to resolver"
 pass "Update-ComposeFlags passes GPU_BACKEND to resolver"
 
+info "Static: Update-ComposeFlags can skip incompatible Whisper GPU overlay"
+grep -q -- '--skip-gpu-overlays' "$ODS_PS1" \
+    || fail "Update-ComposeFlags does not pass skip-gpu-overlays to resolver"
+grep -q 'Test-ODSWindowsWhisperCudaSupported' "$ODS_PS1" \
+    || fail "Update-ComposeFlags does not check Windows Whisper CUDA support"
+pass "Update-ComposeFlags can skip incompatible Whisper GPU overlay"
+
 info "Static: Update-ComposeFlags fallback preserves backend overlay -f entries"
 # The fallback keeps everything that doesn't match extensions/services
 grep -q "extensions\[/\\\\\\\\\]services" "$ODS_PS1" \

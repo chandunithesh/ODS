@@ -72,6 +72,7 @@ STARTUP_ODS_MODE: str | None = None
 TIER: str = "1"
 GPU_COUNT: str = "1"
 CORE_SERVICE_IDS: set = set()
+WINDOWS_WHISPER_CUDA_MIN_DRIVER_MAJOR = 575
 # Always-on services defined in docker-compose.base.yml — never stoppable via API.
 # Distinct from CORE_SERVICE_IDS (which is the allowlist of known service IDs).
 ALWAYS_ON_SERVICES: frozenset = frozenset({"llama-server", "open-webui", "dashboard", "dashboard-api"})
@@ -162,6 +163,39 @@ def _ensure_windows_resolver_pyyaml(python_cmd: str) -> None:
         raise RuntimeError(
             "PyYAML install completed but this host-agent process still cannot import yaml"
         )
+
+
+def _nvidia_driver_major() -> int:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+
+    if result.returncode != 0:
+        return 0
+    first = (result.stdout or "").strip().splitlines()
+    if not first:
+        return 0
+    match = re.match(r"^(\d+)", first[0].strip())
+    return int(match.group(1)) if match else 0
+
+
+def _windows_whisper_cuda_supported(env: dict) -> bool:
+    if platform.system() != "Windows":
+        return True
+    gpu_backend = str(env.get("GPU_BACKEND") or GPU_BACKEND or "").lower()
+    if gpu_backend != "nvidia":
+        return False
+
+    acceleration = str(env.get("WHISPER_ACCELERATION") or "").strip().lower()
+    image = str(env.get("WHISPER_IMAGE") or "").strip().lower()
+    if acceleration == "cpu" or (image and "cpu" in image):
+        return False
+
+    return _nvidia_driver_major() >= WINDOWS_WHISPER_CUDA_MIN_DRIVER_MAJOR
 
 
 def _find_usable_bash() -> str | None:
@@ -942,7 +976,8 @@ def resolve_compose_flags() -> list:
     if platform.system() == "Windows":
         _ensure_windows_resolver_pyyaml(sys.executable)
         env["ODS_PYTHON_CMD"] = _to_bash_path(Path(sys.executable))
-    ods_mode = load_env(INSTALL_DIR / ".env").get("ODS_MODE", "").strip() or "local"
+    install_env = load_env(INSTALL_DIR / ".env")
+    ods_mode = install_env.get("ODS_MODE", "").strip() or "local"
     cmd = [
         bash, _to_bash_path(script),
         "--script-dir", _to_bash_path(INSTALL_DIR),
@@ -951,6 +986,8 @@ def resolve_compose_flags() -> list:
         "--gpu-count", GPU_COUNT,
         "--ods-mode", ods_mode,
     ]
+    if platform.system() == "Windows" and not _windows_whisper_cuda_supported(install_env):
+        cmd.extend(["--skip-gpu-overlays", "whisper"])
     try:
         result = subprocess.run(
             cmd,

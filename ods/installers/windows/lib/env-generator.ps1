@@ -215,6 +215,7 @@ function New-ODSEnv {
         [string]$LemonadeServerImage = "",
         [string]$LemonadeModel = "",
         [int]$SystemRamGB = 0,
+        [bool]$WhisperCudaEnabled = $true,
         # Mirror the install-time ENABLE_LANGFUSE toggle from phase 03 into
         # .env's LANGFUSE_ENABLED default. Re-install preserves whatever the
         # user already had in .env (via Get-EnvOrNew), so manual
@@ -492,6 +493,27 @@ function New-ODSEnv {
     } catch { "UTC" })
 
     $timestamp = Get-Date -Format "o"
+    $whisperAccelerationDefault = $(if ($GpuBackend -eq "nvidia" -and $WhisperCudaEnabled) { "cuda" } else { "cpu" })
+    $whisperAcceleration = Get-EnvOrNew "WHISPER_ACCELERATION" $whisperAccelerationDefault
+    if ($GpuBackend -eq "nvidia" -and -not $WhisperCudaEnabled) {
+        $whisperAcceleration = "cpu"
+    }
+    if ($whisperAcceleration -notin @("cpu", "cuda")) {
+        $whisperAcceleration = $whisperAccelerationDefault
+    }
+
+    $whisperImageDefault = $(if ($whisperAcceleration -eq "cuda") { "" } else { "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu" })
+    $whisperImage = Get-EnvOrNew "WHISPER_IMAGE" $whisperImageDefault
+    if ($whisperAcceleration -eq "cpu" -and
+        ([string]::IsNullOrWhiteSpace($whisperImage) -or $whisperImage -match "(?i)cuda")) {
+        $whisperImage = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu"
+    }
+
+    $audioSttModelDefault = $(if ($whisperAcceleration -eq "cuda") { "deepdml/faster-whisper-large-v3-turbo-ct2" } else { "Systran/faster-whisper-base" })
+    $audioSttModel = Get-EnvOrNew "AUDIO_STT_MODEL" $audioSttModelDefault
+    if ($whisperAcceleration -eq "cpu" -and $audioSttModel -match "(?i)large-v3|turbo") {
+        $audioSttModel = $audioSttModelDefault
+    }
 
     # Build .env content (matches Phase 06 format)
     $envContent = @"
@@ -620,10 +642,14 @@ DIFY_SECRET_KEY=$difySecretKey
 
 #=== Voice Settings ===
 WHISPER_MODEL=base
-# Whisper STT model — NVIDIA uses the larger turbo model, others use base.
+# Whisper STT runtime. Windows NVIDIA uses CUDA only when the driver supports
+# the bundled Speaches CUDA image; otherwise Whisper stays on the CPU image.
+WHISPER_ACCELERATION=$whisperAcceleration
+$(if ($whisperImage) { "WHISPER_IMAGE=$whisperImage" } else { "#WHISPER_IMAGE=ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu" })
+# Whisper STT model — CUDA uses the larger turbo model, CPU uses base.
 # Open WebUI reads this to request transcription; installer pre-downloads
 # the same model so the first transcription works.
-AUDIO_STT_MODEL=$(Get-EnvOrNew "AUDIO_STT_MODEL" $(if ($GpuBackend -eq "nvidia") { "deepdml/faster-whisper-large-v3-turbo-ct2" } else { "Systran/faster-whisper-base" }))
+AUDIO_STT_MODEL=$audioSttModel
 TTS_VOICE=en_US-lessac-medium
 
 #=== Web UI Settings ===

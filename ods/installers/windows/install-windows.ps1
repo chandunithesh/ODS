@@ -917,9 +917,9 @@ litellm_settings:
                     $gpuOverlay = Join-Path $svcDir.FullName "compose.nvidia.yaml"
                     if (Test-Path $gpuOverlay) {
                         $useGpuOverlay = $true
-                        if ($svcName -eq "whisper" -and $gpuInfo.DriverMajor -lt 575) {
+                        if ($svcName -eq "whisper" -and -not (Test-ODSWindowsWhisperCudaSupported -GpuInfo $gpuInfo)) {
                             $useGpuOverlay = $false
-                            Write-AIWarn "Whisper CUDA image requires a newer NVIDIA driver than $($gpuInfo.DriverVersion); using CPU Whisper."
+                            Write-AIWarn "Whisper CUDA image requires NVIDIA driver $($script:MIN_WINDOWS_WHISPER_CUDA_DRIVER)+; detected $($gpuInfo.DriverVersion). Using CPU Whisper."
                         }
                         if ($useGpuOverlay) {
                             $relOverlay = $gpuOverlay.Substring($installDir.Length + 1) -replace "\\", "/"

@@ -148,6 +148,43 @@ function Get-GpuInfo {
     }
 }
 
+function Test-ODSWindowsWhisperCudaSupported {
+    <#
+    .SYNOPSIS
+        Return whether the detected Windows NVIDIA driver can run the default
+        Speaches CUDA Whisper image.
+    #>
+    param([hashtable]$GpuInfo)
+
+    if ($null -eq $GpuInfo) {
+        try {
+            $GpuInfo = Get-GpuInfo
+        } catch {
+            return $false
+        }
+    }
+
+    if ($null -eq $GpuInfo -or $GpuInfo.Backend -ne "nvidia") {
+        return $false
+    }
+
+    $driverMajor = 0
+    if ($GpuInfo.ContainsKey("DriverMajor")) {
+        [int]::TryParse([string]$GpuInfo.DriverMajor, [ref]$driverMajor) | Out-Null
+    }
+    if ($driverMajor -le 0 -and $GpuInfo.ContainsKey("DriverVersion") -and
+        [string]$GpuInfo.DriverVersion -match "^(\d+)") {
+        $driverMajor = [int]$Matches[1]
+    }
+
+    $minimum = 575
+    if ($script:MIN_WINDOWS_WHISPER_CUDA_DRIVER) {
+        [int]::TryParse([string]$script:MIN_WINDOWS_WHISPER_CUDA_DRIVER, [ref]$minimum) | Out-Null
+    }
+
+    return ($driverMajor -ge $minimum)
+}
+
 function Get-SystemRamGB {
     <#
     .SYNOPSIS

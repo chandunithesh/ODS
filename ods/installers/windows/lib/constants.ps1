@@ -49,6 +49,11 @@ $script:MIN_DOCKER_VERSION = "4.20.0"
 # Minimum NVIDIA driver version for CUDA in Docker Desktop
 $script:MIN_NVIDIA_DRIVER = 570
 
+# Speaches CUDA images can require a newer driver than llama.cpp's CUDA image.
+# Keep this separate so NVIDIA LLM installs can remain available on R570 drivers
+# while Whisper falls back to its CPU image.
+$script:MIN_WINDOWS_WHISPER_CUDA_DRIVER = 575
+
 # OpenCode (host-level AI coding IDE, not a Docker service)
 $script:OPENCODE_VERSION = "1.2.18"
 $script:OPENCODE_ZIP = "opencode-windows-x64.zip"

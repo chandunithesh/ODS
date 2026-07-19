@@ -2205,6 +2205,7 @@ function Update-ComposeFlags {
         # parameters that the installer originally selected.
         $gpuBackend = "nvidia"
         $tier = "1"
+        $envMap = @{}
         try {
             $envMap = Read-ODSEnv
             if ($envMap.ContainsKey("GPU_BACKEND") -and $envMap["GPU_BACKEND"]) {
@@ -2215,14 +2216,36 @@ function Update-ComposeFlags {
             }
         } catch { }
 
-        $wslInstallDir = $InstallDir -replace "\\", "/" -replace "^([A-Za-z]):", "/mnt/`$1"
-        $wslInstallDir = $wslInstallDir.ToLower() -replace "^/mnt/([a-z])", { "/mnt/$($_.Groups[1].Value.ToLower())" }
+        $skipGpuOverlays = @()
+        try {
+            $whisperAcceleration = ""
+            $whisperImage = ""
+            if ($envMap.ContainsKey("WHISPER_ACCELERATION")) {
+                $whisperAcceleration = ([string]$envMap["WHISPER_ACCELERATION"]).ToLowerInvariant()
+            }
+            if ($envMap.ContainsKey("WHISPER_IMAGE")) {
+                $whisperImage = ([string]$envMap["WHISPER_IMAGE"]).ToLowerInvariant()
+            }
+            if ($gpuBackend -eq "nvidia" -and (
+                $whisperAcceleration -eq "cpu" -or
+                $whisperImage -match "cpu" -or
+                -not (Test-ODSWindowsWhisperCudaSupported)
+            )) {
+                $skipGpuOverlays += "whisper"
+            }
+        } catch { }
 
-        $resolvedFlagsRaw = & $bashExe.Source "$resolverScript" `
-            --script-dir "$InstallDir" `
-            --gpu-backend "$gpuBackend" `
-            --tier "$tier" `
-            2>$null
+        $resolverArgs = @(
+            "$resolverScript",
+            "--script-dir", "$InstallDir",
+            "--gpu-backend", "$gpuBackend",
+            "--tier", "$tier"
+        )
+        if ($skipGpuOverlays.Count -gt 0) {
+            $resolverArgs += @("--skip-gpu-overlays", ($skipGpuOverlays -join ","))
+        }
+
+        $resolvedFlagsRaw = & $bashExe.Source @resolverArgs 2>$null
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($resolvedFlagsRaw)) {
             # Prepend --env-file .env if the existing flags had it (the resolver
             # emits only -f flags; the Windows installer adds --env-file separately).

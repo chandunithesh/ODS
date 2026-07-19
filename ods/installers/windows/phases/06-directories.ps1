@@ -12,6 +12,7 @@
 #   $selectedTier, $tierConfig -- from phase 02
 #   $gpuInfo                   -- from phase 02
 #   $llamaServerImage          -- from phase 02
+#   $whisperCudaSupported      -- from phase 02
 #   $enableOpenClaw            -- from phase 03
 #   $openClawConfig            -- from phase 03
 #
@@ -297,6 +298,7 @@ $envResult = New-ODSEnv `
     -AmdInferenceManaged $_amdInferenceManaged `
     -LemonadeServerImage $_lemonadeServerImage `
     -SystemRamGB    $systemRamGB `
+    -WhisperCudaEnabled $whisperCudaSupported `
     -EnableLangfuse $enableLangfuse `
     -EnableLan      $lanFlag
 Write-AISuccess "Generated .env with secure secrets"

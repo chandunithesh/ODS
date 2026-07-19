@@ -318,6 +318,7 @@ class TestResolveComposeFlags:
         git_bash = r"C:\Program Files\Git\bin\bash.exe"
         monkeypatch.setattr(_mod, "_find_usable_bash", lambda: git_bash)
         monkeypatch.setattr(_mod, "_ensure_windows_resolver_pyyaml", lambda python_cmd: None)
+        monkeypatch.setattr(_mod, "_windows_whisper_cuda_supported", lambda _env: True)
 
         calls = []
 
@@ -392,6 +393,50 @@ class TestResolveComposeFlags:
         cmd = calls[0][0]
         assert cmd[cmd.index("--ods-mode") + 1] == expected_mode
         assert cmd[cmd.index("--gpu-count") + 1] == "1"
+
+    def test_windows_resolver_skips_whisper_overlay_for_cpu_fallback(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir = tmp_path / "ods"
+        scripts_dir = install_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (install_dir / ".env").write_text(
+            "ODS_MODE=local\nGPU_BACKEND=nvidia\nWHISPER_ACCELERATION=cpu\n",
+            encoding="utf-8",
+        )
+        (scripts_dir / "resolve-compose-stack.sh").write_text(
+            "#!/usr/bin/env bash\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "TIER", "1")
+        monkeypatch.setattr(_mod, "GPU_BACKEND", "nvidia")
+        monkeypatch.setattr(_mod, "GPU_COUNT", "1")
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: r"C:\Program Files\Git\bin\bash.exe")
+        monkeypatch.setattr(_mod, "_ensure_windows_resolver_pyyaml", lambda _python: None)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="-f docker-compose.base.yml -f extensions/services/whisper/compose.yaml\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert resolve_compose_flags() == [
+            "-f", "docker-compose.base.yml",
+            "-f", "extensions/services/whisper/compose.yaml",
+        ]
+        cmd = calls[0][0]
+        assert cmd[cmd.index("--skip-gpu-overlays") + 1] == "whisper"
 
     def test_windows_installs_pyyaml_for_resolver_python(self, monkeypatch):
         monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
