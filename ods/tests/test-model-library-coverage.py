@@ -215,10 +215,6 @@ def test_granite4_1b_models_are_low_vram_agent_viable_candidates():
             "https://huggingface.co/ibm-granite/granite-4.0-h-1b-GGUF/",
             "da3d737121a96f3c9a316685212376257a7f167b74380855666dd488d6af3bcb",
         ),
-        "granite4.0-1b-q4": (
-            "https://huggingface.co/ibm-granite/granite-4.0-1b-GGUF/",
-            "22ec0f9cc99a90185312de3c882c84e7bd6789bdd050389844380a01a831d7f1",
-        ),
         "granite4.0-h-350m-q4": (
             "https://huggingface.co/ibm-granite/granite-4.0-h-350m-GGUF/",
             "0a8d6a7373602fadfba274a640ba784b86cc6847f1c67f1b0a90fa2ec266b7fb",
@@ -232,6 +228,45 @@ def test_granite4_1b_models_are_low_vram_agent_viable_candidates():
         assert model["gguf_sha256"] == sha256
         assert model["gguf_url"].startswith(url_prefix)
         assert _agent_viable_for_release(model)
+
+
+def test_granite33_8b_has_visible_nvidia_8gb_release_profile():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+
+    model = by_id["granite3.3-8b-instruct-q4"]
+    profiles = {profile["id"]: profile for profile in model["runtime_profiles"]}
+    profile = profiles["nvidia-8gb-64k"]
+
+    assert model["gguf_url"].startswith("https://huggingface.co/ibm-granite/granite-3.3-8b-instruct-GGUF/")
+    assert model["gguf_sha256"] == "77bcee066a76dcdd10d0d123c87e32c8ec2c74e31b6ffd87ebee49c9ac215dca"
+    assert model["size_bytes"] == 4942873344
+    assert model["context_length"] == 128000
+    assert profile["backend"] == "nvidia"
+    assert profile["memory_type"] == "discrete"
+    assert profile["vram_min_gb"] == 7.5
+    assert profile["vram_max_gb"] == 8.5
+    assert profile["context_length"] == HERMES_CONTEXT_FLOOR
+    assert profile["estimated_required_gb"] < 8
+    assert _agent_viable_for_release(model)
+
+
+def test_granite4_dense_1b_is_direct_chat_only_until_talk_revalidated():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+
+    model = by_id["granite4.0-1b-q4"]
+    compatibility = model["app_compatibility"]
+
+    assert model["vram_required_gb"] <= 3
+    assert model["context_length"] >= HERMES_CONTEXT_FLOOR
+    assert model["gguf_sha256"] == "22ec0f9cc99a90185312de3c882c84e7bd6789bdd050389844380a01a831d7f1"
+    assert model["gguf_url"].startswith("https://huggingface.co/ibm-granite/granite-4.0-1b-GGUF/")
+    assert compatibility["openai_chat"]["status"] == "verified"
+    assert "0.93 tok/s" in compatibility["agent_viability"]["reason"]
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert not _agent_viable_for_release(model)
 
 
 def test_qwen3_4b_is_blocked_after_windows_talk_timeout():

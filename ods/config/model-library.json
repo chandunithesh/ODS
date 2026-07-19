@@ -312,6 +312,23 @@
       "tokens_per_sec_estimate": 150,
       "llm_model_name": "granite-4.0-1b",
       "llama_server_image": null,
+      "app_compatibility": {
+        "openai_chat": {
+          "status": "verified",
+          "reason": "Targeted windows-laptop diagnostic on 2026-07-19 loaded granite4.0-1b-q4 and llama-server returned the requested verification phrase through the OpenAI-compatible chat API, but measured only 0.93 tok/s.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T23-55-56Z-release-product-741c5a5360ae-harness-46275424f31d-hosts-windows-laptop/model-ui/cycle-005/windows-laptop plus targeted repro at 2026-07-19T01:15Z"
+        },
+        "hermes_talk": {
+          "status": "unsupported_until_revalidated",
+          "reason": "Fleet model-UI run 2026-07-18T23-55Z on windows-laptop loaded this model successfully, but ODS Talk timed out after 180s. A targeted direct-chat repro returned the verification phrase at 0.93 tok/s, below the 2.0 tok/s floor for ODS Talk.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T23-55-56Z-release-product-741c5a5360ae-harness-46275424f31d-hosts-windows-laptop/model-ui/cycle-005/windows-laptop"
+        },
+        "agent_viability": {
+          "status": "not_agent_viable",
+          "reason": "The model can answer direct chat, but its measured 0.93 tok/s response rate is below the 2.0 tok/s floor for agent-required workflows and ODS Talk timed out in release coverage.",
+          "evidence": "dream-fleet-test/runs/2026-07-18T23-55-56Z-release-product-741c5a5360ae-harness-46275424f31d-hosts-windows-laptop/model-ui/cycle-005/windows-laptop"
+        }
+      },
       "install_recommendation": false
     },
     {
@@ -634,9 +651,9 @@
       "name": "Granite 3.3 8B Instruct",
       "family": "granite",
       "gguf_file": "granite-3.3-8b-instruct-Q4_K_M.gguf",
-      "gguf_url": "https://huggingface.co/unsloth/granite-3.3-8b-instruct-GGUF/resolve/main/granite-3.3-8b-instruct-Q4_K_M.gguf",
-      "gguf_sha256": "7057b01e68af6819e5273c75cc2d948d48eeaa750962e5eebb4ecf916a910f33",
-      "size_bytes": 4942873760,
+      "gguf_url": "https://huggingface.co/ibm-granite/granite-3.3-8b-instruct-GGUF/resolve/main/granite-3.3-8b-instruct-Q4_K_M.gguf",
+      "gguf_sha256": "77bcee066a76dcdd10d0d123c87e32c8ec2c74e31b6ffd87ebee49c9ac215dca",
+      "size_bytes": 4942873344,
       "size_mb": 4943,
       "vram_required_gb": 8,
       "context_length": 128000,
@@ -646,6 +663,19 @@
       "tokens_per_sec_estimate": 72,
       "llm_model_name": "granite-3.3-8b-instruct",
       "llama_server_image": null,
+      "runtime_profiles": [
+        {
+          "id": "nvidia-8gb-64k",
+          "label": "NVIDIA 8GB 64K context",
+          "backend": "nvidia",
+          "memory_type": "discrete",
+          "vram_min_gb": 7.5,
+          "vram_max_gb": 8.5,
+          "context_length": 65536,
+          "estimated_required_gb": 6.8,
+          "fit_label": "64K 8GB profile"
+        }
+      ],
       "install_recommendation": false
     },
     {

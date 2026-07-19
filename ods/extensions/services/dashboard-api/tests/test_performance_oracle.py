@@ -365,18 +365,22 @@ def test_real_catalog_has_six_windows_8gb_release_swap_candidates(data_dir, tmp_
         and not _compatibility_blocks_release_coverage(model["appCompatibility"]["hermesTalk"])
     ]
     candidate_ids = {model["id"] for model in candidates}
+    by_id = {model["id"]: model for model in candidates}
 
     assert len(candidates) >= 6
     assert {
         "granite4.0-h-350m-q4",
         "granite4.0-h-1b-q4",
-        "granite4.0-1b-q4",
+        "granite3.3-8b-instruct-q4",
         "granite4.0-h-micro-q4",
         "granite4.0-h-tiny-q4",
         "gemma3-4b-it-q4",
     }.issubset(candidate_ids)
+    assert by_id["granite3.3-8b-instruct-q4"]["contextLength"] == 65536
+    assert by_id["granite3.3-8b-instruct-q4"]["estimatedRequired"] == 6.8
+    assert by_id["granite3.3-8b-instruct-q4"]["runtimeProfile"]["id"] == "nvidia-8gb-64k"
     assert "phi4-mini-q4" not in candidate_ids
-    assert "granite3.3-8b-instruct-q4" not in candidate_ids
+    assert "granite4.0-1b-q4" not in candidate_ids
     assert "smollm3-3b-q4" not in candidate_ids
     assert "qwen2.5-3b-instruct-q4" not in candidate_ids
     assert "qwen3-4b-q4" not in candidate_ids
