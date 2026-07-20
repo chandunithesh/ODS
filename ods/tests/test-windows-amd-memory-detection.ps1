@@ -89,4 +89,31 @@ $registryByteVram = Get-WindowsAmdDedicatedVramMB `
     -AdapterRamBytes ([uint64]4293918720)
 Assert-Equal $registryByteVram 16304 "Byte-array registry VRAM"
 
+# Regression: a genuine APU whose BIOS raises the dedicated-VRAM carve above
+# 4 GB reports the true carve via the registry, but the unified-memory gate
+# must still see the raw WMI-capped value — otherwise a real Strix Halo flips
+# to "discrete" and mis-tiers.
+$expectedName = "AMD Radeon(TM) 8060S Graphics"
+$registryValue = [uint64](96GB)
+$raisedCarveRecovered = Get-WindowsAmdDedicatedVramMB `
+    -GpuName $expectedName `
+    -AdapterRamBytes ([uint64]536870912)
+Assert-Equal $raisedCarveRecovered 98304 "Raised-carve registry recovery still reads the true carve"
+$raisedCarveUnified = Test-WindowsAmdUnifiedMemory `
+    -GpuName $expectedName `
+    -ProcessorNames "AMD Ryzen AI MAX+ PRO 395" `
+    -AdapterRamMB 512 `
+    -SystemRamGB 128
+Assert-Equal $raisedCarveUnified $true "Raised-carve Strix Halo stays unified when gated on raw WMI value"
+
+# Wiring: Get-GpuInfo must gate unified detection on the WMI-capped value and
+# apply registry recovery only on the discrete branch.
+$detectionSource = Get-Content -LiteralPath $detectionPath -Raw
+if ($detectionSource -notmatch '(?s)\$adapterRamMB\s*=\s*\[math\]::Floor\(\$adapterRamBytes\s*/\s*1048576\)') {
+    throw "Get-GpuInfo must feed the unified gate the raw WMI-capped adapter RAM"
+}
+if ($detectionSource -notmatch '(?s)\}\s*else\s*\{[^}]*Get-WindowsAmdDedicatedVramMB') {
+    throw "Get-GpuInfo must apply registry VRAM recovery only on the discrete branch"
+}
+
 Write-Host "[PASS] Windows AMD discrete and unified memory detection"

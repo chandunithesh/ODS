@@ -191,10 +191,12 @@ function Get-GpuInfo {
 
             # WMI AdapterRAM is a 32-bit field (maxes at 4 GB for discrete GPUs)
             # For APUs with unified memory, this is typically small (512MB–2GB)
+            # Keep the raw WMI-capped value for the unified-memory gate: an APU
+            # whose BIOS dedicated-VRAM carve exceeds 4 GB reports the true
+            # carve in the registry, and feeding that into the <=4GB gate would
+            # flip a genuine Strix Halo / APU to "discrete".
             $adapterRamBytes = ConvertTo-WindowsAmdAdapterRamBytes -Value $primary.AdapterRAM
-            $adapterRamMB = Get-WindowsAmdDedicatedVramMB `
-                -GpuName ([string]$gpuName) `
-                -AdapterRamBytes $adapterRamBytes
+            $adapterRamMB = [math]::Floor($adapterRamBytes / 1048576)
 
             # System RAM for unified memory calculation
             $systemRamGB = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1073741824)
@@ -219,6 +221,12 @@ function Get-GpuInfo {
             if ($isUnified) {
                 # Effective VRAM: ~75% of system RAM is usable for GPU on Strix Halo
                 $effectiveVramMB = [math]::Floor($systemRamGB * 0.75 * 1024)
+            } else {
+                # Discrete adapters only: recover true dedicated VRAM beyond
+                # WMI's 32-bit cap from the driver registry key.
+                $effectiveVramMB = Get-WindowsAmdDedicatedVramMB `
+                    -GpuName ([string]$gpuName) `
+                    -AdapterRamBytes $adapterRamBytes
             }
 
             $driverVer = $primary.DriverVersion
