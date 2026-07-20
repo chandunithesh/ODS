@@ -2659,8 +2659,11 @@ function Invoke-Model {
                 }
                 $tier = $tier.ToUpperInvariant()
 
-                # Retrieve the model config using tier-map functions
-                $model = ConvertTo-ModelFromTier -Tier $tier
+                # Use the persisted profile for both selection and activation
+                # validation, even when this shell has no MODEL_PROFILE set.
+                $envVars = Read-ODSEnv
+                $modelProfile = [string]$envVars["MODEL_PROFILE"]
+                $model = ConvertTo-ModelFromTier -Tier $tier -ModelProfile $modelProfile
                 if ([string]::IsNullOrWhiteSpace($model)) {
                     Write-AIError "Unknown tier: $tier"
                     return
@@ -2676,12 +2679,11 @@ function Invoke-Model {
                 }
 
                 # Resolve tier config to obtain GGUF details
-                $tierConfig = Resolve-TierConfig -Tier $normTier
+                $tierConfig = Resolve-TierConfig -Tier $normTier -ModelProfile $modelProfile
 
                 try {
                     $modelId = Resolve-WindowsODSModelCatalogId `
                         -InstallDir $InstallDir -GgufFile $tierConfig.GgufFile
-                    $envVars = Read-ODSEnv
                     Write-AI "Activating $model across ODS consumers..."
                     $receipt = Invoke-WindowsODSModelActivationTransaction `
                         -EnvMap $envVars -ModelId $modelId -Tier $normTier `

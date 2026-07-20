@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root "installers\windows\lib\model-activation.ps1")
+. (Join-Path $root "installers\windows\lib\tier-map.ps1")
 
 function Assert-Equal {
     param($Actual, $Expected, [string]$Label)
@@ -33,6 +34,20 @@ Set-Content -LiteralPath (Join-Path $tempRoot "data\models\model.gguf") -Value "
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $tempRoot "config\model-library.json")
 
 try {
+    $previousModelProfile = $env:MODEL_PROFILE
+    try {
+        $env:MODEL_PROFILE = "qwen"
+        Assert-Equal `
+            (ConvertTo-ModelFromTier -Tier "T1" -ModelProfile "gemma4") `
+            "gemma-4-e2b-it" "Explicit model profile selection"
+        $gemmaTier = Resolve-TierConfig -Tier "1" -ModelProfile "gemma4"
+        Assert-Equal $gemmaTier.LlmModel "gemma-4-e2b-it" "Explicit tier profile model"
+        Assert-Equal $gemmaTier.GgufFile `
+            "gemma-4-E2B-it-Q4_K_M.gguf" "Explicit tier profile GGUF"
+    } finally {
+        $env:MODEL_PROFILE = $previousModelProfile
+    }
+
     Assert-Equal (Resolve-WindowsODSModelCatalogId -InstallDir $tempRoot -GgufFile "model.gguf") `
         "catalog-model" "Catalog model resolution"
     Assert-Throws { Resolve-WindowsODSModelCatalogId -InstallDir $tempRoot -GgufFile "..\model.gguf" } `

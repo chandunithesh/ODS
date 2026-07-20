@@ -62,6 +62,18 @@ if grep -q 'Set-ODSEnvValue' <<< "$invoke_model_body"; then
 fi
 pass "Invoke-Model uses transactional activation without direct env mutation"
 
+info "Static: model swap resolves the persisted MODEL_PROFILE before tier selection"
+grep -q 'ConvertTo-ModelFromTier -Tier \$tier -ModelProfile \$modelProfile' <<< "$invoke_model_body" \
+    || fail "Invoke-Model does not pass persisted MODEL_PROFILE to model selection"
+grep -q 'Resolve-TierConfig -Tier \$normTier -ModelProfile \$modelProfile' <<< "$invoke_model_body" \
+    || fail "Invoke-Model does not pass persisted MODEL_PROFILE to tier resolution"
+env_read_line=$(grep -n '\$envVars = Read-ODSEnv' <<< "$invoke_model_body" | head -1 | cut -d: -f1)
+model_select_line=$(grep -n 'ConvertTo-ModelFromTier' <<< "$invoke_model_body" | head -1 | cut -d: -f1)
+if [[ -z "$env_read_line" || -z "$model_select_line" || $env_read_line -ge $model_select_line ]]; then
+    fail "Invoke-Model must read persisted env before selecting the model"
+fi
+pass "Invoke-Model uses persisted MODEL_PROFILE consistently"
+
 info "Static: command dispatcher wires 'model'"
 grep -q '"model"' "$ODS_PS1" && grep -q 'Invoke-Model' "$ODS_PS1" \
     || fail "Dispatcher does not call Invoke-Model for 'model'"

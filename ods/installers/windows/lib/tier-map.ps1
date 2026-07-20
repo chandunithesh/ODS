@@ -369,9 +369,12 @@ function Resolve-GemmaTierConfig {
 }
 
 function Resolve-TierConfig {
-    param([string]$Tier)
+    param(
+        [string]$Tier,
+        [string]$ModelProfile = $env:MODEL_PROFILE
+    )
 
-    $requestedProfile = Normalize-ModelProfile
+    $requestedProfile = Normalize-ModelProfile -ModelProfile $ModelProfile
     $effectiveProfile = Resolve-EffectiveModelProfile -Tier $Tier -RequestedProfile $requestedProfile
 
     switch ($effectiveProfile) {
