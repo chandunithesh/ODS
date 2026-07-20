@@ -374,3 +374,64 @@ class TestObserveHook:
         tma._mod.AgentHandler._do_model_activate(handler, "target-model")
         assert handler.response_code != 200
         assert state_path.read_text(encoding="utf-8") == before
+
+    def test_initial_reconstructed_state_promotes_after_readiness_proof(
+        self, tmp_path, monkeypatch
+    ):
+        import test_model_activate as tma
+
+        install_dir = tma._write_model_activation_fixture(tmp_path)[0]
+        state_path = install_dir / "data" / "model-state.json"
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+
+        env = tma._mod.load_env(install_dir / ".env")
+        reconstructed = sb.initialize_if_missing(state_path, env)
+        assert reconstructed["active"]["reconstructed"] is True
+        assert reconstructed["active"]["proof"]["completion"] is False
+
+        monkeypatch.setattr(
+            tma._mod,
+            "_wait_for_model_readiness",
+            lambda *_args, **_kwargs: {
+                "identity": "old-model.gguf",
+                "contextLength": 65536,
+                "contextVerified": True,
+                "verifiedAt": "2026-07-20T00:00:00Z",
+            },
+        )
+
+        assert tma._mod._publish_verified_initial_switchboard_route(
+            reason="test", attempts=1, initial_delay=0, interval=0
+        ) is True
+        doc, errors = sb.read_state(state_path)
+        assert errors == [] and doc is not None
+        assert doc["active"].get("reconstructed") is None
+        assert doc["active"]["runtimeModelId"] == "old-model.gguf"
+        assert doc["active"]["verifiedAt"]
+        assert doc["active"]["proof"] == {
+            "identity": "old-model.gguf",
+            "completion": True,
+        }
+
+    def test_initial_reconstructed_state_stays_unroutable_without_proof(
+        self, tmp_path, monkeypatch
+    ):
+        import test_model_activate as tma
+
+        install_dir = tma._write_model_activation_fixture(tmp_path)[0]
+        state_path = install_dir / "data" / "model-state.json"
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+
+        env = tma._mod.load_env(install_dir / ".env")
+        sb.initialize_if_missing(state_path, env)
+        before = state_path.read_text(encoding="utf-8")
+        monkeypatch.setattr(
+            tma._mod,
+            "_wait_for_model_readiness",
+            lambda *_args, **_kwargs: {},
+        )
+
+        assert tma._mod._publish_verified_initial_switchboard_route(
+            reason="test", attempts=1, initial_delay=0, interval=0
+        ) is False
+        assert state_path.read_text(encoding="utf-8") == before

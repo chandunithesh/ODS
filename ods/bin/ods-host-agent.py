@@ -294,6 +294,8 @@ _model_lifecycle_operation: str | None = None
 _model_lifecycle_target: str | None = None
 _model_activation_target: str | None = None
 _model_status_verify_thread: threading.Thread | None = None
+_switchboard_initial_verify_lock = threading.Lock()
+_switchboard_initial_verify_thread: threading.Thread | None = None
 # Update lock/state: only one background ods-update run at a time.
 _update_lock = threading.Lock()
 _update_status_lock = threading.Lock()
@@ -749,6 +751,184 @@ def load_env(env_path: Path) -> dict:
             key, _, val = line.partition("=")
             env[key.strip()] = val.strip().strip("'\"")
     return env
+
+
+def _switchboard_state_path() -> Path:
+    return INSTALL_DIR / "data" / "model-state.json"
+
+
+def _switchboard_state_needs_initial_verification(path: Path) -> bool:
+    if _switchboard_state is None:
+        return False
+    doc, errors = _switchboard_state.read_state(path)
+    if errors or not isinstance(doc, dict):
+        return False
+    active = doc.get("active")
+    if not isinstance(active, dict):
+        return False
+    proof = active.get("proof")
+    return (
+        active.get("reconstructed") is True
+        or not isinstance(active.get("verifiedAt"), str)
+        or not active.get("verifiedAt")
+        or not isinstance(proof, dict)
+        or proof.get("completion") is not True
+    )
+
+
+def _catalog_model_for_current_env(env: dict) -> tuple[str, dict]:
+    gguf_file = str(env.get("GGUF_FILE") or "").strip()
+    llm_model_name = str(env.get("LLM_MODEL") or "").strip()
+    library_path = INSTALL_DIR / "config" / "model-library.json"
+    if library_path.exists():
+        try:
+            library = json.loads(library_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            library = {}
+        for entry in library.get("models", []) if isinstance(library, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or "")
+            entry_gguf = str(entry.get("gguf_file") or "")
+            entry_llm = str(entry.get("llm_model_name") or entry_id)
+            if (
+                (llm_model_name and entry_id == llm_model_name)
+                or (llm_model_name and entry_llm == llm_model_name)
+                or (gguf_file and entry_gguf == gguf_file)
+            ):
+                return entry_id or llm_model_name or gguf_file, entry
+    return llm_model_name or gguf_file, {}
+
+
+def _initial_switchboard_backend(env: dict) -> tuple[str, str, str | None]:
+    gpu_backend = str(env.get("GPU_BACKEND") or "nvidia").lower()
+    windows_native_llama = _is_windows_host_llama_server(env)
+    if gpu_backend == "amd" and not windows_native_llama:
+        lemonade_model_id = str(env.get("LEMONADE_MODEL") or "").strip()
+        if not lemonade_model_id:
+            lemonade_model_id = _resolve_lemonade_model_id(
+                env,
+                str(env.get("GGUF_FILE") or ""),
+            )
+        return "lemonade", "lemonade-default", lemonade_model_id or None
+    return "llama-server", "llama-server-default", None
+
+
+def _publish_verified_initial_switchboard_route(
+    *,
+    reason: str,
+    attempts: int = 180,
+    initial_delay: float = 0,
+    interval: float = 10,
+) -> bool:
+    """Promote reconstructed startup state only after runtime proof succeeds."""
+    if _switchboard_state is None:
+        return False
+    state_path = _switchboard_state_path()
+    if not _switchboard_state_needs_initial_verification(state_path):
+        return False
+
+    env = load_env(INSTALL_DIR / ".env")
+    identity = _switchboard_state.migrate_env_identity(env)
+    if not identity:
+        return False
+
+    gguf_file = str(env.get("GGUF_FILE") or identity["runtimeModelId"])
+    llm_model_name = str(env.get("LLM_MODEL") or identity["catalogId"])
+    if not gguf_file:
+        return False
+
+    model_id, model = _catalog_model_for_current_env(env)
+    backend_kind, endpoint_id, native_route = _initial_switchboard_backend(env)
+    proof = _wait_for_model_readiness(
+        env,
+        model_id=model_id or llm_model_name or gguf_file,
+        gguf_file=gguf_file,
+        llm_model_name=llm_model_name,
+        lemonade_model_id=native_route or "",
+        attempts=attempts,
+        initial_delay=initial_delay,
+        interval=interval,
+        return_proof=True,
+    )
+    if not isinstance(proof, dict) or not proof.get("identity"):
+        logger.info("switchboard initial route proof deferred (%s)", reason)
+        return False
+
+    fresh_env = load_env(INSTALL_DIR / ".env")
+    if (
+        str(fresh_env.get("GGUF_FILE") or "") != str(env.get("GGUF_FILE") or "")
+        or str(fresh_env.get("LLM_MODEL") or "") != str(env.get("LLM_MODEL") or "")
+    ):
+        logger.info("switchboard initial route proof discarded after env changed")
+        return False
+    if not _switchboard_state_needs_initial_verification(state_path):
+        return False
+
+    runtime_identity = str(proof["identity"])
+    if not _runtime_model_identity_matches(
+        runtime_identity,
+        model_id=model_id,
+        gguf_file=gguf_file,
+        llm_model_name=llm_model_name,
+    ):
+        logger.warning(
+            "switchboard initial route proof identity %s did not match %s",
+            runtime_identity,
+            gguf_file,
+        )
+        return False
+
+    context_length = int(proof.get("contextLength") or identity.get("contextLength") or 0)
+    capabilities = {
+        "chat": True,
+        "tools": bool(model.get("tools")),
+        "vision": bool(model.get("vision")),
+        "agentViable": _model_agent_viable(model, context_length),
+    }
+    _switchboard_state.record_verified_route(
+        state_path,
+        catalog_id=model_id or llm_model_name or gguf_file,
+        runtime_model_id=runtime_identity,
+        backend_kind=backend_kind,
+        endpoint_id=endpoint_id,
+        native_route=native_route,
+        context_length=context_length,
+        capabilities=capabilities,
+        proof_identity=runtime_identity,
+    )
+    logger.info(
+        "switchboard initial route verified (%s): %s",
+        reason,
+        runtime_identity,
+    )
+    return True
+
+
+def _schedule_initial_switchboard_verification(reason: str) -> None:
+    global _switchboard_initial_verify_thread
+    if _switchboard_state is None:
+        return
+    state_path = _switchboard_state_path()
+    if not _switchboard_state_needs_initial_verification(state_path):
+        return
+    with _switchboard_initial_verify_lock:
+        thread = _switchboard_initial_verify_thread
+        if thread is not None and thread.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                _publish_verified_initial_switchboard_route(reason=reason)
+            except Exception as exc:
+                logger.warning("switchboard initial route verification failed: %s", exc)
+
+        _switchboard_initial_verify_thread = threading.Thread(
+            target=_run,
+            name="ods-switchboard-initial-verify",
+            daemon=True,
+        )
+        _switchboard_initial_verify_thread.start()
 
 
 def _atomic_write_bytes(
@@ -4103,6 +4283,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         """Return current model download progress."""
         if not check_auth(self):
             return
+        _schedule_initial_switchboard_verification("model-status")
         status_path = INSTALL_DIR / "data" / "model-download-status.json"
         if not status_path.exists():
             json_response(self, 200, {"status": "idle"})
@@ -9562,6 +9743,7 @@ def main():
             )
         except Exception as exc:
             logger.warning("switchboard state init skipped: %s", exc)
+        _schedule_initial_switchboard_verification("startup")
     STARTUP_ODS_MODE = _normalize_ods_mode(env.get("ODS_MODE"))
     TIER = env.get("TIER", "1")
     GPU_COUNT = env.get("GPU_COUNT", "1")

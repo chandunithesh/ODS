@@ -58,8 +58,11 @@ def test_switchboard_surface_gated_on_enabled_mode() -> None:
     assert "litellm-switchboard" in surfaces
     switchboard = next(i for i in enabled["files"] if i["surface"] == "litellm-switchboard")
     assert "model_name: ods/current" in switchboard["content"]
+    assert "model_name: local" in switchboard["content"]
+    assert "model_name: default" in switchboard["content"]
+    assert 'model_name: "*"' in switchboard["content"]
     assert "api_base: http://model-router:9099/v1" in switchboard["content"]
-    assert switchboard["content"].count("http://model-router:9099/v1") == 3
+    assert switchboard["content"].count("http://model-router:9099/v1") == 4
 
 
 def test_router_endpoints_strip_trailing_v1() -> None:
