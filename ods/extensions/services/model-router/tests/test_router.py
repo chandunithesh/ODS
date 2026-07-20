@@ -4,17 +4,20 @@ upstream is an httpx.MockTransport and state/endpoints are temp files."""
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import hmac
 import importlib
 import json
 import sys
+import threading
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 _APP_DIR = Path(__file__).resolve().parents[1]
 if str(_APP_DIR) not in sys.path:
@@ -67,8 +70,8 @@ def router(tmp_path, monkeypatch):
         }, headers={"x-lemonade-route": "route-a"})
 
     def write_state(runtime="Concrete.gguf", endpoint="llama-server-default",
-                    queue=False, route_seq=7):
-        state_path.write_text(json.dumps({
+                    queue=False, route_seq=7, seq=None, mutate=None):
+        doc = {
             "schema": "ods.model-state.v1", "seq": route_seq, "routeSeq": route_seq,
             "operation": None, "desired": {"catalogId": "concrete"},
             "active": {
@@ -85,14 +88,19 @@ def router(tmp_path, monkeypatch):
             "history": [],
             "availability": {"mode": "queue" if queue else "serve_active",
                              "queueDeadline": None},
-        }), encoding="utf-8")
-        mod._state_cache.update({"mtime": None, "doc": None})
+        }
+        doc["seq"] = route_seq if seq is None else seq
+        if mutate:
+            mutate(doc)
+        state_path.write_text(json.dumps(doc), encoding="utf-8")
+        mod._state_cache["mtime"] = None
 
     client = TestClient(mod.app)
     client.__enter__()
     mod.app.state.http = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler)
     )
+    mod._inflight = 0
     yield mod, client, write_state, calls
     client.__exit__(None, None, None)
 
@@ -102,6 +110,49 @@ def _signed_marker(probe_id: str, key: str = "probe-secret") -> str:
         hmac.new(key.encode(), probe_id.encode(), hashlib.sha256).digest()
     ).rstrip(b"=").decode()
     return f"[ODS_PROBE id={probe_id} sig={sig}]"
+
+
+def test_internal_key_falls_back_to_dashboard_api_key(monkeypatch):
+    monkeypatch.delenv("ODS_ROUTER_INTERNAL_KEY", raising=False)
+    monkeypatch.setenv("DASHBOARD_API_KEY", "dashboard-secret")
+    import app.main as mod
+
+    mod = importlib.reload(mod)
+
+    assert mod.INTERNAL_KEY == "dashboard-secret"
+
+
+class _ChunkedStream(httpx.AsyncByteStream):
+    def __init__(self, chunks, error=None, started=None, release=None):
+        self.chunks = chunks
+        self.error = error
+        self.started = started
+        self.release = release
+
+    async def __aiter__(self):
+        for index, chunk in enumerate(self.chunks):
+            yield chunk
+            if index == 0 and self.started is not None:
+                self.started.set()
+                await asyncio.to_thread(self.release.wait, 5)
+        if self.error is not None:
+            raise self.error
+
+    async def aclose(self):
+        return None
+
+
+def _set_stream_upstream(mod, chunks, *, model_error=None, started=None,
+                         release=None):
+    def handler(_request):
+        return httpx.Response(
+            200,
+            stream=_ChunkedStream(chunks, model_error, started, release),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    asyncio.run(mod.app.state.http.aclose())
+    mod.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
 class TestForwarding:
@@ -193,6 +244,133 @@ class TestForwarding:
         assert resp.json()["error"]["type"] == "model_swap_in_progress"
         assert "Retry-After" in resp.headers
 
+    def test_fragmented_sse_is_framed_before_rewrite(self, router):
+        mod, client, write_state, calls = router
+        write_state()
+        _set_stream_upstream(mod, [
+            b'data: {"id":"c1","mod',
+            b'el":"Concrete.gguf","choices":[{"delta":{"content":"hi"}}]}\r',
+            b'\n\r\ndata: [DONE]\r\n\r\n',
+        ])
+        with client.stream("POST", "/v1/chat/completions", json={
+            "model": "default", "stream": True, "messages": [],
+        }) as resp:
+            raw = b"".join(resp.iter_bytes())
+        assert resp.status_code == 200
+        assert b'"model":"default"' in raw
+        assert b"Concrete.gguf" not in raw
+        assert raw.endswith(b"data: [DONE]\r\n\r\n")
+
+    def test_stream_holds_admission_until_teardown(self, router, monkeypatch):
+        mod, client, write_state, calls = router
+        write_state()
+        started = threading.Event()
+        release = threading.Event()
+        monkeypatch.setattr(mod, "MAX_QUEUE_DEPTH", 1)
+        _set_stream_upstream(
+            mod,
+            [b'data: {"model":"Concrete.gguf"}\n\n', b"data: [DONE]\n\n"],
+            started=started,
+            release=release,
+        )
+        result = {}
+
+        def consume_stream():
+            result["response"] = client.post("/v1/chat/completions", json={
+                "model": "ods/current", "stream": True, "messages": [],
+            })
+
+        worker = threading.Thread(target=consume_stream)
+        worker.start()
+        assert started.wait(5)
+        assert mod._inflight == 1
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert result["response"].status_code == 200
+        assert mod._inflight == 0
+
+
+class TestStateTrust:
+    def test_schema_invalid_state_is_not_routable(self, router):
+        mod, client, write_state, calls = router
+        write_state(mutate=lambda doc: doc.update({"unexpected": True}))
+        resp = client.post("/v1/chat/completions", json={
+            "model": "ods/current", "messages": [],
+        })
+        assert resp.status_code == 503
+        assert calls == []
+
+    @pytest.mark.parametrize("mutation", [
+        lambda doc: doc["active"].update({"reconstructed": True}),
+        lambda doc: doc["active"]["proof"].update({"completion": False}),
+        lambda doc: doc["active"]["proof"].update({"identity": "Other.gguf"}),
+        lambda doc: doc["active"].update({"verifiedAt": None}),
+        lambda doc: doc.update({"routeSeq": doc["routeSeq"] + 1}),
+    ])
+    def test_unverified_state_is_not_routable(self, router, mutation):
+        mod, client, write_state, calls = router
+        write_state(mutate=mutation)
+        resp = client.post("/v1/chat/completions", json={
+            "model": "ods/current", "messages": [],
+        })
+        assert resp.status_code == 503
+        assert calls == []
+
+    def test_regressed_state_retains_verified_last_known_good(self, router):
+        mod, client, write_state, calls = router
+        write_state(runtime="New.gguf", route_seq=9)
+        assert client.get("/v1/models").json()["ods"]["routedModel"] == "New.gguf"
+        write_state(runtime="Old.gguf", route_seq=8)
+        resp = client.post("/v1/chat/completions", json={
+            "model": "ods/current", "messages": [],
+        })
+        assert resp.status_code == 200
+        assert calls[-1]["model"] == "New.gguf"
+
+    def test_invalid_update_retains_verified_last_known_good(self, router):
+        mod, client, write_state, calls = router
+        write_state(runtime="Good.gguf", route_seq=9)
+        assert client.get("/v1/models").status_code == 200
+        write_state(
+            runtime="Unproved.gguf", route_seq=10,
+            mutate=lambda doc: doc["active"]["proof"].update({"completion": False}),
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "ods/current", "messages": [],
+        })
+        assert resp.status_code == 200
+        assert calls[-1]["model"] == "Good.gguf"
+
+    def test_same_sequence_cannot_mutate_route(self, router):
+        mod, client, write_state, calls = router
+        write_state(runtime="Original.gguf", route_seq=9)
+        assert client.get("/v1/models").status_code == 200
+        write_state(runtime="Replacement.gguf", route_seq=9)
+        client.post("/v1/chat/completions", json={
+            "model": "ods/current", "messages": [],
+        })
+        assert calls[-1]["model"] == "Original.gguf"
+
+
+class TestIngressLimits:
+    def test_chunked_body_stops_at_limit(self, router, monkeypatch):
+        mod, client, write_state, calls = router
+        monkeypatch.setattr(mod, "MAX_BODY_BYTES", 5)
+        messages = iter([
+            {"type": "http.request", "body": b"123", "more_body": True},
+            {"type": "http.request", "body": b"456", "more_body": False},
+        ])
+
+        async def receive():
+            return next(messages)
+
+        request = Request({"type": "http", "method": "POST", "path": "/",
+                           "headers": []}, receive)
+        with pytest.raises(mod.RouterError) as exc:
+            asyncio.run(mod._read_bounded_body(request))
+        assert exc.value.status == 413
+
 
 class TestModelsAndEvidence:
     def test_models_lists_aliases_with_ods_metadata(self, router):
@@ -222,6 +400,73 @@ class TestModelsAndEvidence:
         assert record["routeSeq"] == 7
         assert record["responseModel"] == "Concrete.gguf"
         assert "messages" not in record and "content" not in record
+
+    def test_completed_verified_stream_records_evidence(self, router):
+        mod, client, write_state, calls = router
+        write_state()
+        probe_id = str(uuid.uuid4())
+        marker = _signed_marker(probe_id)
+        _set_stream_upstream(mod, [
+            b'data: {"id":"c1","model":"Con',
+            b'crete.gguf","choices":[{"delta":{"content":"ok"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ])
+        resp = client.post("/v1/chat/completions", json={
+            "model": "ods/current", "stream": True,
+            "messages": [{"role": "user", "content": marker}],
+        })
+        assert resp.status_code == 200
+        ev = client.get(
+            f"/internal/route-evidence/{probe_id}",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+        assert ev.status_code == 200
+        assert ev.json()["responseModel"] == "Concrete.gguf"
+
+    @pytest.mark.parametrize("sse", [
+        b'data: {"model":"Wrong.gguf","choices":[]}\n\ndata: [DONE]\n\n',
+        b'data: {"choices":[{"delta":{"content":"no identity"}}]}\n\n'
+        b'data: [DONE]\n\n',
+    ])
+    def test_stream_without_matching_concrete_identity_records_no_evidence(
+            self, router, sse):
+        mod, client, write_state, calls = router
+        write_state()
+        probe_id = str(uuid.uuid4())
+        _set_stream_upstream(mod, [sse])
+        resp = client.post("/v1/chat/completions", json={
+            "model": "ods/current", "stream": True,
+            "messages": [{"role": "user", "content": _signed_marker(probe_id)}],
+        })
+        assert resp.status_code == 200
+        ev = client.get(
+            f"/internal/route-evidence/{probe_id}",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+        assert ev.status_code == 404
+
+    def test_failed_stream_records_no_evidence_and_releases_admission(self, router):
+        mod, client, write_state, calls = router
+        write_state()
+        probe_id = str(uuid.uuid4())
+        _set_stream_upstream(
+            mod,
+            [b'data: {"model":"Concrete.gguf"}\n\n'],
+            model_error=httpx.ReadError("truncated stream"),
+        )
+        with pytest.raises(httpx.ReadError, match="truncated stream"):
+            client.post("/v1/chat/completions", json={
+                "model": "ods/current", "stream": True,
+                "messages": [
+                    {"role": "user", "content": _signed_marker(probe_id)}
+                ],
+            })
+        ev = client.get(
+            f"/internal/route-evidence/{probe_id}",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+        assert ev.status_code == 404
+        assert mod._inflight == 0
 
     def test_forged_marker_records_nothing(self, router):
         mod, client, write_state, calls = router

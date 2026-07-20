@@ -195,23 +195,49 @@ def render_litellm_switchboard(inputs: RenderInputs) -> RenderedFile:
     configuration byte-identical. The renderer owns this YAML — no installer,
     CLI, or host-agent heredoc may maintain a second enabled-mode copy.
     """
-    content = """model_list:
-  - model_name: ods/current
-    litellm_params:
-      model: openai/ods/current
-      api_base: http://model-router:9099/v1
-      api_key: no-key
-  - model_name: default
-    litellm_params:
-      model: openai/ods/current
-      api_base: http://model-router:9099/v1
-      api_key: no-key
-  - model_name: "*"
-    litellm_params:
+    local_route = """    litellm_params:
       model: openai/ods/current
       api_base: http://model-router:9099/v1
       api_key: no-key
 """
+    routes = []
+    for name in ("ods/current", "local", "default"):
+        routes.append(f"  - model_name: {name}\n{local_route}")
+    if inputs.ods_mode == "hybrid":
+        routes.extend([
+            """  - model_name: cloud
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5-20250514
+      api_key: os.environ/ANTHROPIC_API_KEY
+""",
+            """  - model_name: minimax
+    litellm_params:
+      model: openai/MiniMax-M2.7
+      api_base: https://api.minimax.io/v1
+      api_key: os.environ/MINIMAX_API_KEY
+""",
+            """  - model_name: minimax-fast
+    litellm_params:
+      model: openai/MiniMax-M2.7-highspeed
+      api_base: https://api.minimax.io/v1
+      api_key: os.environ/MINIMAX_API_KEY
+""",
+        ])
+    routes.append(f'  - model_name: "*"\n{local_route}')
+    content = (
+        "model_list:\n"
+        + "".join(routes)
+        + """
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  request_timeout: 900
+  stream_timeout: 900
+"""
+    )
     return RenderedFile(
         "litellm-switchboard", "config/litellm/switchboard.yaml", content
     )

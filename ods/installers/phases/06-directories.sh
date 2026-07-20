@@ -1005,6 +1005,39 @@ LITELLM_EOF
         unset _renderer_ok _renderer_py
     fi
 
+    # Materialize router inputs before Compose can interpret file bind mounts.
+    # These files are required even in observe mode so a fresh install never
+    # turns a missing file path into a Docker-created directory.
+    _phase06_step "render-model-router-config"
+    mkdir -p "$INSTALL_DIR/config/model-router" "$INSTALL_DIR/config/litellm"
+    _router_renderer_py="${ODS_PYTHON_CMD:-python3}"
+    if [[ ! -f "$SCRIPT_DIR/scripts/render-runtime-configs.py" ]] \
+        || ! command -v "$_router_renderer_py" >/dev/null 2>&1; then
+        error "Model router config renderer is unavailable"
+        return 1
+    fi
+    _router_common_args=(
+        --switchboard-mode "${ODS_MODEL_SWITCHBOARD:-observe}"
+        --ods-mode "${ODS_MODE:-local}"
+        --gpu-backend "${GPU_BACKEND:-nvidia}"
+        --gguf-file "${GGUF_FILE:-}"
+        --lemonade-model-id "${LEMONADE_MODEL_VALUE:-}"
+        --lemonade-api-base "${LEMONADE_CONTAINER_API_BASE_VALUE:-http://llama-server:8080/api/v1}"
+        --llm-base-url "${LLM_API_URL:-http://llama-server:8080/v1}"
+        --litellm-key "${LITELLM_KEY:-}"
+        --output-root "$INSTALL_DIR"
+        --write
+    )
+    for _router_surface in model-router-endpoints litellm-switchboard; do
+        if ! "$_router_renderer_py" "$SCRIPT_DIR/scripts/render-runtime-configs.py" \
+            --surface "$_router_surface" "${_router_common_args[@]}" \
+            >> "$LOG_FILE" 2>&1; then
+            error "Failed to render required ${_router_surface} config"
+            return 1
+        fi
+    done
+    unset _router_renderer_py _router_surface _router_common_args
+
     # Validate generated .env against schema (fails fast on missing/unknown keys).
     _phase06_step "validate-env"
     ods_progress 41 "directories" "Validating configuration"

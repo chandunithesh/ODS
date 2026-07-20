@@ -80,7 +80,7 @@ _MACOS_HOST_AGENT_BRIDGE_LABEL = "com.ods.host-agent-bridge"
 # Prevents fail-open: without this, a missing JSON file would allow anyone with
 # the API key to stop core services like llama-server or dashboard-api.
 _FALLBACK_CORE_IDS = frozenset({
-    "dashboard-api", "dashboard", "llama-server", "open-webui",
+    "dashboard-api", "dashboard", "llama-server", "model-router", "open-webui",
     "litellm", "langfuse", "hermes", "hermes-proxy", "n8n", "openclaw", "opencode",
     "perplexica", "searxng", "qdrant", "tts", "whisper",
     "embeddings", "token-spy", "comfyui", "ape", "privacy-shield",
@@ -97,7 +97,9 @@ CORE_SERVICE_IDS: set = set()
 WINDOWS_WHISPER_CUDA_MIN_DRIVER_MAJOR = 575
 # Always-on services defined in docker-compose.base.yml — never stoppable via API.
 # Distinct from CORE_SERVICE_IDS (which is the allowlist of known service IDs).
-ALWAYS_ON_SERVICES: frozenset = frozenset({"llama-server", "open-webui", "dashboard", "dashboard-api"})
+ALWAYS_ON_SERVICES: frozenset = frozenset({
+    "llama-server", "model-router", "open-webui", "dashboard", "dashboard-api",
+})
 USER_EXTENSIONS_DIR: Path = Path()
 EXTENSIONS_DIR: Path = Path()
 _ODS_MODES = frozenset({"local", "cloud", "hybrid", "lemonade"})
@@ -5014,6 +5016,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         models_ini = INSTALL_DIR / "config" / "llama-server" / "models.ini"
         lemonade_yaml = INSTALL_DIR / "config" / "litellm" / "lemonade.yaml"
         litellm_local_yaml = INSTALL_DIR / "config" / "litellm" / "local.yaml"
+        litellm_switchboard_yaml = INSTALL_DIR / "config" / "litellm" / "switchboard.yaml"
+        model_router_endpoints = INSTALL_DIR / "config" / "model-router" / "endpoints.json"
         hermes_live_config = INSTALL_DIR / "data" / "hermes" / "config.yaml"
         hermes_template_config = INSTALL_DIR / "extensions" / "services" / "hermes" / "cli-config.yaml.template"
 
@@ -5023,6 +5027,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         ini_snapshot: dict | None = None
         lemonade_snapshot: dict | None = None
         litellm_local_snapshot: dict | None = None
+        litellm_switchboard_snapshot: dict | None = None
+        model_router_endpoints_snapshot: dict | None = None
         hermes_live_snapshot: dict | None = None
         hermes_template_snapshot: dict | None = None
         opencode_snapshot: dict | None = None
@@ -5054,6 +5060,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 _restore_text_file(lemonade_yaml, lemonade_snapshot)
             if litellm_local_snapshot is not None:
                 _restore_text_file(litellm_local_yaml, litellm_local_snapshot)
+            if litellm_switchboard_snapshot is not None:
+                _restore_text_file(litellm_switchboard_yaml, litellm_switchboard_snapshot)
+            if model_router_endpoints_snapshot is not None:
+                _restore_text_file(model_router_endpoints, model_router_endpoints_snapshot)
             if hermes_template_snapshot is not None:
                 _restore_text_file(hermes_template_config, hermes_template_snapshot)
             if hermes_live_snapshot and hermes_live_snapshot.get("exists"):
@@ -5258,6 +5268,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             ini_snapshot = _snapshot_text_file(models_ini)
             lemonade_snapshot = _snapshot_text_file(lemonade_yaml)
             litellm_local_snapshot = _snapshot_text_file(litellm_local_yaml)
+            litellm_switchboard_snapshot = _snapshot_text_file(litellm_switchboard_yaml)
+            model_router_endpoints_snapshot = _snapshot_text_file(model_router_endpoints)
             # Persisted Hermes state is commonly UID-10000-owned. Capture it
             # through the running container when host permissions deny access;
             # activation must never claim success with an unpatched live route.
@@ -5308,6 +5320,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 (models_ini, ini_snapshot),
                 (lemonade_yaml, lemonade_snapshot),
                 (litellm_local_yaml, litellm_local_snapshot),
+                (litellm_switchboard_yaml, litellm_switchboard_snapshot),
+                (model_router_endpoints, model_router_endpoints_snapshot),
                 (hermes_template_config, hermes_template_snapshot),
             ):
                 _assert_text_file_matches_snapshot(path, snapshot)
@@ -5585,6 +5599,15 @@ class AgentHandler(BaseHTTPRequestHandler):
 
                 if windows_native_llama:
                     _write_windows_native_litellm_config(INSTALL_DIR, gguf_file, env)
+
+                _render_model_router_runtime_configs(
+                    INSTALL_DIR,
+                    env,
+                    model=llm_model_name,
+                    gguf_file=gguf_file,
+                    lemonade_model_id=lemonade_model_id,
+                    context_length=int(context_length),
+                )
 
                 hermes_live_exists = bool(
                     hermes_live_snapshot and hermes_live_snapshot.get("exists")
@@ -7206,12 +7229,16 @@ def _render_runtime_config(
     install_dir: Path,
     surface: str,
     *,
+    model: str = "",
     gguf_file: str,
     lemonade_model_id: str,
     lemonade_api_key: str,
     lemonade_api_base: str,
+    llm_base_url: str = "",
     ods_mode: str,
     gpu_backend: str,
+    context_length: int | None = None,
+    switchboard_mode: str = "observe",
 ) -> bool:
     renderer = install_dir / "scripts" / "render-runtime-configs.py"
     if not renderer.exists():
@@ -7221,22 +7248,30 @@ def _render_runtime_config(
         str(renderer),
         "--surface",
         surface,
+        "--switchboard-mode",
+        switchboard_mode,
         "--ods-mode",
         ods_mode,
         "--gpu-backend",
         gpu_backend,
+        "--model",
+        model or _local_model_name_from_gguf(gguf_file),
         "--gguf-file",
         gguf_file,
         "--lemonade-model-id",
         lemonade_model_id,
         "--lemonade-api-base",
         lemonade_api_base,
+        "--llm-base-url",
+        llm_base_url or "http://llama-server:8080/v1",
         "--litellm-key",
         lemonade_api_key,
         "--output-root",
         str(install_dir),
         "--write",
     ]
+    if context_length is not None:
+        cmd.extend(["--context-length", str(context_length)])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -7250,6 +7285,68 @@ def _render_runtime_config(
         )
         return False
     return True
+
+
+def _normal_switchboard_mode(env: dict) -> str:
+    value = str(env.get("ODS_MODEL_SWITCHBOARD") or "observe").strip().lower()
+    return value if value in {"legacy", "observe", "enabled"} else "observe"
+
+
+def _runtime_lemonade_api_base(env: dict) -> str:
+    base = "http://llama-server:8080/api/v1"
+    if str(env.get("AMD_INFERENCE_LOCATION") or "").lower() == "host":
+        lemonade_port = env.get("AMD_INFERENCE_PORT", "8080") or "8080"
+        base = f"http://host.docker.internal:{lemonade_port}/api/v1"
+    return base
+
+
+def _runtime_llama_api_base(env: dict) -> str:
+    if _is_windows_host_llama_server(env):
+        port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
+        return f"http://host.docker.internal:{port}/v1"
+    configured = str(env.get("LLM_API_URL") or "").strip()
+    if configured and "litellm" not in configured.lower():
+        return configured
+    return "http://llama-server:8080/v1"
+
+
+def _render_model_router_runtime_configs(
+    install_dir: Path,
+    env: dict,
+    *,
+    model: str,
+    gguf_file: str,
+    lemonade_model_id: str,
+    context_length: int,
+) -> None:
+    """Render router/LiteLLM switchboard inputs before dependent restarts."""
+    switchboard_mode = _normal_switchboard_mode(env)
+    enabled = switchboard_mode == "enabled"
+    api_key = (
+        env.get("LITELLM_LEMONADE_API_KEY")
+        or env.get("LITELLM_KEY")
+        or env.get("LITELLM_MASTER_KEY")
+        or "sk-lemonade"
+    )
+    common = {
+        "model": model,
+        "gguf_file": gguf_file,
+        "lemonade_model_id": lemonade_model_id,
+        "lemonade_api_key": api_key,
+        "lemonade_api_base": _runtime_lemonade_api_base(env),
+        "llm_base_url": _runtime_llama_api_base(env),
+        "ods_mode": env.get("ODS_MODE", "local"),
+        "gpu_backend": env.get("GPU_BACKEND", "nvidia"),
+        "context_length": int(context_length),
+        "switchboard_mode": switchboard_mode,
+    }
+    for surface in ("model-router-endpoints", "litellm-switchboard"):
+        if _render_runtime_config(install_dir, surface, **common):
+            continue
+        message = f"Failed to render required {surface} config"
+        if enabled:
+            raise RuntimeError(message)
+        logger.warning("%s; switchboard mode is %s", message, switchboard_mode)
 
 
 def _write_lemonade_config(

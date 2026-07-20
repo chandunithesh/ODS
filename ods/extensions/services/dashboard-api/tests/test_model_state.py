@@ -174,9 +174,23 @@ class TestStateModule:
         assert doc["active"]["verifiedAt"] is None
         assert doc["active"]["proof"]["completion"] is False
         assert doc["active"]["capabilities"]["agentViable"] is True
+        assert doc["active"]["backend"]["endpointId"] == "llama-server-default"
         before = path.read_text(encoding="utf-8")
         assert sb.initialize_if_missing(path, {"GGUF_FILE": "Other.gguf"}) is None
         assert path.read_text(encoding="utf-8") == before
+
+    def test_initialize_uses_lemonade_endpoint_id(self, tmp_path):
+        path = tmp_path / "model-state.json"
+        doc = sb.initialize_if_missing(
+            path,
+            {
+                "GPU_BACKEND": "amd",
+                "LLM_BACKEND": "lemonade",
+                "LEMONADE_MODEL": "extra.Model.gguf",
+                "GGUF_FILE": "Model.gguf",
+            },
+        )
+        assert doc["active"]["backend"]["endpointId"] == "lemonade-default"
 
     def test_initialize_cloud_only_writes_nothing(self, tmp_path):
         path = tmp_path / "model-state.json"

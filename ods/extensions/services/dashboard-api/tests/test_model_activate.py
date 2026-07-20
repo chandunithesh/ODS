@@ -742,6 +742,77 @@ class TestWriteLemonadeConfig:
         assert (litellm_dir / "lemonade.yaml").exists()
 
 
+class TestSwitchboardRuntimeConfig:
+    def test_render_runtime_config_passes_switchboard_and_runtime_args(
+        self, monkeypatch, tmp_path,
+    ):
+        renderer = tmp_path / "scripts" / "render-runtime-configs.py"
+        renderer.parent.mkdir(parents=True)
+        renderer.write_text("# renderer placeholder\n", encoding="utf-8")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _mod._render_runtime_config(
+            tmp_path,
+            "litellm-switchboard",
+            model="qwen",
+            gguf_file="Qwen.gguf",
+            lemonade_model_id="",
+            lemonade_api_key="sk-runtime",
+            lemonade_api_base="http://lemonade:8080/api/v1",
+            llm_base_url="http://runtime:8080/v1",
+            ods_mode="hybrid",
+            gpu_backend="nvidia",
+            context_length=65536,
+            switchboard_mode="enabled",
+        ) is True
+
+        cmd = calls[0][0]
+        assert cmd[cmd.index("--switchboard-mode") + 1] == "enabled"
+        assert cmd[cmd.index("--model") + 1] == "qwen"
+        assert cmd[cmd.index("--llm-base-url") + 1] == "http://runtime:8080/v1"
+        assert cmd[cmd.index("--context-length") + 1] == "65536"
+
+    def test_enabled_mode_renderer_failure_aborts(self, monkeypatch, tmp_path):
+        calls = []
+
+        def fake_render(_install_dir, surface, **_kwargs):
+            calls.append(surface)
+            return False
+
+        monkeypatch.setattr(_mod, "_render_runtime_config", fake_render)
+
+        with pytest.raises(RuntimeError, match="model-router-endpoints"):
+            _mod._render_model_router_runtime_configs(
+                tmp_path,
+                {"ODS_MODEL_SWITCHBOARD": "enabled"},
+                model="qwen",
+                gguf_file="Qwen.gguf",
+                lemonade_model_id="",
+                context_length=65536,
+            )
+
+        assert calls == ["model-router-endpoints"]
+
+    def test_router_runtime_base_never_points_to_litellm(self):
+        assert _mod._runtime_llama_api_base({
+            "LLM_API_URL": "http://litellm:4000/v1",
+        }) == "http://llama-server:8080/v1"
+
+    def test_windows_native_runtime_base_uses_host_gateway(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_is_windows_host_llama_server", lambda _env: True)
+
+        assert _mod._runtime_llama_api_base({
+            "AMD_INFERENCE_PORT": "9234",
+            "LLM_API_URL": "http://litellm:4000/v1",
+        }) == "http://host.docker.internal:9234/v1"
+
+
 class TestOpenCodeModelRoute:
     def test_lemonade_uses_authenticated_host_litellm_route(self, monkeypatch):
         monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
