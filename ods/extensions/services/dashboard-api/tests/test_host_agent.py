@@ -794,6 +794,12 @@ class TestValidateCoreRecreateIds:
         assert ok is True
         assert error == ""
 
+    def test_accepts_model_router_core_recreate_service(self, monkeypatch):
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"model-router"})
+        ok, error = validate_core_recreate_ids(["model-router"])
+        assert ok is True
+        assert error == ""
+
     def test_rejects_non_core_service(self, monkeypatch):
         monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"dashboard-api"})
         ok, error = validate_core_recreate_ids(["llama-server"])
