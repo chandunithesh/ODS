@@ -2872,8 +2872,8 @@ class TestModelActivateRollback:
             "AMD_INFERENCE_RUNTIME=lemonade\n"
             "AMD_INFERENCE_LOCATION=host\n"
             "AMD_INFERENCE_PORT=8080\n"
-            "GGUF_FILE=new-model.gguf\n"
-            "LLM_MODEL=new-model\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
             "LEMONADE_MODEL=Old-Model\n"
             "CTX_SIZE=2048\n"
             "LITELLM_LEMONADE_API_KEY=sk-inline-from-env-file-67890\n",
@@ -2911,7 +2911,10 @@ class TestModelActivateRollback:
             "lemonade_model_id": "Modern-Model",
         }
         assert restarts == ["new-model.gguf"]
-        assert "LEMONADE_MODEL=Modern-Model" in env_path.read_text(encoding="utf-8")
+        updated_env = env_path.read_text(encoding="utf-8")
+        assert "GGUF_FILE=new-model.gguf" in updated_env
+        assert "LLM_MODEL=target-model" in updated_env
+        assert "LEMONADE_MODEL=Modern-Model" in updated_env
         assert "model: openai/Modern-Model" in lemonade_yaml.read_text(encoding="utf-8")
 
     def test_windows_native_llama_activation_uses_plain_health_and_litellm_local(

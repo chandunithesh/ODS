@@ -4950,6 +4950,15 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 400, {"error": f"Model file not downloaded or empty: {target_gguf}"})
             return
 
+        llm_model_name = str(model_id or _local_model_name_from_gguf(target_gguf)).strip()
+        if not llm_model_name:
+            json_response(self, 400, {"error": "model_id could not be resolved"})
+            return
+        env["GGUF_FILE"] = target_gguf
+        env["LLM_MODEL"] = llm_model_name
+        _upsert_env_value(env_path, "GGUF_FILE", target_gguf)
+        _upsert_env_value(env_path, "LLM_MODEL", llm_model_name)
+
         if _live_runtime_has_model(env, target_gguf) is not True:
             _restart_windows_lemonade(env)
 
@@ -4968,7 +4977,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             )
             return
 
-        llm_model_name = str(env.get("LLM_MODEL") or model_id or _local_model_name_from_gguf(target_gguf))
+        env["LEMONADE_MODEL"] = lemonade_model_id
         _upsert_env_value(env_path, "LEMONADE_MODEL", lemonade_model_id)
         _write_lemonade_config(INSTALL_DIR, target_gguf, lemonade_model_id)
         json_response(
