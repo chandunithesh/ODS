@@ -46,6 +46,7 @@ $LibDir = Join-Path $ScriptDir "lib"
 . (Join-Path $LibDir "backend-contract.ps1")
 . (Join-Path $LibDir "detection.ps1")
 . (Join-Path $LibDir "llm-endpoint.ps1")
+. (Join-Path $LibDir "model-activation.ps1")
 . (Join-Path $LibDir "install-report.ps1")
 . (Join-Path $LibDir "tier-map.ps1")
 
@@ -2658,8 +2659,11 @@ function Invoke-Model {
                 }
                 $tier = $tier.ToUpperInvariant()
 
-                # Retrieve the model config using tier-map functions
-                $model = ConvertTo-ModelFromTier -Tier $tier
+                # Use the persisted profile for both selection and activation
+                # validation, even when this shell has no MODEL_PROFILE set.
+                $envVars = Read-ODSEnv
+                $modelProfile = [string]$envVars["MODEL_PROFILE"]
+                $model = ConvertTo-ModelFromTier -Tier $tier -ModelProfile $modelProfile
                 if ([string]::IsNullOrWhiteSpace($model)) {
                     Write-AIError "Unknown tier: $tier"
                     return
@@ -2675,17 +2679,20 @@ function Invoke-Model {
                 }
 
                 # Resolve tier config to obtain GGUF details
-                $tierConfig = Resolve-TierConfig -Tier $normTier
+                $tierConfig = Resolve-TierConfig -Tier $normTier -ModelProfile $modelProfile
 
-                # Set in .env
-                Set-ODSEnvValue -Key "LLM_MODEL" -Value $model
-                Set-ODSEnvValue -Key "TIER" -Value $normTier
-                Set-ODSEnvValue -Key "GGUF_FILE" -Value $tierConfig.GgufFile
-                Set-ODSEnvValue -Key "GGUF_URL" -Value $tierConfig.GgufUrl
-                Set-ODSEnvValue -Key "CTX_SIZE" -Value $tierConfig.MaxContext
-                Set-ODSEnvValue -Key "MAX_CONTEXT" -Value $tierConfig.MaxContext
-
-                Write-AISuccess "Model set to $model (tier $tier, ctx=$($tierConfig.MaxContext)). Run '.\ods.ps1 restart' to apply."
+                try {
+                    $modelId = Resolve-WindowsODSModelCatalogId `
+                        -InstallDir $InstallDir -GgufFile $tierConfig.GgufFile
+                    Write-AI "Activating $model across ODS consumers..."
+                    $receipt = Invoke-WindowsODSModelActivationTransaction `
+                        -EnvMap $envVars -ModelId $modelId -Tier $normTier `
+                        -ContextLength ([int]$tierConfig.MaxContext)
+                    Write-AISuccess "Model activated everywhere: $model (tier $($receipt.tier), ctx=$($receipt.context_length))."
+                } catch {
+                    Write-AIError $_.Exception.Message
+                    exit 1
+                }
             }
             default {
                 Write-AIError "Usage: .\ods.ps1 model <current|list|swap>"
