@@ -644,7 +644,7 @@ def _get_service_data_info(service_id: str) -> dict | None:
 
 # --- Host Agent Helpers ---
 
-_AGENT_TIMEOUT = 300  # seconds — image pulls can take several minutes on first install
+_AGENT_TIMEOUT = 660  # seconds — exceed the host agent's 600s start allowance
 _AGENT_LOG_TIMEOUT = 30  # seconds — log fetches should be fast
 
 

@@ -16,6 +16,46 @@ _BASE_COMPOSE_SERVICES = frozenset({"llama-server", "open-webui", "dashboard", "
 router = APIRouter(tags=["templates"])
 
 
+def _runtime_dependency_order(
+    service_id: str,
+    read_direct_deps,
+    *,
+    _visiting: set[str] | None = None,
+    _visited: set[str] | None = None,
+    _order: list[str] | None = None,
+) -> list[str]:
+    """Return every dependency in leaves-first runtime start order."""
+    if _visiting is None:
+        _visiting = set()
+    if _visited is None:
+        _visited = set()
+    if _order is None:
+        _order = []
+
+    if service_id in _visiting:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Circular dependency detected involving: {service_id}",
+        )
+    if service_id in _visited:
+        return _order
+
+    _visiting.add(service_id)
+    for dep in read_direct_deps(service_id):
+        _runtime_dependency_order(
+            dep,
+            read_direct_deps,
+            _visiting=_visiting,
+            _visited=_visited,
+            _order=_order,
+        )
+        if dep not in _order:
+            _order.append(dep)
+    _visiting.remove(service_id)
+    _visited.add(service_id)
+    return _order
+
+
 def _gpu_backend_error(service_id: str) -> str | None:
     """Return a compatibility error for a service on the current GPU backend."""
     service_config = SERVICES.get(service_id)
@@ -259,7 +299,14 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
                     results[svc_id] = f"skipped: install failed: {detail}"
                     continue
 
-            # Dep-aware enable: resolve transitive deps, activate leaves first.
+            # Resolve the complete runtime dependency tree separately from the
+            # activation plan. An existing compose.yaml means enabled on disk,
+            # but does not prove that the dependency container is running.
+            runtime_deps = await asyncio.to_thread(
+                _runtime_dependency_order, svc_id, _read_direct_deps,
+            )
+
+            # Dep-aware enable: resolve missing deps, activate leaves first.
             # _activate_service checks both user-installed and built-in extension dirs.
             missing_deps = await asyncio.to_thread(_get_missing_deps_transitive, svc_id)
 
@@ -277,6 +324,28 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
                     else str(activation_error.detail)
                 )
                 results[svc_id] = f"skipped: {detail}"
+                continue
+
+            dependency_failed = False
+            successful_outcomes = {
+                "already_enabled", "core_service", "enabled",
+                "enabled_as_dependency", "library_installed",
+            }
+            for dep in runtime_deps:
+                dep_status = services_by_id.get(dep)
+                if dep in _BASE_COMPOSE_SERVICES or (
+                    dep_status and dep_status.status == "healthy"
+                ):
+                    continue
+                prior_outcome = results.get(dep)
+                if prior_outcome is not None and prior_outcome not in successful_outcomes:
+                    results[svc_id] = f"skipped: dependency {dep} was not enabled: {prior_outcome}"
+                    dependency_failed = True
+                    break
+                if prior_outcome is None:
+                    results[dep] = "already_enabled"
+                enabled_services.append(dep)
+            if dependency_failed:
                 continue
 
             action = result.get("action", "skipped")

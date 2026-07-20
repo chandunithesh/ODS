@@ -329,6 +329,68 @@ async def test_template_apply_activates_deps(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_template_apply_starts_enabled_stopped_dependency_first(tmp_path):
+    """An enabled compose definition is not treated as runtime readiness."""
+    mock_templates = [{
+        "id": "test-tmpl",
+        "name": "Test",
+        "services": ["child-svc"],
+    }]
+
+    class MockSvc:
+        def __init__(self, id_, status):
+            self.id = id_
+            self.status = status
+
+    mock_lock = MagicMock()
+    mock_lock.__enter__ = MagicMock(return_value=None)
+    mock_lock.__exit__ = MagicMock(return_value=False)
+    starts: list[str] = []
+
+    def mock_direct_deps(service_id):
+        return ["dep-svc"] if service_id == "child-svc" else []
+
+    def mock_agent(action, service_id):
+        assert action == "start"
+        starts.append(service_id)
+        return True
+
+    user_ext = tmp_path / "user-ext"
+    for service_id in ("dep-svc", "child-svc"):
+        (user_ext / service_id).mkdir(parents=True)
+
+    with (
+        patch("routers.templates.TEMPLATES", mock_templates),
+        patch("routers.templates._BASE_COMPOSE_SERVICES", frozenset()),
+        patch("routers.templates.USER_EXTENSIONS_DIR", user_ext),
+        patch(
+            "helpers.get_cached_services",
+            return_value=[
+                MockSvc("dep-svc", "stopped"),
+                MockSvc("child-svc", "stopped"),
+            ],
+        ),
+        patch(
+            "routers.extensions._activate_service",
+            return_value={"id": "child-svc", "action": "already_enabled"},
+        ),
+        patch("routers.extensions._extensions_lock", return_value=mock_lock),
+        patch("routers.extensions._get_missing_deps_transitive", return_value=[]),
+        patch("routers.extensions._read_direct_deps", side_effect=mock_direct_deps),
+        patch("routers.extensions._call_agent", side_effect=mock_agent),
+        patch("routers.extensions._call_agent_hook", return_value=True),
+        patch("routers.extensions._validate_service_id"),
+    ):
+        from routers.templates import apply_template
+        result = await apply_template("test-tmpl", api_key="test")
+
+    assert starts == ["dep-svc", "child-svc"]
+    assert result["results"]["dep-svc"] == "already_enabled"
+    assert result["started_count"] == 2
+    assert result["failed_services"] == []
+
+
+@pytest.mark.asyncio
 async def test_template_apply_incompatible_skipped():
     """Apply skips services that fail activation (e.g., not installed)."""
     from fastapi import HTTPException
