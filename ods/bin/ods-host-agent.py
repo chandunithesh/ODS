@@ -5242,6 +5242,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         apple_llama_log: Path | None = None
         apple_pid_file: Path | None = None
         switchboard_run: dict | None = None
+        final_runtime_proof: dict[str, object] | None = None
 
         def restore_backups():
             if env_snapshot is not None:
@@ -5894,25 +5895,41 @@ class AgentHandler(BaseHTTPRequestHandler):
                     _wait_for_container_health("ods-openclaw")
                 if opencode_snapshot is not None and opencode_runtime_state is not None:
                     opencode_restarted = _restart_managed_opencode(opencode_runtime_state)
+
+                final_runtime_proof = _wait_for_model_readiness(
+                    env,
+                    model_id=model_id,
+                    gguf_file=gguf_file,
+                    llm_model_name=llm_model_name,
+                    lemonade_model_id=lemonade_model_id,
+                    attempts=6,
+                    initial_delay=0,
+                    interval=5,
+                    return_proof=True,
+                )
+                if not final_runtime_proof:
+                    raise RuntimeError(
+                        "Final runtime proof failed for activated model "
+                        f"{gguf_file}; rolling back to previous model"
+                    )
                 committed = True  # system state is committed before the response write
                 if (
                     _switchboard_state is not None
-                    and switchboard_run
-                    and switchboard_run.get("ok")
-                    and switchboard_run.get("contextVerified") is True
+                    and final_runtime_proof
+                    and final_runtime_proof.get("contextVerified") is True
                 ):
                     # Observe mode: record the proven route after the existing
                     # transaction committed. Failures are logged, never fatal,
                     # and never alter activation behavior.
                     try:
                         verified_runtime_identity = str(
-                            switchboard_run.get("identity") or ""
+                            final_runtime_proof.get("identity") or ""
                         )
                         verified_context_length = int(
-                            switchboard_run.get("contextLength") or 0
+                            final_runtime_proof.get("contextLength") or 0
                         )
                         verified_capabilities = (
-                            switchboard_run.get("capabilities") or {}
+                            (switchboard_run or {}).get("capabilities") or {}
                         )
                         _switchboard_state.record_verified_route(
                             INSTALL_DIR / "data" / "model-state.json",
