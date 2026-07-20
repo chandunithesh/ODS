@@ -62,7 +62,7 @@ from host_agent_client import (
 from agent_monitor import collect_metrics
 from routers import (
     workflows, features, setup, updates, agents, privacy, extensions,
-    gpu as gpu_router, resources, voice, models as models_router, templates,
+    gpu as gpu_router, resources, voice, models as models_router, model_state as model_state_router, templates,
     auth as auth_router,
     magic_link,
     oauth_passthrough,
@@ -1032,6 +1032,8 @@ app.include_router(extensions.router)
 app.include_router(gpu_router.router)
 app.include_router(resources.router)
 app.include_router(voice.router)
+# Static switchboard state route registers before the dynamic model-ID routes.
+app.include_router(model_state_router.router)
 app.include_router(models_router.router)
 app.include_router(templates.router)
 app.include_router(auth_router.router)

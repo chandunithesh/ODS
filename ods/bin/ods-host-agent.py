@@ -39,6 +39,17 @@ from socketserver import ThreadingMixIn
 from urllib import error as urllib_error, request as urllib_request
 from urllib.parse import parse_qs, unquote, urlparse
 
+# Model Switchboard (PR 1, observe mode): stdlib-only sibling package. The
+# import is fail-open — a missing/broken package disables state recording but
+# never the agent itself.
+_SWITCHBOARD_BIN_DIR = str(Path(__file__).resolve().parent)
+if _SWITCHBOARD_BIN_DIR not in sys.path:
+    sys.path.insert(0, _SWITCHBOARD_BIN_DIR)
+try:
+    from model_switchboard import state as _switchboard_state
+except Exception:  # pragma: no cover - import environment dependent
+    _switchboard_state = None
+
 VERSION = "1.0.0"
 ODS_VERSION = VERSION
 SERVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -5569,6 +5580,39 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if opencode_snapshot is not None and opencode_runtime_state is not None:
                     opencode_restarted = _restart_managed_opencode(opencode_runtime_state)
                 committed = True  # system state is committed before the response write
+                if _switchboard_state is not None:
+                    # Observe mode: record the proven route after the existing
+                    # transaction committed. Failures are logged, never fatal,
+                    # and never alter activation behavior.
+                    try:
+                        _switchboard_state.record_verified_route(
+                            INSTALL_DIR / "data" / "model-state.json",
+                            catalog_id=str(model_id),
+                            runtime_model_id=str(
+                                lemonade_model_id or gguf_file or llm_model_name
+                            ),
+                            backend_kind=(
+                                "lemonade" if lemonade_model_id else "llama-server"
+                            ),
+                            endpoint_id=(
+                                "lemonade-default"
+                                if lemonade_model_id
+                                else "llama-server-default"
+                            ),
+                            native_route=(lemonade_model_id or None),
+                            context_length=int(context_length),
+                            capabilities={
+                                "chat": True,
+                                "tools": bool(model.get("tools")),
+                                "vision": bool(model.get("vision")),
+                                "agentViable": int(context_length) >= 65536,
+                            },
+                            proof_identity=str(
+                                lemonade_model_id or gguf_file or llm_model_name
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning("switchboard state record failed: %s", exc)
                 json_response(
                     self,
                     200,
@@ -9155,6 +9199,13 @@ def main():
         logger.error("Neither ODS_AGENT_KEY nor DASHBOARD_API_KEY set in .env")
         sys.exit(1)
     GPU_BACKEND = env.get("GPU_BACKEND", "nvidia")
+    if _switchboard_state is not None:
+        try:
+            _switchboard_state.initialize_if_missing(
+                INSTALL_DIR / "data" / "model-state.json", env
+            )
+        except Exception as exc:
+            logger.warning("switchboard state init skipped: %s", exc)
     STARTUP_ODS_MODE = _normalize_ods_mode(env.get("ODS_MODE"))
     TIER = env.get("TIER", "1")
     GPU_COUNT = env.get("GPU_COUNT", "1")
