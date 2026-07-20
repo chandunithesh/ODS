@@ -88,7 +88,10 @@ services:
       - no-new-privileges:true
     environment:
       ENABLE_OLLAMA_API: "false"
-      OPENAI_API_BASE_URL: "${LLM_API_URL:-http://llama-server:8080}/v1"
+      # Switchboard: OPEN_WEBUI_LLM_BASE_URL overrides to the LiteLLM gateway
+      # (ods/current) in enabled mode; default is byte-identical to the prior
+      # direct llama-server route for legacy/observe.
+      OPENAI_API_BASE_URL: "${OPEN_WEBUI_LLM_BASE_URL:-${LLM_API_URL:-http://llama-server:8080}/v1}"
       OPENAI_API_KEY: ""
       # PWA / branding — surfaces as the app title, page title, and PWA install name.
       # When a user adds ODS to their home screen, this is the label they see
