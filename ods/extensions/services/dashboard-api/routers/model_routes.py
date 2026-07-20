@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -18,6 +19,8 @@ router = APIRouter(tags=["models"])
 
 MODEL_ROUTER_URL = os.environ.get("MODEL_ROUTER_URL", "http://model-router:4010")
 _EVIDENCE_TIMEOUT_SECONDS = 5.0
+_EVIDENCE_ATTEMPTS = 3
+_EVIDENCE_RETRY_DELAY_SECONDS = 0.5
 
 _STRING_FIELDS = {
     "probeId",
@@ -76,18 +79,34 @@ async def get_model_route_evidence(probe_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Model router evidence key is not configured.")
 
     url = f"{MODEL_ROUTER_URL.rstrip('/')}/internal/route-evidence/{probe_id}"
-    try:
-        async with httpx.AsyncClient(timeout=_EVIDENCE_TIMEOUT_SECONDS) as client:
-            response = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {internal_key}"},
-            )
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
-        logger.warning("model-router route evidence unavailable: %s", exc)
-        raise HTTPException(status_code=503, detail="Model router is not reachable.") from exc
-    except httpx.HTTPError as exc:
-        logger.warning("model-router route evidence request failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Model router evidence request failed.") from exc
+    attempts = max(1, _EVIDENCE_ATTEMPTS)
+    response: httpx.Response | None = None
+    for attempt in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=_EVIDENCE_TIMEOUT_SECONDS) as client:
+                response = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {internal_key}"},
+                )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            if attempt + 1 < attempts:
+                await asyncio.sleep(_EVIDENCE_RETRY_DELAY_SECONDS)
+                continue
+            logger.warning("model-router route evidence unavailable: %s", exc)
+            raise HTTPException(status_code=503, detail="Model router is not reachable.") from exc
+        except httpx.HTTPError as exc:
+            logger.warning("model-router route evidence request failed: %s", exc)
+            raise HTTPException(status_code=502, detail="Model router evidence request failed.") from exc
+
+        if response.status_code == 404 and attempt + 1 < attempts:
+            await asyncio.sleep(_EVIDENCE_RETRY_DELAY_SECONDS)
+            continue
+        if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
+            await asyncio.sleep(_EVIDENCE_RETRY_DELAY_SECONDS)
+            continue
+        break
+
+    assert response is not None
 
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail="Route evidence not found.")

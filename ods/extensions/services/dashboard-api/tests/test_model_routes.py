@@ -9,10 +9,12 @@ import httpx
 
 
 def _patch_router_client(monkeypatch, response: httpx.Response | None = None,
-                         error: Exception | None = None):
+                         error: Exception | None = None,
+                         outcomes: list[httpx.Response | Exception] | None = None):
     from routers import model_routes as mr
 
     calls: list[tuple[str, Any]] = []
+    queued = list(outcomes or [])
 
     class FakeAsyncClient:
         def __init__(self, timeout: float):
@@ -26,12 +28,18 @@ def _patch_router_client(monkeypatch, response: httpx.Response | None = None,
 
         async def get(self, url: str, headers: dict[str, str]):
             calls.append(("get", {"url": url, "headers": headers}))
+            if queued:
+                outcome = queued.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
             if error is not None:
                 raise error
             return response or httpx.Response(404, json={"error": "not_found"})
 
     monkeypatch.setattr(mr.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(mr, "MODEL_ROUTER_URL", "http://model-router.test")
+    monkeypatch.setattr(mr, "_EVIDENCE_RETRY_DELAY_SECONDS", 0)
     return calls
 
 
@@ -101,6 +109,7 @@ def test_route_evidence_proxies_with_internal_key_and_sanitizes(
 
 def test_route_evidence_preserves_not_found(test_client, monkeypatch):
     probe_id = str(uuid.uuid4())
+    monkeypatch.setenv("ODS_ROUTER_INTERNAL_KEY", "internal-secret")
     calls = _patch_router_client(
         monkeypatch,
         httpx.Response(404, json={"error": "not_found"}),
@@ -113,10 +122,12 @@ def test_route_evidence_preserves_not_found(test_client, monkeypatch):
 
     assert resp.status_code == 404
     assert calls[1][0] == "get"
+    assert len([call for call in calls if call[0] == "get"]) == 3
 
 
 def test_route_evidence_maps_unreachable_router_to_503(test_client, monkeypatch):
     probe_id = str(uuid.uuid4())
+    monkeypatch.setenv("ODS_ROUTER_INTERNAL_KEY", "internal-secret")
     _patch_router_client(monkeypatch, error=httpx.ConnectError("no route"))
 
     resp = test_client.get(
@@ -125,6 +136,73 @@ def test_route_evidence_maps_unreachable_router_to_503(test_client, monkeypatch)
     )
 
     assert resp.status_code == 503
+
+
+def test_route_evidence_recovers_after_transient_router_unreachable(
+    test_client,
+    monkeypatch,
+):
+    probe_id = str(uuid.uuid4())
+    monkeypatch.setenv("ODS_ROUTER_INTERNAL_KEY", "internal-secret")
+    payload = {
+        "probeId": probe_id,
+        "requestedModel": "ods/current",
+        "routedModel": "Qwen.gguf",
+        "backend": "llama-server",
+        "endpointId": "llama-server-default",
+        "routeSeq": 12,
+        "path": "/v1/chat/completions",
+        "status": 200,
+        "responseModel": "Qwen.gguf",
+    }
+    calls = _patch_router_client(
+        monkeypatch,
+        outcomes=[
+            httpx.ConnectError("router starting"),
+            httpx.Response(200, json=payload),
+        ],
+    )
+
+    resp = test_client.get(
+        f"/api/models/routes/{probe_id}",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["routedModel"] == "Qwen.gguf"
+    assert len([call for call in calls if call[0] == "get"]) == 2
+
+
+def test_route_evidence_recovers_after_transient_not_found(test_client, monkeypatch):
+    probe_id = str(uuid.uuid4())
+    monkeypatch.setenv("ODS_ROUTER_INTERNAL_KEY", "internal-secret")
+    payload = {
+        "probeId": probe_id,
+        "requestedModel": "ods/current",
+        "routedModel": "Qwen.gguf",
+        "backend": "llama-server",
+        "endpointId": "llama-server-default",
+        "routeSeq": 12,
+        "path": "/v1/chat/completions",
+        "status": 200,
+        "responseModel": "Qwen.gguf",
+    }
+    calls = _patch_router_client(
+        monkeypatch,
+        outcomes=[
+            httpx.Response(404, json={"error": "not_found"}),
+            httpx.Response(200, json=payload),
+        ],
+    )
+
+    resp = test_client.get(
+        f"/api/models/routes/{probe_id}",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["probeId"] == probe_id
+    assert len([call for call in calls if call[0] == "get"]) == 2
 
 
 def test_route_evidence_rejects_mismatched_probe(test_client, monkeypatch):
