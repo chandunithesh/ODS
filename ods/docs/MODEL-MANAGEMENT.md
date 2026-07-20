@@ -45,8 +45,9 @@ curl http://localhost:11434/v1/models
 On macOS native Metal and Windows native/Lemonade installs, use
 `http://localhost:8080/v1/models` unless you changed the port.
 
-Dashboard activation and `ods model swap <tier>` use the same authenticated
-host-agent transaction. The transaction updates `.env`, `models.ini`, the
+Dashboard activation, Unix `ods model swap <tier>`, and Windows
+`.\ods.ps1 model swap <tier>` use the same authenticated host-agent transaction.
+The transaction updates `.env`, `models.ini`, the
 native or container inference runtime, LiteLLM, Hermes, OpenClaw, OpenCode, and
 Perplexica when those consumers are installed. It verifies the new runtime and
 downstream routes before reporting success. A late failure restores the prior
@@ -330,7 +331,5 @@ For AMD/Lemonade, use `extra.<GGUF_FILE>`.
 - Custom GGUF import from a local file or arbitrary URL is not yet a first-class
   Dashboard workflow.
 - `ods model swap` switches ODS tiers, not arbitrary GGUF files.
-- Windows `ods.ps1 model swap` parity is tracked separately; use the Dashboard
-  Models page for transactional activation on Windows until that command lands.
 - `scripts/upgrade-model.sh` is a legacy helper for model-directory layouts and
   should not be used as the primary GGUF switch path on current installs.

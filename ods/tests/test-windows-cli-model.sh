@@ -53,12 +53,14 @@ grep -q 'Resolve-TierConfig' "$ODS_PS1" \
     || fail "Invoke-Model does not call Resolve-TierConfig"
 pass "Invoke-Model integrates with tier-map functions"
 
-info "Static: Invoke-Model uses Set-ODSEnvValue to update .env on swap"
-grep -q 'Set-ODSEnvValue -Key "LLM_MODEL"' "$ODS_PS1" \
-    || fail "Invoke-Model does not set LLM_MODEL"
-grep -q 'Set-ODSEnvValue -Key "TIER"' "$ODS_PS1" \
-    || fail "Invoke-Model does not set TIER"
-pass "Invoke-Model updates .env variables correctly on swap"
+info "Static: Invoke-Model routes swaps through the host-agent transaction"
+invoke_model_body=$(sed -n '/^function Invoke-Model {/,/^function Show-Help {/p' "$ODS_PS1")
+grep -q 'Invoke-WindowsODSModelActivationTransaction' <<< "$invoke_model_body" \
+    || fail "Invoke-Model does not call the transactional activation helper"
+if grep -q 'Set-ODSEnvValue' <<< "$invoke_model_body"; then
+    fail "Invoke-Model must not bypass rollback with direct .env writes"
+fi
+pass "Invoke-Model uses transactional activation without direct env mutation"
 
 info "Static: command dispatcher wires 'model'"
 grep -q '"model"' "$ODS_PS1" && grep -q 'Invoke-Model' "$ODS_PS1" \
