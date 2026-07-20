@@ -880,6 +880,8 @@ def _publish_verified_initial_switchboard_route(
         return False
 
     context_length = int(proof.get("contextLength") or identity.get("contextLength") or 0)
+    if backend_kind == "lemonade":
+        native_route = runtime_identity
     capabilities = {
         "chat": True,
         "tools": bool(model.get("tools")),
@@ -6251,12 +6253,12 @@ def _resolve_lemonade_model_id(
         return ""
     stem = filename.rsplit(".", 1)[0] if "." in filename else filename
     persisted = str(env.get("LEMONADE_MODEL") or "").strip()
-    configured_gguf = str(env.get("GGUF_FILE") or "").strip()
     persisted_matches_target = bool(
         persisted
         and _runtime_model_identity_matches(
-            configured_gguf,
+            persisted,
             gguf_file=filename,
+            llm_model_name=stem,
         )
     )
     if host is None or port is None:
@@ -6962,10 +6964,15 @@ def _wait_for_model_readiness(
                     runtime_context = _llama_runtime_context_length(host, port)
                     if expected_context and runtime_context < expected_context:
                         runtime_identity = ""
+            completion_request_model = (
+                str(runtime_identity)
+                if is_lemonade and runtime_identity
+                else str(completion_model)
+            )
             if runtime_identity and _chat_completion_ready(
                 host,
                 port,
-                str(completion_model),
+                completion_request_model,
                 completion_prefix,
                 expected_model_id=str(runtime_identity),
                 expected_gguf_file=gguf_file,
@@ -8464,6 +8471,10 @@ def _perplexica_model_route(
     lemonade_model_id: str = "",
 ) -> tuple[str, str, str]:
     """Return model, container-visible base URL, and key for Perplexica."""
+    if _normal_switchboard_mode(env) == "enabled":
+        api_key = str(env.get("LITELLM_KEY") or env.get("OPENAI_API_KEY") or "no-key")
+        return "ods/current", "http://litellm:4000/v1", api_key
+
     runtime = str(
         env.get("AMD_INFERENCE_RUNTIME")
         or env.get("LLM_BACKEND")

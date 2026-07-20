@@ -370,7 +370,13 @@ grep -qF 'read_env_value HERMES_LLM_BASE_URL' <<<"$perplexica_update_block" \
     || fail "Lemonade Perplexica updates must use the working LiteLLM route"
 grep -qF 'read_env_value LEMONADE_MODEL' <<<"$perplexica_update_block" \
     || fail "Perplexica post-swap update must use the exact Lemonade model ID"
-pass "Perplexica post-swap update uses runnable Python and the exact LiteLLM model route"
+grep -qF 'read_env_value ODS_MODEL_SWITCHBOARD' <<<"$perplexica_update_block" \
+    || fail "Perplexica post-swap update must branch on switchboard mode"
+grep -qF '_px_model="ods/current"' <<<"$perplexica_update_block" \
+    || fail "Switchboard Perplexica updates must keep the stable model alias"
+grep -qF '_px_base_url="http://litellm:4000/v1"' <<<"$perplexica_update_block" \
+    || fail "Switchboard Perplexica updates must route through LiteLLM"
+pass "Perplexica post-swap update uses runnable Python and the exact LiteLLM/switchboard model route"
 
 grep -qF 'HOT_SWAP_VERIFIED=true' <<<"$active_code" \
     || fail "hot-swap must record when the full model is verified serving"

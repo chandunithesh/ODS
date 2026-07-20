@@ -243,12 +243,29 @@ class TestResolveLemonadeModelId:
         assert _resolve_lemonade_model_id(
             {
                 "GGUF_FILE": "Model.gguf",
-                "LEMONADE_MODEL": "persisted-exact-id",
+                "LEMONADE_MODEL": "Model",
             },
             "Model.gguf",
             host="127.0.0.1",
             port="8080",
-        ) == "persisted-exact-id"
+        ) == "Model"
+
+    def test_stale_persisted_model_does_not_mask_107_stem_fallback(self, monkeypatch):
+        def fake_run(cmd, **_kwargs):
+            body = '{"data":[]}' if cmd[-1].endswith("/models") else '{"version":"10.7.0"}'
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _resolve_lemonade_model_id(
+            {
+                "GGUF_FILE": "Model.gguf",
+                "LEMONADE_MODEL": "Old-Model",
+            },
+            "Model.gguf",
+            host="127.0.0.1",
+            port="8080",
+        ) == "Model"
 
     def test_ignores_persisted_model_for_a_different_gguf(self, monkeypatch):
         def fake_run(cmd, **_kwargs):
@@ -453,14 +470,14 @@ class TestLemonadeCompletionReady:
 
         assert _lemonade_completion_ready("127.0.0.1", "8080", "model.gguf") is False
 
-    def test_readiness_uses_persisted_exact_model_for_completion(self, monkeypatch):
+    def test_readiness_uses_runtime_identity_for_lemonade_completion(self, monkeypatch):
         completion_calls = []
 
         def fake_run(cmd, **_kwargs):
             return subprocess.CompletedProcess(
                 cmd,
                 0,
-                stdout='{"status":"ok","model_loaded":"Modern-Model"}',
+                stdout='{"status":"ok","version":"10.7.0","model_loaded":"Modern-Model"}',
                 stderr="",
             )
 
@@ -475,12 +492,12 @@ class TestLemonadeCompletionReady:
             {
                 "GPU_BACKEND": "amd",
                 "OLLAMA_PORT": "8080",
-                "GGUF_FILE": "Model.gguf",
-                "LEMONADE_MODEL": "Modern-Model",
+                "GGUF_FILE": "Modern-Model.gguf",
             },
             model_id="catalog-model",
-            gguf_file="Model.gguf",
+            gguf_file="Modern-Model.gguf",
             llm_model_name="model",
+            lemonade_model_id="extra.Modern-Model.gguf",
             attempts=1,
             initial_delay=0,
             interval=0,
@@ -493,7 +510,7 @@ class TestLemonadeCompletionReady:
                 "/api/v1",
                 {
                     "expected_model_id": "Modern-Model",
-                    "expected_gguf_file": "Model.gguf",
+                    "expected_gguf_file": "Modern-Model.gguf",
                     "expected_llm_model_name": "model",
                 },
             ),
@@ -929,6 +946,23 @@ class TestPerplexicaModelRoute:
         )
 
         assert model == "Modern-Model"
+        assert base_url == "http://litellm:4000/v1"
+        assert api_key == "secret-key"
+
+    def test_switchboard_mode_uses_stable_alias_through_litellm(self):
+        model, base_url, api_key = _mod._perplexica_model_route(
+            {
+                "ODS_MODEL_SWITCHBOARD": "enabled",
+                "GPU_BACKEND": "amd",
+                "AMD_INFERENCE_RUNTIME": "lemonade",
+                "LEMONADE_MODEL": "Modern-Model",
+                "LITELLM_KEY": "secret-key",
+            },
+            "Modern-Model.gguf",
+            lemonade_model_id="Modern-Model",
+        )
+
+        assert model == "ods/current"
         assert base_url == "http://litellm:4000/v1"
         assert api_key == "secret-key"
 
