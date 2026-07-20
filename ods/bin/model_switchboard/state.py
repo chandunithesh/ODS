@@ -532,7 +532,7 @@ def initialize_if_missing(
     path: os.PathLike | str,
     env: dict[str, str],
     *,
-    endpoint_id: str = "local-default",
+    endpoint_id: str | None = None,
 ) -> dict[str, Any] | None:
     """One-time startup reconstruction when no v1 state was ever committed.
 
@@ -544,6 +544,12 @@ def initialize_if_missing(
     identity = migrate_env_identity(env)
     if identity is None:
         return None
+    if endpoint_id is None:
+        endpoint_id = (
+            "lemonade-default"
+            if identity["backendKind"] == "lemonade"
+            else "llama-server-default"
+        )
     return record_verified_route(
         path,
         catalog_id=identity["catalogId"],

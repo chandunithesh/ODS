@@ -80,7 +80,7 @@ _MACOS_HOST_AGENT_BRIDGE_LABEL = "com.ods.host-agent-bridge"
 # Prevents fail-open: without this, a missing JSON file would allow anyone with
 # the API key to stop core services like llama-server or dashboard-api.
 _FALLBACK_CORE_IDS = frozenset({
-    "dashboard-api", "dashboard", "llama-server", "open-webui",
+    "dashboard-api", "dashboard", "llama-server", "model-router", "open-webui",
     "litellm", "langfuse", "hermes", "hermes-proxy", "n8n", "openclaw", "opencode",
     "perplexica", "searxng", "qdrant", "tts", "whisper",
     "embeddings", "token-spy", "comfyui", "ape", "privacy-shield",
@@ -97,7 +97,9 @@ CORE_SERVICE_IDS: set = set()
 WINDOWS_WHISPER_CUDA_MIN_DRIVER_MAJOR = 575
 # Always-on services defined in docker-compose.base.yml — never stoppable via API.
 # Distinct from CORE_SERVICE_IDS (which is the allowlist of known service IDs).
-ALWAYS_ON_SERVICES: frozenset = frozenset({"llama-server", "open-webui", "dashboard", "dashboard-api"})
+ALWAYS_ON_SERVICES: frozenset = frozenset({
+    "llama-server", "model-router", "open-webui", "dashboard", "dashboard-api",
+})
 USER_EXTENSIONS_DIR: Path = Path()
 EXTENSIONS_DIR: Path = Path()
 _ODS_MODES = frozenset({"local", "cloud", "hybrid", "lemonade"})
@@ -116,7 +118,7 @@ _ALLOWED_CORE_RECREATE_IDS = frozenset({
     "llama-server", "open-webui", "litellm", "langfuse", "n8n",
     "hermes", "hermes-proxy", "openclaw", "opencode", "perplexica", "searxng", "qdrant",
     "tts", "whisper", "embeddings", "token-spy", "comfyui",
-    "ape", "privacy-shield",
+    "ape", "privacy-shield", "model-router",
 })
 
 
@@ -292,6 +294,8 @@ _model_lifecycle_operation: str | None = None
 _model_lifecycle_target: str | None = None
 _model_activation_target: str | None = None
 _model_status_verify_thread: threading.Thread | None = None
+_switchboard_initial_verify_lock = threading.Lock()
+_switchboard_initial_verify_thread: threading.Thread | None = None
 # Update lock/state: only one background ods-update run at a time.
 _update_lock = threading.Lock()
 _update_status_lock = threading.Lock()
@@ -402,7 +406,31 @@ def _parse_huggingface_resolve_url(url: object) -> tuple[str, str, str] | None:
     return repo_id, revision, filename
 
 
-def _download_huggingface_artifact(part_url: str, part_tmp: Path, cancel_event: threading.Event) -> tuple[bool, str]:
+def _positive_int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return minimum
+    if maximum is not None and value > maximum:
+        return maximum
+    return value
+
+
+def _download_huggingface_artifact(
+    part_url: str,
+    part_tmp: Path,
+    cancel_event: threading.Event,
+    *,
+    status_path: Path | None = None,
+    status_label: str = "",
+    part_total: int = 0,
+    status_error: str = "",
+) -> tuple[bool, str]:
     """Download a Hugging Face artifact with huggingface_hub for Xet-backed files."""
     global _model_download_proc
     parsed = _parse_huggingface_resolve_url(part_url)
@@ -411,6 +439,24 @@ def _download_huggingface_artifact(part_url: str, part_tmp: Path, cancel_event: 
 
     repo_id, revision, filename = parsed
     cache_dir = INSTALL_DIR / "data" / "hf-cache"
+    fallback_timeout = _positive_int_env(
+        "ODS_HF_HUB_FALLBACK_TIMEOUT_SECONDS",
+        2700,
+        minimum=30,
+        maximum=14400,
+    )
+    heartbeat_seconds = _positive_int_env(
+        "ODS_HF_HUB_FALLBACK_STATUS_SECONDS",
+        10,
+        minimum=2,
+        maximum=120,
+    )
+    response_timeout = _positive_int_env(
+        "ODS_HF_HUB_RESPONSE_TIMEOUT_SECONDS",
+        30,
+        minimum=10,
+        maximum=300,
+    )
     code = r'''
 import shutil
 import sys
@@ -449,30 +495,83 @@ shutil.copyfile(path, dest_path)
         str(cache_dir),
     ]
     try:
+        child_env = os.environ.copy()
+        child_env.setdefault("HF_HUB_ETAG_TIMEOUT", str(response_timeout))
+        child_env.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(response_timeout))
+        logger.info(
+            "Model download falling back to Hugging Face Hub for %s from %s",
+            filename,
+            repo_id,
+        )
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=child_env,
         )
         _model_download_proc = proc
+        stop_status = threading.Event()
+        heartbeat_thread = None
+
+        if status_path is not None:
+            label = status_label or Path(filename).name
+            status_message = (
+                f"{status_error}; Hugging Face Hub fallback active"
+                if status_error
+                else "Hugging Face Hub fallback active"
+            )
+
+            def _heartbeat_status() -> None:
+                while not stop_status.is_set():
+                    if cancel_event.is_set():
+                        try:
+                            proc.kill()
+                        except (OSError, AttributeError):
+                            pass
+                    try:
+                        current = part_tmp.stat().st_size if part_tmp.exists() else 0
+                    except OSError:
+                        current = 0
+                    _write_model_status(
+                        status_path,
+                        "downloading",
+                        label,
+                        current,
+                        part_total,
+                        status_message,
+                    )
+                    stop_status.wait(heartbeat_seconds)
+
+            heartbeat_thread = threading.Thread(target=_heartbeat_status, daemon=True)
+            heartbeat_thread.start()
+        timed_out = False
         try:
-            stdout_text, stderr_text = proc.communicate(timeout=14400)
+            stdout_text, stderr_text = proc.communicate(timeout=fallback_timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             proc.kill()
+            timeout_error = f"Hugging Face Hub fallback timed out after {fallback_timeout}s"
             try:
                 stdout_text, stderr_text = proc.communicate(timeout=5)
+                stderr_text = stderr_text or timeout_error
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
-                stdout_text, stderr_text = "", "Hugging Face Hub download timed out"
+                stdout_text, stderr_text = "", timeout_error
         finally:
+            stop_status.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1)
             _model_download_proc = None
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"Hugging Face Hub fallback could not start: {exc}"
 
     if cancel_event.is_set():
         return False, "Download cancelled by user"
+    if timed_out:
+        logger.warning("Model download Hugging Face Hub fallback timed out for %s", filename)
+        return False, stderr_text or f"Hugging Face Hub fallback timed out after {fallback_timeout}s"
     if proc.returncode == 0 and _model_file_ready(part_tmp):
         return True, ""
     details = stderr_text or stdout_text
@@ -747,6 +846,186 @@ def load_env(env_path: Path) -> dict:
             key, _, val = line.partition("=")
             env[key.strip()] = val.strip().strip("'\"")
     return env
+
+
+def _switchboard_state_path() -> Path:
+    return INSTALL_DIR / "data" / "model-state.json"
+
+
+def _switchboard_state_needs_initial_verification(path: Path) -> bool:
+    if _switchboard_state is None:
+        return False
+    doc, errors = _switchboard_state.read_state(path)
+    if errors or not isinstance(doc, dict):
+        return False
+    active = doc.get("active")
+    if not isinstance(active, dict):
+        return False
+    proof = active.get("proof")
+    return (
+        active.get("reconstructed") is True
+        or not isinstance(active.get("verifiedAt"), str)
+        or not active.get("verifiedAt")
+        or not isinstance(proof, dict)
+        or proof.get("completion") is not True
+    )
+
+
+def _catalog_model_for_current_env(env: dict) -> tuple[str, dict]:
+    gguf_file = str(env.get("GGUF_FILE") or "").strip()
+    llm_model_name = str(env.get("LLM_MODEL") or "").strip()
+    library_path = INSTALL_DIR / "config" / "model-library.json"
+    if library_path.exists():
+        try:
+            library = json.loads(library_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            library = {}
+        for entry in library.get("models", []) if isinstance(library, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or "")
+            entry_gguf = str(entry.get("gguf_file") or "")
+            entry_llm = str(entry.get("llm_model_name") or entry_id)
+            if (
+                (llm_model_name and entry_id == llm_model_name)
+                or (llm_model_name and entry_llm == llm_model_name)
+                or (gguf_file and entry_gguf == gguf_file)
+            ):
+                return entry_id or llm_model_name or gguf_file, entry
+    return llm_model_name or gguf_file, {}
+
+
+def _initial_switchboard_backend(env: dict) -> tuple[str, str, str | None]:
+    gpu_backend = str(env.get("GPU_BACKEND") or "nvidia").lower()
+    windows_native_llama = _is_windows_host_llama_server(env)
+    if gpu_backend == "amd" and not windows_native_llama:
+        lemonade_model_id = str(env.get("LEMONADE_MODEL") or "").strip()
+        if not lemonade_model_id:
+            lemonade_model_id = _resolve_lemonade_model_id(
+                env,
+                str(env.get("GGUF_FILE") or ""),
+            )
+        return "lemonade", "lemonade-default", lemonade_model_id or None
+    return "llama-server", "llama-server-default", None
+
+
+def _publish_verified_initial_switchboard_route(
+    *,
+    reason: str,
+    attempts: int = 180,
+    initial_delay: float = 0,
+    interval: float = 10,
+) -> bool:
+    """Promote reconstructed startup state only after runtime proof succeeds."""
+    if _switchboard_state is None:
+        return False
+    state_path = _switchboard_state_path()
+    if not _switchboard_state_needs_initial_verification(state_path):
+        return False
+
+    env = load_env(INSTALL_DIR / ".env")
+    identity = _switchboard_state.migrate_env_identity(env)
+    if not identity:
+        return False
+
+    gguf_file = str(env.get("GGUF_FILE") or identity["runtimeModelId"])
+    llm_model_name = str(env.get("LLM_MODEL") or identity["catalogId"])
+    if not gguf_file:
+        return False
+
+    model_id, model = _catalog_model_for_current_env(env)
+    backend_kind, endpoint_id, native_route = _initial_switchboard_backend(env)
+    proof = _wait_for_model_readiness(
+        env,
+        model_id=model_id or llm_model_name or gguf_file,
+        gguf_file=gguf_file,
+        llm_model_name=llm_model_name,
+        lemonade_model_id=native_route or "",
+        attempts=attempts,
+        initial_delay=initial_delay,
+        interval=interval,
+        return_proof=True,
+    )
+    if not isinstance(proof, dict) or not proof.get("identity"):
+        logger.info("switchboard initial route proof deferred (%s)", reason)
+        return False
+
+    fresh_env = load_env(INSTALL_DIR / ".env")
+    if (
+        str(fresh_env.get("GGUF_FILE") or "") != str(env.get("GGUF_FILE") or "")
+        or str(fresh_env.get("LLM_MODEL") or "") != str(env.get("LLM_MODEL") or "")
+    ):
+        logger.info("switchboard initial route proof discarded after env changed")
+        return False
+    if not _switchboard_state_needs_initial_verification(state_path):
+        return False
+
+    runtime_identity = str(proof["identity"])
+    if not _runtime_model_identity_matches(
+        runtime_identity,
+        model_id=model_id,
+        gguf_file=gguf_file,
+        llm_model_name=llm_model_name,
+    ):
+        logger.warning(
+            "switchboard initial route proof identity %s did not match %s",
+            runtime_identity,
+            gguf_file,
+        )
+        return False
+
+    context_length = int(proof.get("contextLength") or identity.get("contextLength") or 0)
+    if backend_kind == "lemonade":
+        native_route = runtime_identity
+    capabilities = {
+        "chat": True,
+        "tools": bool(model.get("tools")),
+        "vision": bool(model.get("vision")),
+        "agentViable": _model_agent_viable(model, context_length),
+    }
+    _switchboard_state.record_verified_route(
+        state_path,
+        catalog_id=model_id or llm_model_name or gguf_file,
+        runtime_model_id=runtime_identity,
+        backend_kind=backend_kind,
+        endpoint_id=endpoint_id,
+        native_route=native_route,
+        context_length=context_length,
+        capabilities=capabilities,
+        proof_identity=runtime_identity,
+    )
+    logger.info(
+        "switchboard initial route verified (%s): %s",
+        reason,
+        runtime_identity,
+    )
+    return True
+
+
+def _schedule_initial_switchboard_verification(reason: str) -> None:
+    global _switchboard_initial_verify_thread
+    if _switchboard_state is None:
+        return
+    state_path = _switchboard_state_path()
+    if not _switchboard_state_needs_initial_verification(state_path):
+        return
+    with _switchboard_initial_verify_lock:
+        thread = _switchboard_initial_verify_thread
+        if thread is not None and thread.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                _publish_verified_initial_switchboard_route(reason=reason)
+            except Exception as exc:
+                logger.warning("switchboard initial route verification failed: %s", exc)
+
+        _switchboard_initial_verify_thread = threading.Thread(
+            target=_run,
+            name="ods-switchboard-initial-verify",
+            daemon=True,
+        )
+        _switchboard_initial_verify_thread.start()
 
 
 def _atomic_write_bytes(
@@ -4136,6 +4415,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         """Return current model download progress."""
         if not check_auth(self):
             return
+        _schedule_initial_switchboard_verification("model-status")
         status_path = INSTALL_DIR / "data" / "model-download-status.json"
         if not status_path.exists():
             json_response(self, 200, {"status": "idle"})
@@ -4474,6 +4754,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                                             part_url,
                                             part_tmp,
                                             _model_download_cancel,
+                                            status_path=status_path,
+                                            status_label=part_label,
+                                            part_total=part_total,
+                                            status_error=f"Retry {attempt}/3: {curl_error}",
                                         )
                                         downloaded = hub_ok
                                         if not hub_ok:
@@ -4800,6 +5084,15 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 400, {"error": f"Model file not downloaded or empty: {target_gguf}"})
             return
 
+        llm_model_name = str(model_id or _local_model_name_from_gguf(target_gguf)).strip()
+        if not llm_model_name:
+            json_response(self, 400, {"error": "model_id could not be resolved"})
+            return
+        env["GGUF_FILE"] = target_gguf
+        env["LLM_MODEL"] = llm_model_name
+        _upsert_env_value(env_path, "GGUF_FILE", target_gguf)
+        _upsert_env_value(env_path, "LLM_MODEL", llm_model_name)
+
         if _live_runtime_has_model(env, target_gguf) is not True:
             _restart_windows_lemonade(env)
 
@@ -4818,7 +5111,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             )
             return
 
-        llm_model_name = str(env.get("LLM_MODEL") or model_id or _local_model_name_from_gguf(target_gguf))
+        env["LEMONADE_MODEL"] = lemonade_model_id
         _upsert_env_value(env_path, "LEMONADE_MODEL", lemonade_model_id)
         _write_lemonade_config(INSTALL_DIR, target_gguf, lemonade_model_id)
         json_response(
@@ -5049,6 +5342,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         models_ini = INSTALL_DIR / "config" / "llama-server" / "models.ini"
         lemonade_yaml = INSTALL_DIR / "config" / "litellm" / "lemonade.yaml"
         litellm_local_yaml = INSTALL_DIR / "config" / "litellm" / "local.yaml"
+        litellm_switchboard_yaml = INSTALL_DIR / "config" / "litellm" / "switchboard.yaml"
+        model_router_endpoints = INSTALL_DIR / "config" / "model-router" / "endpoints.json"
         hermes_live_config = INSTALL_DIR / "data" / "hermes" / "config.yaml"
         hermes_template_config = INSTALL_DIR / "extensions" / "services" / "hermes" / "cli-config.yaml.template"
 
@@ -5058,6 +5353,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         ini_snapshot: dict | None = None
         lemonade_snapshot: dict | None = None
         litellm_local_snapshot: dict | None = None
+        litellm_switchboard_snapshot: dict | None = None
+        model_router_endpoints_snapshot: dict | None = None
         hermes_live_snapshot: dict | None = None
         hermes_template_snapshot: dict | None = None
         opencode_snapshot: dict | None = None
@@ -5079,6 +5376,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         apple_llama_log: Path | None = None
         apple_pid_file: Path | None = None
         switchboard_run: dict | None = None
+        final_runtime_proof: dict[str, object] | None = None
 
         def restore_backups():
             if env_snapshot is not None:
@@ -5089,6 +5387,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 _restore_text_file(lemonade_yaml, lemonade_snapshot)
             if litellm_local_snapshot is not None:
                 _restore_text_file(litellm_local_yaml, litellm_local_snapshot)
+            if litellm_switchboard_snapshot is not None:
+                _restore_text_file(litellm_switchboard_yaml, litellm_switchboard_snapshot)
+            if model_router_endpoints_snapshot is not None:
+                _restore_text_file(model_router_endpoints, model_router_endpoints_snapshot)
             if hermes_template_snapshot is not None:
                 _restore_text_file(hermes_template_config, hermes_template_snapshot)
             if hermes_live_snapshot and hermes_live_snapshot.get("exists"):
@@ -5293,6 +5595,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             ini_snapshot = _snapshot_text_file(models_ini)
             lemonade_snapshot = _snapshot_text_file(lemonade_yaml)
             litellm_local_snapshot = _snapshot_text_file(litellm_local_yaml)
+            litellm_switchboard_snapshot = _snapshot_text_file(litellm_switchboard_yaml)
+            model_router_endpoints_snapshot = _snapshot_text_file(model_router_endpoints)
             # Persisted Hermes state is commonly UID-10000-owned. Capture it
             # through the running container when host permissions deny access;
             # activation must never claim success with an unpatched live route.
@@ -5343,6 +5647,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 (models_ini, ini_snapshot),
                 (lemonade_yaml, lemonade_snapshot),
                 (litellm_local_yaml, litellm_local_snapshot),
+                (litellm_switchboard_yaml, litellm_switchboard_snapshot),
+                (model_router_endpoints, model_router_endpoints_snapshot),
                 (hermes_template_config, hermes_template_snapshot),
             ):
                 _assert_text_file_matches_snapshot(path, snapshot)
@@ -5621,6 +5927,15 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if windows_native_llama:
                     _write_windows_native_litellm_config(INSTALL_DIR, gguf_file, env)
 
+                _render_model_router_runtime_configs(
+                    INSTALL_DIR,
+                    env,
+                    model=llm_model_name,
+                    gguf_file=gguf_file,
+                    lemonade_model_id=lemonade_model_id,
+                    context_length=int(context_length),
+                )
+
                 hermes_live_exists = bool(
                     hermes_live_snapshot and hermes_live_snapshot.get("exists")
                 )
@@ -5714,25 +6029,41 @@ class AgentHandler(BaseHTTPRequestHandler):
                     _wait_for_container_health("ods-openclaw")
                 if opencode_snapshot is not None and opencode_runtime_state is not None:
                     opencode_restarted = _restart_managed_opencode(opencode_runtime_state)
+
+                final_runtime_proof = _wait_for_model_readiness(
+                    env,
+                    model_id=model_id,
+                    gguf_file=gguf_file,
+                    llm_model_name=llm_model_name,
+                    lemonade_model_id=lemonade_model_id,
+                    attempts=6,
+                    initial_delay=0,
+                    interval=5,
+                    return_proof=True,
+                )
+                if not final_runtime_proof:
+                    raise RuntimeError(
+                        "Final runtime proof failed for activated model "
+                        f"{gguf_file}; rolling back to previous model"
+                    )
                 committed = True  # system state is committed before the response write
                 if (
                     _switchboard_state is not None
-                    and switchboard_run
-                    and switchboard_run.get("ok")
-                    and switchboard_run.get("contextVerified") is True
+                    and final_runtime_proof
+                    and final_runtime_proof.get("contextVerified") is True
                 ):
                     # Observe mode: record the proven route after the existing
                     # transaction committed. Failures are logged, never fatal,
                     # and never alter activation behavior.
                     try:
                         verified_runtime_identity = str(
-                            switchboard_run.get("identity") or ""
+                            final_runtime_proof.get("identity") or ""
                         )
                         verified_context_length = int(
-                            switchboard_run.get("contextLength") or 0
+                            final_runtime_proof.get("contextLength") or 0
                         )
                         verified_capabilities = (
-                            switchboard_run.get("capabilities") or {}
+                            (switchboard_run or {}).get("capabilities") or {}
                         )
                         _switchboard_state.record_verified_route(
                             INSTALL_DIR / "data" / "model-state.json",
@@ -6082,12 +6413,12 @@ def _resolve_lemonade_model_id(
         return ""
     stem = filename.rsplit(".", 1)[0] if "." in filename else filename
     persisted = str(env.get("LEMONADE_MODEL") or "").strip()
-    configured_gguf = str(env.get("GGUF_FILE") or "").strip()
     persisted_matches_target = bool(
         persisted
         and _runtime_model_identity_matches(
-            configured_gguf,
+            persisted,
             gguf_file=filename,
+            llm_model_name=stem,
         )
     )
     if host is None or port is None:
@@ -6793,10 +7124,15 @@ def _wait_for_model_readiness(
                     runtime_context = _llama_runtime_context_length(host, port)
                     if expected_context and runtime_context < expected_context:
                         runtime_identity = ""
+            completion_request_model = (
+                str(runtime_identity)
+                if is_lemonade and runtime_identity
+                else str(completion_model)
+            )
             if runtime_identity and _chat_completion_ready(
                 host,
                 port,
-                str(completion_model),
+                completion_request_model,
                 completion_prefix,
                 expected_model_id=str(runtime_identity),
                 expected_gguf_file=gguf_file,
@@ -7241,12 +7577,16 @@ def _render_runtime_config(
     install_dir: Path,
     surface: str,
     *,
+    model: str = "",
     gguf_file: str,
     lemonade_model_id: str,
     lemonade_api_key: str,
     lemonade_api_base: str,
+    llm_base_url: str = "",
     ods_mode: str,
     gpu_backend: str,
+    context_length: int | None = None,
+    switchboard_mode: str = "observe",
 ) -> bool:
     renderer = install_dir / "scripts" / "render-runtime-configs.py"
     if not renderer.exists():
@@ -7256,22 +7596,30 @@ def _render_runtime_config(
         str(renderer),
         "--surface",
         surface,
+        "--switchboard-mode",
+        switchboard_mode,
         "--ods-mode",
         ods_mode,
         "--gpu-backend",
         gpu_backend,
+        "--model",
+        model or _local_model_name_from_gguf(gguf_file),
         "--gguf-file",
         gguf_file,
         "--lemonade-model-id",
         lemonade_model_id,
         "--lemonade-api-base",
         lemonade_api_base,
+        "--llm-base-url",
+        llm_base_url or "http://llama-server:8080/v1",
         "--litellm-key",
         lemonade_api_key,
         "--output-root",
         str(install_dir),
         "--write",
     ]
+    if context_length is not None:
+        cmd.extend(["--context-length", str(context_length)])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -7285,6 +7633,68 @@ def _render_runtime_config(
         )
         return False
     return True
+
+
+def _normal_switchboard_mode(env: dict) -> str:
+    value = str(env.get("ODS_MODEL_SWITCHBOARD") or "observe").strip().lower()
+    return value if value in {"legacy", "observe", "enabled"} else "observe"
+
+
+def _runtime_lemonade_api_base(env: dict) -> str:
+    base = "http://llama-server:8080/api/v1"
+    if str(env.get("AMD_INFERENCE_LOCATION") or "").lower() == "host":
+        lemonade_port = env.get("AMD_INFERENCE_PORT", "8080") or "8080"
+        base = f"http://host.docker.internal:{lemonade_port}/api/v1"
+    return base
+
+
+def _runtime_llama_api_base(env: dict) -> str:
+    if _is_windows_host_llama_server(env):
+        port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
+        return f"http://host.docker.internal:{port}/v1"
+    configured = str(env.get("LLM_API_URL") or "").strip()
+    if configured and "litellm" not in configured.lower():
+        return configured
+    return "http://llama-server:8080/v1"
+
+
+def _render_model_router_runtime_configs(
+    install_dir: Path,
+    env: dict,
+    *,
+    model: str,
+    gguf_file: str,
+    lemonade_model_id: str,
+    context_length: int,
+) -> None:
+    """Render router/LiteLLM switchboard inputs before dependent restarts."""
+    switchboard_mode = _normal_switchboard_mode(env)
+    enabled = switchboard_mode == "enabled"
+    api_key = (
+        env.get("LITELLM_LEMONADE_API_KEY")
+        or env.get("LITELLM_KEY")
+        or env.get("LITELLM_MASTER_KEY")
+        or "sk-lemonade"
+    )
+    common = {
+        "model": model,
+        "gguf_file": gguf_file,
+        "lemonade_model_id": lemonade_model_id,
+        "lemonade_api_key": api_key,
+        "lemonade_api_base": _runtime_lemonade_api_base(env),
+        "llm_base_url": _runtime_llama_api_base(env),
+        "ods_mode": env.get("ODS_MODE", "local"),
+        "gpu_backend": env.get("GPU_BACKEND", "nvidia"),
+        "context_length": int(context_length),
+        "switchboard_mode": switchboard_mode,
+    }
+    for surface in ("model-router-endpoints", "litellm-switchboard"):
+        if _render_runtime_config(install_dir, surface, **common):
+            continue
+        message = f"Failed to render required {surface} config"
+        if enabled:
+            raise RuntimeError(message)
+        logger.warning("%s; switchboard mode is %s", message, switchboard_mode)
 
 
 def _write_lemonade_config(
@@ -8221,6 +8631,10 @@ def _perplexica_model_route(
     lemonade_model_id: str = "",
 ) -> tuple[str, str, str]:
     """Return model, container-visible base URL, and key for Perplexica."""
+    if _normal_switchboard_mode(env) == "enabled":
+        api_key = str(env.get("LITELLM_KEY") or env.get("OPENAI_API_KEY") or "no-key")
+        return "ods/current", "http://litellm:4000/v1", api_key
+
     runtime = str(
         env.get("AMD_INFERENCE_RUNTIME")
         or env.get("LLM_BACKEND")
@@ -9500,6 +9914,7 @@ def main():
             )
         except Exception as exc:
             logger.warning("switchboard state init skipped: %s", exc)
+        _schedule_initial_switchboard_verification("startup")
     STARTUP_ODS_MODE = _normalize_ods_mode(env.get("ODS_MODE"))
     TIER = env.get("TIER", "1")
     GPU_COUNT = env.get("GPU_COUNT", "1")

@@ -794,6 +794,12 @@ class TestValidateCoreRecreateIds:
         assert ok is True
         assert error == ""
 
+    def test_accepts_model_router_core_recreate_service(self, monkeypatch):
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"model-router"})
+        ok, error = validate_core_recreate_ids(["model-router"])
+        assert ok is True
+        assert error == ""
+
     def test_rejects_non_core_service(self, monkeypatch):
         monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"dashboard-api"})
         ok, error = validate_core_recreate_ids(["llama-server"])
@@ -4748,6 +4754,113 @@ class TestModelDownloadFileIntegrity:
         assert any(cmd and cmd[0] == sys.executable for cmd in calls)
         status = json.loads((install_dir / "data" / "model-download-status.json").read_text(encoding="utf-8"))
         assert status["status"] == "complete"
+
+    def test_huggingface_fallback_reports_active_status(self, tmp_path, monkeypatch):
+        payload = b"downloaded through hf hub"
+        model = {
+            "gguf_file": "hf-model.gguf",
+            "gguf_url": "https://huggingface.co/org/model-GGUF/resolve/main/subdir/hf-model.gguf",
+            "gguf_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        install_dir = self._setup_env(
+            tmp_path,
+            monkeypatch,
+            library_models=[model],
+            expected_payload=payload,
+        )
+        monkeypatch.delenv("HF_HUB_ETAG_TIMEOUT", raising=False)
+        monkeypatch.delenv("HF_HUB_DOWNLOAD_TIMEOUT", raising=False)
+        child_envs = []
+        status_path = install_dir / "data" / "model-download-status.json"
+        part_tmp = install_dir / "data" / "models" / "hf-model.gguf.part"
+
+        class HubProc:
+            def __init__(self, cmd, *args, **kwargs):
+                self.cmd = cmd
+                self.returncode = None
+                child_envs.append(kwargs.get("env", {}))
+
+            def communicate(self, timeout=None):
+                deadline = time.time() + 2
+                while time.time() < deadline and not status_path.exists():
+                    time.sleep(0.01)
+                dest = Path(self.cmd[6])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(payload)
+                self.returncode = 0
+                return "", ""
+
+            def wait(self, timeout=None):
+                return self.returncode if self.returncode is not None else 0
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(_mod.subprocess, "Popen", HubProc)
+
+        ok, error = _mod._download_huggingface_artifact(
+            model["gguf_url"],
+            part_tmp,
+            self._NoCancel(),
+            status_path=status_path,
+            status_label=model["gguf_file"],
+            part_total=len(payload),
+            status_error="Retry 1/3: curl exited with code 35",
+        )
+
+        assert ok is True
+        assert error == ""
+        assert child_envs[0]["HF_HUB_ETAG_TIMEOUT"] == "30"
+        assert child_envs[0]["HF_HUB_DOWNLOAD_TIMEOUT"] == "30"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        assert status["status"] == "downloading"
+        assert status["model"] == "hf-model.gguf"
+        assert status["bytesTotal"] == len(payload)
+        assert "curl exited with code 35" in status["error"]
+        assert "Hugging Face Hub fallback active" in status["error"]
+
+    def test_huggingface_fallback_timeout_is_bounded(self, tmp_path, monkeypatch):
+        model = {
+            "gguf_file": "hf-model.gguf",
+            "gguf_url": "https://huggingface.co/org/model-GGUF/resolve/main/subdir/hf-model.gguf",
+            "gguf_sha256": hashlib.sha256(b"payload").hexdigest(),
+        }
+        install_dir = self._setup_env(tmp_path, monkeypatch, library_models=[model])
+        monkeypatch.setenv("ODS_HF_HUB_FALLBACK_TIMEOUT_SECONDS", "1")
+        part_tmp = install_dir / "data" / "models" / "hf-model.gguf.part"
+        timeouts = []
+
+        class HangingHubProc:
+            def __init__(self, cmd, *args, **kwargs):
+                self.cmd = cmd
+                self.returncode = None
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                timeouts.append(timeout)
+                if self.killed:
+                    self.returncode = -9
+                    return "", ""
+                raise subprocess.TimeoutExpired(self.cmd, timeout)
+
+            def wait(self, timeout=None):
+                return self.returncode if self.returncode is not None else -9
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        monkeypatch.setattr(_mod.subprocess, "Popen", HangingHubProc)
+
+        ok, error = _mod._download_huggingface_artifact(
+            model["gguf_url"],
+            part_tmp,
+            self._NoCancel(),
+        )
+
+        assert ok is False
+        assert timeouts[0] == 30
+        assert "Hugging Face Hub fallback timed out after 30s" in error
 
     def test_split_download_skips_existing_non_empty_parts(self, tmp_path, monkeypatch):
         parts = [

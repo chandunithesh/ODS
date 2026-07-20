@@ -3000,23 +3000,29 @@ if curl -sf --max-time 3 "${_perplexica_url}/api/config" >/dev/null 2>&1; then
             _py_cmd="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
         fi
     if [[ -n "$_py_cmd" ]]; then
-        # On Lemonade, LiteLLM exposes the model id as "extra.<GGUF_FILE>".
-        # On NVIDIA/Apple/CPU, llama.cpp serves under the bare GGUF id.
+        _switchboard_for_perplexica="$(read_env_value ODS_MODEL_SWITCHBOARD | tr '[:upper:]' '[:lower:]')"
         _px_model="$FULL_GGUF_FILE"
         _runtime_for_perplexica=$(grep -E '^AMD_INFERENCE_RUNTIME=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' | tr '[:upper:]' '[:lower:]' || echo "")
         _llm_backend_for_perplexica=$(grep -E '^LLM_BACKEND=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' | tr '[:upper:]' '[:lower:]' || echo "")
-        if [[ "$_runtime_for_perplexica" == "lemonade" || "$_llm_backend_for_perplexica" == "lemonade" ]]; then
-            _px_model="$(read_env_value LEMONADE_MODEL)"
-            [[ -n "$_px_model" ]] || _px_model="extra.$FULL_GGUF_FILE"
-        fi
         _litellm_key=$(grep -E '^LITELLM_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' || echo "no-key")
         : "${_litellm_key:=no-key}"
-        if [[ "$_runtime_for_perplexica" == "lemonade" || "$_llm_backend_for_perplexica" == "lemonade" ]]; then
-            _px_base_url="$(read_env_value HERMES_LLM_BASE_URL)"
-            : "${_px_base_url:=http://litellm:4000/v1}"
+        if [[ "$_switchboard_for_perplexica" == "enabled" ]]; then
+            _px_model="ods/current"
+            _px_base_url="http://litellm:4000/v1"
         else
-            _px_base_url=$(grep -E '^LLM_API_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' || echo "http://llama-server:8080")
-            : "${_px_base_url:=http://llama-server:8080}"
+            # On Lemonade, LiteLLM exposes the model id as "extra.<GGUF_FILE>".
+            # On NVIDIA/Apple/CPU, llama.cpp serves under the bare GGUF id.
+            if [[ "$_runtime_for_perplexica" == "lemonade" || "$_llm_backend_for_perplexica" == "lemonade" ]]; then
+                _px_model="$(read_env_value LEMONADE_MODEL)"
+                [[ -n "$_px_model" ]] || _px_model="extra.$FULL_GGUF_FILE"
+            fi
+            if [[ "$_runtime_for_perplexica" == "lemonade" || "$_llm_backend_for_perplexica" == "lemonade" ]]; then
+                _px_base_url="$(read_env_value HERMES_LLM_BASE_URL)"
+                : "${_px_base_url:=http://litellm:4000/v1}"
+            else
+                _px_base_url=$(grep -E '^LLM_API_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"\047\r' || echo "http://llama-server:8080")
+                : "${_px_base_url:=http://llama-server:8080}"
+            fi
         fi
         case "$_px_base_url" in
             */v1|*/api/v1) ;;

@@ -174,9 +174,23 @@ class TestStateModule:
         assert doc["active"]["verifiedAt"] is None
         assert doc["active"]["proof"]["completion"] is False
         assert doc["active"]["capabilities"]["agentViable"] is True
+        assert doc["active"]["backend"]["endpointId"] == "llama-server-default"
         before = path.read_text(encoding="utf-8")
         assert sb.initialize_if_missing(path, {"GGUF_FILE": "Other.gguf"}) is None
         assert path.read_text(encoding="utf-8") == before
+
+    def test_initialize_uses_lemonade_endpoint_id(self, tmp_path):
+        path = tmp_path / "model-state.json"
+        doc = sb.initialize_if_missing(
+            path,
+            {
+                "GPU_BACKEND": "amd",
+                "LLM_BACKEND": "lemonade",
+                "LEMONADE_MODEL": "extra.Model.gguf",
+                "GGUF_FILE": "Model.gguf",
+            },
+        )
+        assert doc["active"]["backend"]["endpointId"] == "lemonade-default"
 
     def test_initialize_cloud_only_writes_nothing(self, tmp_path):
         path = tmp_path / "model-state.json"
@@ -359,4 +373,65 @@ class TestObserveHook:
         handler = tma._ResponseHandler()
         tma._mod.AgentHandler._do_model_activate(handler, "target-model")
         assert handler.response_code != 200
+        assert state_path.read_text(encoding="utf-8") == before
+
+    def test_initial_reconstructed_state_promotes_after_readiness_proof(
+        self, tmp_path, monkeypatch
+    ):
+        import test_model_activate as tma
+
+        install_dir = tma._write_model_activation_fixture(tmp_path)[0]
+        state_path = install_dir / "data" / "model-state.json"
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+
+        env = tma._mod.load_env(install_dir / ".env")
+        reconstructed = sb.initialize_if_missing(state_path, env)
+        assert reconstructed["active"]["reconstructed"] is True
+        assert reconstructed["active"]["proof"]["completion"] is False
+
+        monkeypatch.setattr(
+            tma._mod,
+            "_wait_for_model_readiness",
+            lambda *_args, **_kwargs: {
+                "identity": "old-model.gguf",
+                "contextLength": 65536,
+                "contextVerified": True,
+                "verifiedAt": "2026-07-20T00:00:00Z",
+            },
+        )
+
+        assert tma._mod._publish_verified_initial_switchboard_route(
+            reason="test", attempts=1, initial_delay=0, interval=0
+        ) is True
+        doc, errors = sb.read_state(state_path)
+        assert errors == [] and doc is not None
+        assert doc["active"].get("reconstructed") is None
+        assert doc["active"]["runtimeModelId"] == "old-model.gguf"
+        assert doc["active"]["verifiedAt"]
+        assert doc["active"]["proof"] == {
+            "identity": "old-model.gguf",
+            "completion": True,
+        }
+
+    def test_initial_reconstructed_state_stays_unroutable_without_proof(
+        self, tmp_path, monkeypatch
+    ):
+        import test_model_activate as tma
+
+        install_dir = tma._write_model_activation_fixture(tmp_path)[0]
+        state_path = install_dir / "data" / "model-state.json"
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+
+        env = tma._mod.load_env(install_dir / ".env")
+        sb.initialize_if_missing(state_path, env)
+        before = state_path.read_text(encoding="utf-8")
+        monkeypatch.setattr(
+            tma._mod,
+            "_wait_for_model_readiness",
+            lambda *_args, **_kwargs: {},
+        )
+
+        assert tma._mod._publish_verified_initial_switchboard_route(
+            reason="test", attempts=1, initial_delay=0, interval=0
+        ) is False
         assert state_path.read_text(encoding="utf-8") == before
