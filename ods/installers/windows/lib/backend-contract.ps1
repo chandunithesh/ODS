@@ -403,16 +403,50 @@ try {
 
 function Start-ODSLemonadeDirectProcess {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][psobject]$Contract)
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Contract,
+        [string]$DiagnosticLogPath
+    )
 
     $previousAdminKey = $env:LEMONADE_ADMIN_API_KEY
     try {
         if (-not [string]::IsNullOrWhiteSpace([string]$Contract.AdminApiKey)) {
             $env:LEMONADE_ADMIN_API_KEY = [string]$Contract.AdminApiKey
         }
-        return Start-Process -FilePath $Contract.ExecutablePath `
-            -ArgumentList $Contract.ArgumentString -WindowStyle Hidden `
-            -WorkingDirectory (Split-Path -Parent $Contract.ExecutablePath) -PassThru
+        $logDir = if (-not [string]::IsNullOrWhiteSpace($DiagnosticLogPath)) {
+            Split-Path -Parent $DiagnosticLogPath
+        } else {
+            [IO.Path]::GetTempPath()
+        }
+        if ([string]::IsNullOrWhiteSpace($logDir)) { $logDir = [IO.Path]::GetTempPath() }
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $stdoutLog = if (-not [string]::IsNullOrWhiteSpace($DiagnosticLogPath)) {
+            "$DiagnosticLogPath.$stamp.stdout.log"
+        } else {
+            Join-Path $logDir "ods-lemonade-direct-$stamp.stdout.log"
+        }
+        $stderrLog = if (-not [string]::IsNullOrWhiteSpace($DiagnosticLogPath)) {
+            "$DiagnosticLogPath.$stamp.stderr.log"
+        } else {
+            Join-Path $logDir "ods-lemonade-direct-$stamp.stderr.log"
+        }
+        $workingDirectory = Split-Path -Parent $Contract.ExecutablePath
+        if (-not [string]::IsNullOrWhiteSpace([string]$Contract.AdminApiKey)) {
+            $env:LEMONADE_ADMIN_API_KEY = [string]$Contract.AdminApiKey
+        }
+        $process = Start-Process -FilePath $Contract.ExecutablePath `
+            -ArgumentList $Contract.ArgumentString `
+            -WorkingDirectory $workingDirectory `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -PassThru
+        return [pscustomobject]@{
+            Id = [int]$process.Id
+            ProcessId = [int]$process.Id
+            LaunchMethod = "start-process"
+        }
     } finally {
         if ($null -eq $previousAdminKey) {
             Remove-Item Env:\LEMONADE_ADMIN_API_KEY -ErrorAction SilentlyContinue
@@ -435,7 +469,9 @@ function Set-ODSLemonadeModernRuntimeConfig {
         [Parameter(Mandatory = $true)]
         [string]$ModelsDir,
 
-        [string]$AdminApiKey
+        [string]$AdminApiKey,
+
+        [int]$ContextSize = 0
     )
 
     $headers = @{}
@@ -448,6 +484,9 @@ function Set-ODSLemonadeModernRuntimeConfig {
         llamacpp = [ordered]@{
             backend = "vulkan"
         }
+    }
+    if ($ContextSize -gt 0) {
+        $payload.ctx_size = [int]$ContextSize
     }
     $body = $payload | ConvertTo-Json -Compress
     $null = Invoke-RestMethod -Method Post -Uri "$baseUrl/internal/set" `
@@ -469,6 +508,17 @@ function Set-ODSLemonadeModernRuntimeConfig {
     }
     if ([string]$config.llamacpp.backend -ne "vulkan") {
         throw "Lemonade llamacpp backend verification failed: expected 'vulkan', got '$($config.llamacpp.backend)'."
+    }
+    if ($ContextSize -gt 0) {
+        $actualContext = 0
+        try {
+            $actualContext = [int]$config.ctx_size
+        } catch {
+            $actualContext = 0
+        }
+        if ($actualContext -ne [int]$ContextSize) {
+            throw "Lemonade ctx_size verification failed: expected '$ContextSize', got '$($config.ctx_size)'."
+        }
     }
     return $config
 }

@@ -456,6 +456,18 @@ function Test-CatalogModelFamilyAllowed {
     return ($family -ne "gemma4")
 }
 
+function Test-CatalogModelInstallRecommendationAllowed {
+    param([object]$Model)
+
+    $prop = $Model.PSObject.Properties["install_recommendation"]
+    if (-not $prop) { return $true }
+    $value = $prop.Value
+    if ($null -eq $value) { return $true }
+    if ($value -is [bool]) { return [bool]$value }
+    $text = "$value".Trim().ToLowerInvariant()
+    return -not ($text -in @("0", "false", "no", "off"))
+}
+
 function Get-CatalogModelEstimatedParamBillions {
     param([object]$Model)
 
@@ -649,6 +661,7 @@ function Resolve-CatalogModelRecommendation {
     $candidates = @()
     foreach ($model in $catalog.models) {
         if (-not $model.gguf_url) { continue }
+        if (-not (Test-CatalogModelInstallRecommendationAllowed -Model $model)) { continue }
         if (-not (Test-CatalogModelFamilyAllowed -Model $model -ModelProfileName $modelProfileName)) { continue }
         $runtimeProfile = Get-CatalogRuntimeProfile -Model $model -GpuInfo $GpuInfo -SystemRamGB $SystemRamGB
         $requiredGb = Get-CatalogModelSelectorRequiredGB -Model $model -RuntimeProfile $runtimeProfile
@@ -795,6 +808,7 @@ function ConvertTo-ModelFromTier {
 
 $script:BOOTSTRAP_GGUF_FILE    = "Qwen3.5-2B-Q4_K_M.gguf"
 $script:BOOTSTRAP_GGUF_URL     = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf"
+$script:BOOTSTRAP_GGUF_SHA256  = "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
 $script:BOOTSTRAP_LLM_MODEL    = "qwen3.5-2b"
 # Hermes requires at least a 64K context window. Keep the fast-start model at
 # that floor so Hermes works during the first-run bootstrap experience too.

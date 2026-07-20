@@ -211,7 +211,7 @@ if ($gpuInfo.Backend -eq "amd") {
     $_resolvedLemonadeExe = Resolve-ODSLemonadeExe -ExecutableName ([string]$amdLemonadeRuntime.windows_executable)
     if ($_resolvedLemonadeExe) { $script:LEMONADE_EXE = $_resolvedLemonadeExe }
     $script:LEMONADE_PORT = [int]$amdLemonadeRuntime.api_port
-    $script:LEMONADE_HEALTH_URL = "http://localhost:$($script:LEMONADE_PORT)$($amdLemonadeRuntime.health_path)"
+    $script:LEMONADE_HEALTH_URL = "http://127.0.0.1:$($script:LEMONADE_PORT)$($amdLemonadeRuntime.health_path)"
 }
 . (Join-Path $PhasesDir "06-directories.ps1")
 . (Join-Path $PhasesDir "07-devtools.ps1")
@@ -290,7 +290,7 @@ if ($dryRun) {
             foreach ($k in $tierConfig.Keys) { $fullTierConfig[$k] = $tierConfig[$k] }
             $tierConfig.GgufFile   = $script:BOOTSTRAP_GGUF_FILE
             $tierConfig.GgufUrl    = $script:BOOTSTRAP_GGUF_URL
-            $tierConfig.GgufSha256 = ""
+            $tierConfig.GgufSha256 = $script:BOOTSTRAP_GGUF_SHA256
             $tierConfig.LlmModel   = $script:BOOTSTRAP_LLM_MODEL
             $tierConfig.MaxContext  = $script:BOOTSTRAP_MAX_CONTEXT
             Write-AI "Fast-start mode: downloading bootstrap model (~1.5GB) for instant chat."
@@ -540,7 +540,7 @@ if ($dryRun) {
                     $launchMethod = "direct process"
                     Write-AIWarn "Could not start Lemonade through Task Scheduler: $_"
                     Write-AI "Starting Lemonade directly for this Windows session..."
-                    $directProcess = Start-ODSLemonadeDirectProcess -Contract $launchContract
+                    $directProcess = Start-ODSLemonadeDirectProcess -Contract $launchContract -DiagnosticLogPath $diagnosticLog
                 }
                 Start-Sleep -Seconds 5
                 $proc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -553,7 +553,7 @@ if ($dryRun) {
                     Write-AIWarn "Lemonade scheduled task did not start a server process."
                     Write-AIWarn (Format-ODSLemonadeLaunchDiagnostics -Diagnostics $scheduledDiagnostics)
                     Write-AI "Starting Lemonade directly for this Windows session..."
-                    $directProcess = Start-ODSLemonadeDirectProcess -Contract $launchContract
+                    $directProcess = Start-ODSLemonadeDirectProcess -Contract $launchContract -DiagnosticLogPath $diagnosticLog
                     Start-Sleep -Seconds 3
                     $proc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($script:LEMONADE_EXE, [StringComparison]::OrdinalIgnoreCase) } |
@@ -589,7 +589,8 @@ if ($dryRun) {
                         try {
                             $null = Set-ODSLemonadeModernRuntimeConfig `
                                 -Port $script:LEMONADE_PORT -ModelsDir $modelsDir `
-                                -AdminApiKey $adminApiKey
+                                -AdminApiKey $adminApiKey `
+                                -ContextSize ([int]$tierConfig.MaxContext)
                             Write-AISuccess "Lemonade 10.7+ runtime configuration verified"
                         } catch {
                             Write-AIWarn "Lemonade runtime configuration failed: $_"
@@ -952,9 +953,9 @@ litellm_settings:
                     $gpuOverlay = Join-Path $svcDir.FullName "compose.nvidia.yaml"
                     if (Test-Path $gpuOverlay) {
                         $useGpuOverlay = $true
-                        if ($svcName -eq "whisper" -and $gpuInfo.DriverMajor -lt 575) {
+                        if ($svcName -eq "whisper" -and -not (Test-ODSWindowsWhisperCudaSupported -GpuInfo $gpuInfo)) {
                             $useGpuOverlay = $false
-                            Write-AIWarn "Whisper CUDA image requires a newer NVIDIA driver than $($gpuInfo.DriverVersion); using CPU Whisper."
+                            Write-AIWarn "Whisper CUDA image requires NVIDIA driver $($script:MIN_WINDOWS_WHISPER_CUDA_DRIVER)+; detected $($gpuInfo.DriverVersion). Using CPU Whisper."
                         }
                         if ($useGpuOverlay) {
                             $relOverlay = $gpuOverlay.Substring($installDir.Length + 1) -replace "\\", "/"
@@ -1838,7 +1839,7 @@ litellm_settings:
 set -uo pipefail
 mkdir -p "`$(dirname "$bashUpgradeLog")"
 echo "`$`$" > "$bashUpgradePidFile"
-exec bash "$bashScript" "$bashInstallDir" "$($fullTierConfig.GgufFile)" "$($fullTierConfig.GgufUrl)" "$($fullTierConfig.GgufSha256)" "$($fullTierConfig.LlmModel)" "$($fullTierConfig.MaxContext)" > "$bashUpgradeLog" 2> "$bashUpgradeErrLog" < /dev/null
+exec bash "$bashScript" "$bashInstallDir" "$($fullTierConfig.GgufFile)" "$($fullTierConfig.GgufUrl)" "$($fullTierConfig.GgufSha256)" "$($fullTierConfig.LlmModel)" "$($fullTierConfig.MaxContext)" "$($script:BOOTSTRAP_GGUF_FILE)" > "$bashUpgradeLog" 2> "$bashUpgradeErrLog" < /dev/null
 "@
                 [System.IO.File]::WriteAllText($wrapperScript, $wrapperContent.Replace("`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -1853,9 +1854,11 @@ exec bash "$bashScript" "$bashInstallDir" "$($fullTierConfig.GgufFile)" "$($full
 
                         $upgradeAction = New-ScheduledTaskAction -Execute $bashPath -Argument ('"{0}"' -f $wrapperScript)
                         $upgradeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+                        $upgradeRestartInterval = New-TimeSpan -Minutes 2
                         $upgradeSettings = New-ScheduledTaskSettingsSet `
                             -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                            -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+                            -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                            -RestartCount 5 -RestartInterval $upgradeRestartInterval
                         # The upgrade owns the native llama-server hot-swap. It
                         # must run at the same limited integrity level as the
                         # host agent so later UI model swaps can stop the child.
@@ -1966,6 +1969,24 @@ $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
 $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $installDir `
     -EnvMap $windowsEnvMap `
     -UseLemonade:$useLemonade -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode
+function Get-WindowsActiveModelSelection {
+    param(
+        [Parameter(Mandatory=$true)][hashtable]$EnvMap,
+        [string]$DefaultGgufFile = "",
+        [string]$DefaultModelName = ""
+    )
+
+    $activeGgufFile = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("GGUF_FILE") -Default $DefaultGgufFile
+    $activeModelName = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LLM_MODEL") -Default $DefaultModelName
+    if ([string]::IsNullOrWhiteSpace($activeGgufFile)) { $activeGgufFile = $DefaultGgufFile }
+    if ([string]::IsNullOrWhiteSpace($activeModelName)) { $activeModelName = $DefaultModelName }
+    return @{
+        GgufFile = $activeGgufFile
+        LlmModel = $activeModelName
+    }
+}
+$activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+    -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
 $healthChecks = @(
     @{ Name = $llmEndpoint.Name; Url = $llmEndpoint.HealthUrl }
     @{ Name = "Chat UI (Open WebUI)"; Url = "http://localhost:3000" }
@@ -2017,8 +2038,17 @@ foreach ($check in $healthChecks) {
 $llmModelReady = $true
 if (-not $cloudMode) {
     Write-AI "Verifying the LLM can actually serve a completion..."
+    $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+    $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $installDir `
+        -EnvMap $windowsEnvMap `
+        -UseLemonade:$useLemonade -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode
+    $activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+        -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
+    if (-not [string]::IsNullOrWhiteSpace($activeModel.GgufFile) -and $activeModel.GgufFile -ne $tierConfig.GgufFile) {
+        Write-AI "  Active model changed during install; verifying $($activeModel.GgufFile)."
+    }
     $llmReady = Test-WindowsLlmModelReadiness -Endpoint $llmEndpoint -InstallDir $installDir `
-        -GgufFile $tierConfig.GgufFile -TimeoutSec 120
+        -GgufFile $activeModel.GgufFile -TimeoutSec 120
     if ($llmReady.Ok -and $useLemonade) {
         try {
             $lemonadeModel = [string]$llmReady.ModelId
@@ -2182,14 +2212,20 @@ if ($enableVoice) {
 # ── Auto-configure Perplexica ─────────────────────────────────────────────────
 if (Test-ODSWindowsServiceEnabled -ServiceId "perplexica" -Plan $servicePlan) {
     Write-AI "Configuring Perplexica..."
-    $perplexicaModel = $(if ($tierConfig.GgufFile) {
+    $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+    $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $installDir `
+        -EnvMap $windowsEnvMap `
+        -UseLemonade:$useLemonade -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode
+    $activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+        -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
+    $perplexicaModel = $(if ($activeModel.GgufFile) {
         if ($useLemonade -and -not [string]::IsNullOrWhiteSpace($lemonadeModel)) {
             $lemonadeModel
         } else {
-            $tierConfig.GgufFile
+            $activeModel.GgufFile
         }
     } else {
-        $tierConfig.LlmModel
+        $activeModel.LlmModel
     })
     $perplexicaBaseUrl = $(if ($useLemonade -or $cloudMode) {
         "http://litellm:4000/v1"
@@ -2347,11 +2383,14 @@ try {
 
 # ── Summary JSON (for CI / automation) ───────────────────────────────────────
 if ($SummaryJsonPath) {
+    $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+    $activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+        -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
     $summary = @{
         version    = $script:ODS_VERSION
         tier       = $selectedTier
         tierName   = $tierConfig.TierName
-        model      = $tierConfig.LlmModel
+        model      = $activeModel.LlmModel
         gpuBackend = $gpuInfo.Backend
         gpuName    = $gpuInfo.Name
         installDir = $installDir

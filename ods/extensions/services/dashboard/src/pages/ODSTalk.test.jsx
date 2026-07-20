@@ -98,6 +98,61 @@ describe('ODSTalk', () => {
     expect(await screen.findByText('I can help from this ODS.')).toBeInTheDocument()
   })
 
+  test('shows model compatibility reason and disables send when text chat is blocked', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        return response({
+          reason: 'Phi direct chat works, but ODS Talk is not revalidated.',
+          modelCompatibility: {
+            hermesTalk: {
+              status: 'unsupported_until_revalidated',
+              reason: 'Phi direct chat works, but ODS Talk is not revalidated.',
+            },
+          },
+          capabilities: {
+            text_chat: false,
+            tts: false,
+            audio_message: false,
+          },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect((await screen.findAllByText('Phi direct chat works, but ODS Talk is not revalidated.')).length).toBeGreaterThan(0)
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), {
+      target: { value: 'hello' },
+    })
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('refreshes transient offline status until text chat becomes ready', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        const ready = fetchMock.mock.calls.length > 1
+        return response({
+          capabilities: {
+            text_chat: ready,
+            tts: false,
+            audio_message: false,
+          },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+
+    expect((await screen.findAllByText('ODS Talk text chat is not available.')).length).toBeGreaterThan(0)
+    expect(await screen.findByText('Ready', {}, { timeout: 2500 })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   test('accumulates SSE deltas across split chunks', async () => {
     // Transport may split a single SSE frame across chunk boundaries. The
     // reader has to buffer the partial frame across reads, not drop bytes.

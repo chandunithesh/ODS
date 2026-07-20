@@ -433,12 +433,14 @@ if ((${#_lemonade_ps_cmd[@]} > 0)); then
                 return [pscustomobject]@{ version = "10.7.0" }
             }
             return [pscustomobject]@{
+                ctx_size = 4096
                 extra_models_dir = $script:expectedModelsDir
                 llamacpp = [pscustomobject]@{ backend = "vulkan" }
             }
         }
         $null = Set-ODSLemonadeModernRuntimeConfig `
-            -Port 8080 -ModelsDir $modelsDir -AdminApiKey "contract-admin-key"
+            -Port 8080 -ModelsDir $modelsDir -AdminApiKey "contract-admin-key" `
+            -ContextSize 4096
         if ($script:configPost.Uri -ne "http://127.0.0.1:8080/internal/set") {
             throw "Modern Lemonade config did not use loopback /internal/set"
         }
@@ -446,11 +448,12 @@ if ((${#_lemonade_ps_cmd[@]} > 0)); then
             throw "Modern Lemonade config did not send the admin Bearer token"
         }
         $postedProperties = @($script:configPost.Body.PSObject.Properties.Name | Sort-Object)
-        if (($postedProperties -join ",") -ne "extra_models_dir,llamacpp") {
+        if (($postedProperties -join ",") -ne "ctx_size,extra_models_dir,llamacpp") {
             throw "Unexpected Lemonade config schema: $($postedProperties -join ",")"
         }
         if ($script:configPost.Body.extra_models_dir -ne $script:expectedModelsDir -or
-            $script:configPost.Body.llamacpp.backend -ne "vulkan") {
+            $script:configPost.Body.llamacpp.backend -ne "vulkan" -or
+            [int]$script:configPost.Body.ctx_size -ne 4096) {
             throw "Lemonade 10.7 config payload values are incorrect"
         }
         $resolvedModernModel = Resolve-ODSLemonadeModelId `
@@ -631,6 +634,9 @@ if command -v pwsh >/dev/null 2>&1; then
         }
         if ($localText -notmatch "(?m)^  request_timeout: 900\r?$" -or $localText -notmatch "(?m)^  stream_timeout: 900\r?$") {
             throw "Windows local LiteLLM config must keep long-model proxy timeouts at 900s"
+        }
+        if ($localText -notmatch "(?m)^general_settings:$" -or $localText -notmatch "(?m)^  master_key: os\.environ/LITELLM_MASTER_KEY$") {
+            throw "Windows local LiteLLM config must enforce the generated LiteLLM master key"
         }
     '; then
         pass "env-generator.ps1: Windows local writes local.yaml and repairs malformed bind-mount directories"
