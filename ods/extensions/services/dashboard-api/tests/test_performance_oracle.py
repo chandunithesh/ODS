@@ -379,13 +379,13 @@ def test_real_catalog_has_six_windows_8gb_release_swap_candidates(data_dir, tmp_
     assert len(candidates) >= 6
     assert {
         "granite4.0-h-1b-q4",
-        "granite3.2-2b-instruct-q4",
+        "falcon-h1-1.5b-instruct-q4",
         "granite3.1-2b-instruct-q4",
         "granite4.0-h-micro-q4",
         "granite4.0-h-tiny-q4",
         "phi3-mini-128k-q4",
     }.issubset(candidate_ids)
-    assert by_id["granite3.2-2b-instruct-q4"]["contextLength"] == 131072
+    assert by_id["falcon-h1-1.5b-instruct-q4"]["contextLength"] >= 65536
     assert by_id["granite3.1-2b-instruct-q4"]["contextLength"] == 131072
     assert by_id["phi3-mini-128k-q4"]["contextLength"] == 131072
     assert "phi4-mini-q4" not in candidate_ids

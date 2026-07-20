@@ -72,6 +72,7 @@ def test_release_model_switchboard_catalog_ids_exist():
         "granite3.3-2b-instruct-q4",
         "smollm3-3b-q4",
         "granite4.0-h-1b-q4",
+        "falcon-h1-1.5b-instruct-q4",
         "granite4.0-1b-q4",
         "granite4.0-h-350m-q4",
         "granite3.2-2b-instruct-q4",
@@ -228,6 +229,35 @@ def test_granite4_1b_models_are_low_vram_agent_viable_candidates():
     assert _agent_viable_for_release(model)
 
 
+def test_falcon_h1_15b_is_low_vram_agent_viable_candidate():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+
+    model = by_id["falcon-h1-1.5b-instruct-q4"]
+    assert model["vram_required_gb"] <= 3
+    assert model["context_length"] >= HERMES_CONTEXT_FLOOR
+    assert model["gguf_sha256"] == "8b51aa2aa34a0373fd0cd64c02eb91d1bc1da681c09e955ad769d4a9b2d8385f"
+    assert model["gguf_url"].startswith("https://huggingface.co/tiiuae/Falcon-H1-1.5B-Instruct-GGUF/")
+    assert model["size_bytes"] == 944786656
+    assert _agent_viable_for_release(model)
+
+
+def test_granite32_2b_is_direct_chat_only_after_windows_talk_timeout():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+
+    model = by_id["granite3.2-2b-instruct-q4"]
+    compatibility = model["app_compatibility"]
+
+    assert compatibility["openai_chat"]["status"] == "verified"
+    assert "0.73 tok/s" in compatibility["openai_chat"]["reason"]
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert "19,349-token Hermes prompt" in compatibility["agent_viability"]["reason"]
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert "cycle-004" in compatibility["hermes_talk"]["evidence"]
+    assert not _agent_viable_for_release(model)
+
+
 def test_granite4_h_350m_is_not_agent_viable_after_talk_probe_failure():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
@@ -250,9 +280,9 @@ def test_replacement_low_vram_long_context_models_are_cataloged_for_validation()
     by_id = {model["id"]: model for model in catalog["models"]}
 
     expected = {
-        "granite3.2-2b-instruct-q4": (
-            "https://huggingface.co/ibm-research/granite-3.2-2b-instruct-GGUF/",
-            "9bc086149f093169fb8e3e7517cd31752bfd9d70e0e7bb3ab351c0a5386cf8c9",
+        "falcon-h1-1.5b-instruct-q4": (
+            "https://huggingface.co/tiiuae/Falcon-H1-1.5B-Instruct-GGUF/",
+            "8b51aa2aa34a0373fd0cd64c02eb91d1bc1da681c09e955ad769d4a9b2d8385f",
         ),
         "granite3.1-2b-instruct-q4": (
             "https://huggingface.co/bartowski/granite-3.1-2b-instruct-GGUF/",
@@ -387,6 +417,7 @@ def test_new_switchboard_models_do_not_change_install_recommendations():
         "granite3.3-2b-instruct-q4",
         "smollm3-3b-q4",
         "granite4.0-h-1b-q4",
+        "falcon-h1-1.5b-instruct-q4",
         "granite4.0-1b-q4",
         "granite4.0-h-350m-q4",
         "granite3.2-2b-instruct-q4",
