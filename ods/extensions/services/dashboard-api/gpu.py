@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from models import GPUInfo, IndividualGPU
+from host_agent_client import AgentClientError, request_json as request_agent_json
 
 logger = logging.getLogger(__name__)
 
@@ -350,12 +351,51 @@ def get_gpu_info_apple() -> Optional[GPUInfo]:
     return None
 
 
+def get_gpu_info_windows_host() -> Optional[GPUInfo]:
+    """Read Windows AMD counters through the authenticated host agent."""
+    if os.environ.get("GPU_BACKEND", "").lower() != "amd":
+        return None
+    location = _read_env_var_from_file("AMD_INFERENCE_LOCATION") or os.environ.get(
+        "AMD_INFERENCE_LOCATION", "",
+    )
+    if location.lower() != "host":
+        return None
+    try:
+        payload = request_agent_json("GET", "/v1/gpu/metrics", timeout=10)
+        if payload.get("schema_version") != "ods.host-gpu-metrics.v1":
+            return None
+        total_mb = max(0, int(payload.get("memory_total_mb") or 0))
+        used_mb = min(total_mb, max(0, int(payload.get("memory_used_mb") or 0)))
+        utilization = max(0, min(100, int(payload.get("utilization_percent") or 0)))
+    except (AgentClientError, OSError, TypeError, ValueError):
+        return None
+    if not payload.get("name") or total_mb <= 0:
+        return None
+    return GPUInfo(
+        name=str(payload["name"]),
+        memory_used_mb=used_mb,
+        memory_total_mb=total_mb,
+        memory_percent=round(used_mb / total_mb * 100, 1),
+        utilization_percent=utilization,
+        temperature_c=int(payload.get("temperature_c") or 0),
+        power_w=None,
+        memory_type="discrete",
+        gpu_backend="amd",
+        memory_usage_available=bool(payload.get("memory_usage_available", False)),
+        utilization_available=bool(payload.get("utilization_available", False)),
+        temperature_available=bool(payload.get("temperature_available", False)),
+    )
+
+
 def get_gpu_info() -> Optional[GPUInfo]:
     """Get GPU metrics. Tries the configured backend first, then auto-detects."""
     gpu_backend = os.environ.get("GPU_BACKEND", "").lower()
 
     if gpu_backend == "amd":
         info = get_gpu_info_amd()
+        if info:
+            return info
+        info = get_gpu_info_windows_host()
         if info:
             return info
 

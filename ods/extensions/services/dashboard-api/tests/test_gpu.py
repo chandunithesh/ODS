@@ -7,7 +7,7 @@ import pytest
 
 from gpu import (
     get_gpu_tier, get_gpu_info_nvidia, get_gpu_info_apple,
-    get_gpu_info_amd, get_gpu_info, run_command,
+    get_gpu_info_amd, get_gpu_info, get_gpu_info_windows_host, run_command,
 )
 
 
@@ -124,6 +124,51 @@ class TestGetGpuInfoNvidia:
         monkeypatch.setattr("gpu._read_meminfo_mb", lambda: None)
 
         assert get_gpu_info_nvidia() is None
+
+
+class TestWindowsHostGpuInfo:
+
+    def test_maps_valid_host_agent_payload(self, monkeypatch):
+        monkeypatch.setenv("GPU_BACKEND", "amd")
+        monkeypatch.setattr("gpu._read_env_var_from_file", lambda key: "host")
+        monkeypatch.setattr("gpu.request_agent_json", lambda *args, **kwargs: {
+            "schema_version": "ods.host-gpu-metrics.v1",
+            "name": "AMD Radeon RX 9070 XT",
+            "memory_total_mb": 16368,
+            "memory_used_mb": 4400,
+            "memory_usage_available": True,
+            "utilization_percent": 37,
+            "utilization_available": True,
+            "temperature_c": None,
+            "temperature_available": False,
+        })
+
+        info = get_gpu_info_windows_host()
+
+        assert info is not None
+        assert info.name == "AMD Radeon RX 9070 XT"
+        assert info.memory_used_mb == 4400
+        assert info.utilization_percent == 37
+        assert info.temperature_available is False
+
+    def test_non_host_amd_does_not_call_agent(self, monkeypatch):
+        monkeypatch.setenv("GPU_BACKEND", "amd")
+        monkeypatch.setattr("gpu._read_env_var_from_file", lambda key: "container")
+        monkeypatch.setattr(
+            "gpu.request_agent_json",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected host-agent call")),
+        )
+
+        assert get_gpu_info_windows_host() is None
+
+    def test_nvidia_path_does_not_call_agent(self, monkeypatch):
+        monkeypatch.setenv("GPU_BACKEND", "nvidia")
+        monkeypatch.setattr(
+            "gpu.request_agent_json",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected host-agent call")),
+        )
+
+        assert get_gpu_info_windows_host() is None
 
 
 # --- get_gpu_info_apple (mock subprocess) ---

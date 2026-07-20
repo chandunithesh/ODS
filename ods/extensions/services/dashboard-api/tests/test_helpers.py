@@ -1050,6 +1050,164 @@ class TestGetLlamaMetricsTPS:
         assert result["tokens_per_second"] == 20.0
 
 
+class TestLemonadeMetrics:
+
+    @pytest.mark.asyncio
+    async def test_host_stats_report_real_tps_and_count_each_completion_once(
+        self, monkeypatch, tmp_path,
+    ):
+        import helpers
+
+        token_file = tmp_path / "token_counter.json"
+        monkeypatch.setattr(helpers, "_TOKEN_FILE", token_file)
+        monkeypatch.setattr(helpers, "LLM_BACKEND", "lemonade")
+        monkeypatch.setattr(helpers, "read_live_env_value", lambda key: "host")
+        stats = {
+            "input_tokens": 24,
+            "output_tokens": 7,
+            "prompt_tokens": 24,
+            "decode_token_times": [0.01, 0.02],
+            "time_to_first_token": 0.04,
+            "tokens_per_second": 188.49,
+        }
+        request = AsyncMock(return_value={
+            "schema_version": "ods.host-llm-status.v1",
+            "health": {"status": "ok"},
+            "stats": stats,
+        })
+        monkeypatch.setattr(helpers, "request_agent_json", request)
+
+        first = await helpers.get_llama_metrics()
+        second = await helpers.get_llama_metrics()
+
+        assert first == {"tokens_per_second": 188.5, "lifetime_tokens": 7}
+        assert second["lifetime_tokens"] == 7
+        assert json.loads(token_file.read_text())["lemonade_last_sample"]
+        assert not list(tmp_path.glob("*.tmp"))
+
+    @pytest.mark.asyncio
+    async def test_unavailable_host_stats_preserve_lifetime(self, monkeypatch, tmp_path):
+        import helpers
+
+        token_file = tmp_path / "token_counter.json"
+        token_file.write_text(json.dumps({"lifetime": 42}))
+        monkeypatch.setattr(helpers, "_TOKEN_FILE", token_file)
+        monkeypatch.setattr(helpers, "LLM_BACKEND", "lemonade")
+        monkeypatch.setattr(helpers, "read_live_env_value", lambda key: "host")
+        monkeypatch.setattr(
+            helpers, "request_agent_json",
+            AsyncMock(return_value={"health": {"status": "ok"}, "stats": None}),
+        )
+
+        result = await helpers.get_llama_metrics()
+
+        assert result == {"tokens_per_second": 0, "lifetime_tokens": 42}
+
+    @pytest.mark.asyncio
+    async def test_container_runtime_accepts_new_v1_stats_route(self, monkeypatch, tmp_path):
+        import helpers
+
+        monkeypatch.setattr(helpers, "_TOKEN_FILE", tmp_path / "token_counter.json")
+        monkeypatch.setattr(helpers, "LLM_BACKEND", "lemonade")
+        monkeypatch.setattr(
+            helpers, "read_live_env_value",
+            lambda key: "container" if key == "AMD_INFERENCE_LOCATION" else "test-key",
+        )
+        monkeypatch.setattr(helpers, "SERVICES", {
+            "llama-server": {"host": "llama-server", "port": 8080},
+        })
+        legacy = MagicMock()
+        legacy.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "not found", request=MagicMock(), response=MagicMock(status_code=404),
+        )
+        current = MagicMock()
+        current.raise_for_status.return_value = None
+        current.json.return_value = {
+            "output_tokens": 5,
+            "tokens_per_second": 33.33,
+            "time_to_first_token": 0.2,
+        }
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=[legacy, current])
+        monkeypatch.setattr(helpers, "_get_httpx_client", AsyncMock(return_value=client))
+
+        result = await helpers.get_llama_metrics()
+
+        assert result == {"tokens_per_second": 33.3, "lifetime_tokens": 5}
+        assert [call.args[0] for call in client.get.await_args_list] == [
+            "http://llama-server:8080/api/v1/stats",
+            "http://llama-server:8080/v1/stats",
+        ]
+        assert all(
+            call.kwargs["headers"] == {"Authorization": "Bearer test-key"}
+            for call in client.get.await_args_list
+        )
+
+
+class TestServiceHealthReconciliation:
+
+    @pytest.mark.asyncio
+    async def test_docker_health_repairs_only_transient_timeout(self, monkeypatch):
+        import helpers
+
+        services = {
+            "dashboard": {
+                "name": "Dashboard", "port": 3001, "external_port": 3001,
+                "type": "docker", "container_name": "ods-dashboard",
+            },
+            "open-webui": {
+                "name": "Open WebUI", "port": 3000, "external_port": 3000,
+                "type": "docker", "container_name": "ods-open-webui",
+            },
+        }
+        monkeypatch.setattr(helpers, "SERVICES", services)
+
+        async def probe(service_id, config):
+            return ServiceStatus(
+                id=service_id, name=config["name"], port=config["port"],
+                external_port=config["external_port"],
+                status="degraded" if service_id == "dashboard" else "unhealthy",
+            )
+
+        monkeypatch.setattr(helpers, "check_service_health", probe)
+        monkeypatch.setattr(helpers, "LLM_BACKEND", "llama")
+        monkeypatch.setattr(helpers, "request_agent_json", AsyncMock(return_value={
+            "schema_version": "ods.host-service-health.v1",
+            "containers": [
+                {"service_id": "dashboard", "container_name": "ods-dashboard", "state": "running", "health": "healthy"},
+                {"service_id": "open-webui", "container_name": "ods-open-webui", "state": "running", "health": "healthy"},
+            ],
+        }))
+
+        statuses = {status.id: status.status for status in await helpers.get_all_services()}
+
+        assert statuses == {"dashboard": "healthy", "open-webui": "unhealthy"}
+
+    @pytest.mark.asyncio
+    async def test_all_healthy_path_does_not_call_host_agent(self, monkeypatch):
+        import helpers
+
+        services = {
+            "dashboard": {"name": "Dashboard", "port": 3001, "external_port": 3001},
+        }
+        monkeypatch.setattr(helpers, "SERVICES", services)
+
+        async def probe(service_id, config):
+            return ServiceStatus(
+                id=service_id, name=config["name"], port=config["port"],
+                external_port=config["external_port"], status="healthy",
+            )
+
+        request = AsyncMock()
+        monkeypatch.setattr(helpers, "check_service_health", probe)
+        monkeypatch.setattr(helpers, "request_agent_json", request)
+
+        statuses = await helpers.get_all_services()
+
+        assert statuses[0].status == "healthy"
+        request.assert_not_awaited()
+
+
 # --- bootstrap status ETA edge cases ---
 
 

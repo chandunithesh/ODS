@@ -490,10 +490,13 @@ def _serialize_gpu(gpu_info) -> Optional[dict]:
 
     gpu_data = {
         "name": gpu_info.name,
-        "vramUsed": round(gpu_info.memory_used_mb / 1024, 1),
+        "vramUsed": (
+            round(gpu_info.memory_used_mb / 1024, 1)
+            if gpu_info.memory_usage_available else None
+        ),
         "vramTotal": round(gpu_info.memory_total_mb / 1024, 1),
-        "utilization": gpu_info.utilization_percent,
-        "temperature": gpu_info.temperature_c,
+        "utilization": gpu_info.utilization_percent if gpu_info.utilization_available else None,
+        "temperature": gpu_info.temperature_c if gpu_info.temperature_available else None,
         "memoryType": gpu_info.memory_type,
         "backend": gpu_info.gpu_backend,
         "gpu_count": gpu_count,
@@ -1345,21 +1348,7 @@ async def _build_api_status() -> dict:
         get_llama_context_size(model_hint=loaded_model),
     )
 
-    gpu_data = None
-    if gpu_info:
-        gpu_data = {
-            "name": gpu_info.name,
-            "vramUsed": round(gpu_info.memory_used_mb / 1024, 1),
-            "vramTotal": round(gpu_info.memory_total_mb / 1024, 1),
-            "utilization": gpu_info.utilization_percent,
-            "temperature": gpu_info.temperature_c,
-            "memoryType": gpu_info.memory_type,
-            "backend": gpu_info.gpu_backend,
-            "gpu_count": _infer_gpu_count(gpu_info),
-        }
-        if gpu_info.power_w is not None:
-            gpu_data["powerDraw"] = gpu_info.power_w
-        gpu_data["memoryLabel"] = "VRAM Partition" if gpu_info.memory_type == "unified" else "VRAM"
+    gpu_data = _serialize_gpu(gpu_info)
 
     services_data = _serialize_services(service_statuses, uptime)
 

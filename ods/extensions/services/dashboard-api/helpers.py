@@ -1,13 +1,16 @@
 """Shared helper functions for service health checking, metrics, and system info."""
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import re
 import shutil
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,7 +18,7 @@ from typing import Optional
 import aiohttp
 import httpx
 
-from config import SERVICES, INSTALL_DIR, DATA_DIR, LLM_BACKEND
+from config import SERVICES, INSTALL_DIR, DATA_DIR, LLM_BACKEND, read_live_env_value
 from host_agent_client import AgentClientError, async_request_json as request_agent_json
 from models import ServiceStatus, DiskUsage, ModelInfo, BootstrapStatus
 
@@ -185,29 +188,26 @@ async def _check_host_systemd_health(service_id: str, config: dict) -> ServiceSt
 _TOKEN_FILE = Path(DATA_DIR) / "token_counter.json"
 _PERF_FILE = Path(DATA_DIR) / "model_performance.json"
 _prev_tokens = {"count": 0, "time": 0.0, "tps": 0.0}
+_token_counter_lock = threading.Lock()
 
 
 def _update_lifetime_tokens(server_counter: float) -> int:
     """Accumulate tokens across server restarts using a persistent file."""
-    data = {"lifetime": 0, "last_server_counter": 0}
-    try:
-        if _TOKEN_FILE.exists():
-            data = json.loads(_TOKEN_FILE.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("Failed to read token counter file %s: %s", _TOKEN_FILE, e)
+    with _token_counter_lock:
+        data = {"lifetime": 0, "last_server_counter": 0}
+        try:
+            if _TOKEN_FILE.exists():
+                data = json.loads(_TOKEN_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to read token counter file %s: %s", _TOKEN_FILE, e)
 
-    prev = data.get("last_server_counter", 0)
-    delta = server_counter if server_counter < prev else server_counter - prev
+        prev = data.get("last_server_counter", 0)
+        delta = server_counter if server_counter < prev else server_counter - prev
 
-    data["lifetime"] = int(data.get("lifetime", 0) + delta)
-    data["last_server_counter"] = server_counter
-
-    try:
-        _TOKEN_FILE.write_text(json.dumps(data))
-    except OSError as e:
-        logger.warning("Failed to write token counter file %s: %s", _TOKEN_FILE, e)
-
-    return data["lifetime"]
+        data["lifetime"] = int(data.get("lifetime", 0) + delta)
+        data["last_server_counter"] = server_counter
+        _write_json_file(_TOKEN_FILE, data)
+        return data["lifetime"]
 
 
 def _get_lifetime_tokens() -> int:
@@ -215,6 +215,34 @@ def _get_lifetime_tokens() -> int:
         return json.loads(_TOKEN_FILE.read_text()).get("lifetime", 0)
     except (json.JSONDecodeError, OSError):
         return 0
+
+
+def _update_lemonade_lifetime_tokens(stats: dict) -> int:
+    """Count Lemonade's per-completion stats once across polls and restarts."""
+    sample = {
+        key: stats.get(key)
+        for key in (
+            "sample_fingerprint", "decode_token_times", "input_tokens",
+            "output_tokens", "prompt_tokens", "time_to_first_token",
+            "tokens_per_second",
+        )
+    }
+    signature = hashlib.sha256(
+        json.dumps(sample, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with _token_counter_lock:
+        data = _read_json_file(_TOKEN_FILE, {"lifetime": 0, "last_server_counter": 0})
+        if not isinstance(data, dict):
+            data = {"lifetime": 0, "last_server_counter": 0}
+        if signature != data.get("lemonade_last_sample"):
+            try:
+                output_tokens = max(0, int(stats.get("output_tokens") or 0))
+            except (TypeError, ValueError):
+                output_tokens = 0
+            data["lifetime"] = int(data.get("lifetime", 0)) + output_tokens
+            data["lemonade_last_sample"] = signature
+            _write_json_file(_TOKEN_FILE, data)
+        return int(data.get("lifetime", 0))
 
 
 def _normalize_perf_key(value: str | None) -> str:
@@ -231,11 +259,18 @@ def _read_json_file(path: Path, default):
 
 
 def _write_json_file(path: Path, data) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
     except OSError as e:
         logger.debug("Failed to write JSON file %s: %s", path, e)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _performance_key(backend: str, gpu_name: str, model_name: str,
@@ -351,6 +386,43 @@ async def get_llama_metrics(model_hint: Optional[str] = None) -> dict:
     loaded model name can avoid a redundant HTTP round-trip.
     """
     try:
+        if LLM_BACKEND == "lemonade":
+            if read_live_env_value("AMD_INFERENCE_LOCATION").lower() == "host":
+                host_status = await request_agent_json("GET", "/v1/llm/status", timeout=6)
+                stats = host_status.get("stats")
+            else:
+                host = SERVICES["llama-server"]["host"]
+                port = SERVICES["llama-server"]["port"]
+                client = await _get_httpx_client()
+                stats = None
+                last_error: Exception | None = None
+                api_key = read_live_env_value("LEMONADE_API_KEY")
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+                for prefix in ("/api/v1", "/v1"):
+                    try:
+                        resp = await client.get(
+                            f"http://{host}:{port}{prefix}/stats", headers=headers,
+                        )
+                        resp.raise_for_status()
+                        stats = resp.json()
+                        break
+                    except (httpx.HTTPError, ValueError) as exc:
+                        last_error = exc
+                if stats is None:
+                    raise ValueError(f"Lemonade stats endpoint is unavailable: {last_error}")
+            if not isinstance(stats, dict):
+                raise ValueError("Lemonade stats response is unavailable")
+            try:
+                tokens_per_second = float(stats.get("tokens_per_second") or 0)
+            except (TypeError, ValueError):
+                tokens_per_second = 0.0
+            if not math.isfinite(tokens_per_second):
+                tokens_per_second = 0.0
+            return {
+                "tokens_per_second": round(max(0.0, tokens_per_second), 1),
+                "lifetime_tokens": _update_lemonade_lifetime_tokens(stats),
+            }
+
         host = SERVICES["llama-server"]["host"]
         port = SERVICES["llama-server"]["port"]
         metrics_port = int(os.environ.get("LLAMA_METRICS_PORT", port))
@@ -388,8 +460,8 @@ async def get_llama_metrics(model_hint: Optional[str] = None) -> dict:
 
         lifetime = _update_lifetime_tokens(curr)
         return {"tokens_per_second": _prev_tokens["tps"], "lifetime_tokens": lifetime}
-    except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
-        logger.warning(f"get_llama_metrics failed: {e}")
+    except (AgentClientError, httpx.HTTPError, httpx.TimeoutException, OSError, ValueError) as e:
+        logger.warning("get_llama_metrics failed: %s: %s", type(e).__name__, e)
         return {"tokens_per_second": 0, "lifetime_tokens": _get_lifetime_tokens()}
 
 
@@ -562,7 +634,69 @@ async def get_all_services() -> list[ServiceStatus]:
             ))
         else:
             statuses.append(result)
-    return statuses
+    if not any(status.status in {"degraded", "down", "unhealthy"} for status in statuses):
+        return statuses
+
+    try:
+        snapshot = await request_agent_json("GET", "/v1/service/health", timeout=15)
+        if snapshot.get("schema_version") != "ods.host-service-health.v1":
+            raise ValueError("unsupported host service-health schema")
+        containers = snapshot.get("containers")
+        if not isinstance(containers, list):
+            raise ValueError("host service-health containers must be a list")
+        by_service = {
+            str(item.get("service_id")): item
+            for item in containers
+            if isinstance(item, dict) and item.get("service_id")
+        }
+        by_name = {
+            str(item.get("container_name")): item
+            for item in containers
+            if isinstance(item, dict) and item.get("container_name")
+        }
+    except (AgentClientError, ValueError):
+        by_service = {}
+        by_name = {}
+
+    reconciled: list[ServiceStatus] = []
+    for status in statuses:
+        config = SERVICES.get(status.id, {})
+        item = by_service.get(status.id) or by_name.get(str(config.get("container_name") or ""))
+        replacement = status.status
+        if item and config.get("type", "docker") == "docker":
+            health = str(item.get("health") or "none").casefold()
+            state = str(item.get("state") or "unknown").casefold()
+            if health == "healthy" and status.status == "degraded":
+                # A successful declared Docker healthcheck is authoritative for
+                # transient dashboard-network timeouts, but never masks HTTP
+                # errors or connection refusal from the application probe.
+                replacement = "healthy"
+            elif health == "unhealthy":
+                replacement = "unhealthy"
+            elif health == "starting" and status.status in {"down", "degraded"}:
+                replacement = "degraded"
+            elif state in {"exited", "dead", "removing"}:
+                replacement = "down"
+        if replacement != status.status:
+            status = status.model_copy(update={"status": replacement})
+        reconciled.append(status)
+
+    if LLM_BACKEND == "lemonade" and read_live_env_value("AMD_INFERENCE_LOCATION").lower() == "host":
+        llama_index = next(
+            (index for index, status in enumerate(reconciled) if status.id == "llama-server"),
+            None,
+        )
+        if llama_index is not None and reconciled[llama_index].status != "healthy":
+            try:
+                host_status = await request_agent_json("GET", "/v1/llm/status", timeout=6)
+                health = host_status.get("health")
+                if isinstance(health, dict) and (health.get("status") == "ok" or health.get("model_loaded")):
+                    reconciled[llama_index] = reconciled[llama_index].model_copy(
+                        update={"status": "healthy"},
+                    )
+            except AgentClientError:
+                pass
+    return reconciled
 
 
 # --- System Metrics ---

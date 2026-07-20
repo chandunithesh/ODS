@@ -20,6 +20,7 @@ from gpu import (
     get_gpu_info_amd_detailed,
     get_gpu_info_apple,
     get_gpu_info_nvidia_detailed,
+    get_gpu_info_windows_host,
     read_gpu_topology,
 )
 from models import GPUInfo, IndividualGPU, MultiGPUStatus
@@ -105,9 +106,25 @@ def _amd_host_runtime_fallback_gpus() -> Optional[list[IndividualGPU]]:
     if not runtime_mode.startswith("windows"):
         return None
 
+    host_info = get_gpu_info_windows_host()
+    if host_info is not None:
+        return [IndividualGPU(
+            index=0,
+            uuid="amd-windows-host-0",
+            name=host_info.name,
+            memory_used_mb=host_info.memory_used_mb,
+            memory_total_mb=host_info.memory_total_mb,
+            memory_percent=host_info.memory_percent,
+            utilization_percent=host_info.utilization_percent,
+            temperature_c=host_info.temperature_c,
+            power_w=host_info.power_w,
+            assigned_services=["llama-server"],
+            memory_usage_available=host_info.memory_usage_available,
+            utilization_available=host_info.utilization_available,
+            temperature_available=host_info.temperature_available,
+        )]
+
     count = max(1, _env_int("GPU_COUNT", 1))
-    host_ram_gb = max(0, _env_int("HOST_RAM_GB", 0))
-    memory_total_mb = host_ram_gb * 1024
     backend = _clean_env("AMD_INFERENCE_BACKEND").lower() or "unknown"
     runtime_label = "Lemonade" if runtime == "lemonade" else "llama-server"
     name = f"AMD {runtime_label} host runtime"
@@ -120,12 +137,15 @@ def _amd_host_runtime_fallback_gpus() -> Optional[list[IndividualGPU]]:
             uuid=f"amd-host-runtime-{idx}",
             name=name,
             memory_used_mb=0,
-            memory_total_mb=memory_total_mb,
+            memory_total_mb=0,
             memory_percent=0.0,
             utilization_percent=0,
             temperature_c=0,
             power_w=None,
             assigned_services=["llama-server"],
+            memory_usage_available=False,
+            utilization_available=False,
+            temperature_available=False,
         )
         for idx in range(count)
     ]
@@ -144,12 +164,16 @@ def _build_aggregate(gpus: list[IndividualGPU], backend: str) -> GPUInfo:
             temperature_c=g.temperature_c,
             power_w=g.power_w,
             gpu_backend=backend,
+            memory_usage_available=g.memory_usage_available,
+            utilization_available=g.utilization_available,
+            temperature_available=g.temperature_available,
         )
 
     mem_used = sum(g.memory_used_mb for g in gpus)
     mem_total = sum(g.memory_total_mb for g in gpus)
     avg_util = round(sum(g.utilization_percent for g in gpus) / len(gpus))
-    max_temp = max(g.temperature_c for g in gpus)
+    available_temps = [g.temperature_c for g in gpus if g.temperature_available]
+    max_temp = max(available_temps) if available_temps else 0
     pw_values = [g.power_w for g in gpus if g.power_w is not None]
     total_power: Optional[float] = round(sum(pw_values), 1) if pw_values else None
 
@@ -170,6 +194,9 @@ def _build_aggregate(gpus: list[IndividualGPU], backend: str) -> GPUInfo:
         temperature_c=max_temp,
         power_w=total_power,
         gpu_backend=backend,
+        memory_usage_available=all(g.memory_usage_available for g in gpus),
+        utilization_available=all(g.utilization_available for g in gpus),
+        temperature_available=bool(available_temps),
     )
 
 
@@ -520,9 +547,9 @@ async def gpu_history():
         }
         for sample in _GPU_HISTORY:
             g = sample["gpus"].get(gpu_key, {})
-            gpus_data[gpu_key]["utilization"].append(g.get("utilization", 0))
-            gpus_data[gpu_key]["memory_percent"].append(g.get("memory_percent", 0))
-            gpus_data[gpu_key]["temperature"].append(g.get("temperature", 0))
+            gpus_data[gpu_key]["utilization"].append(g.get("utilization"))
+            gpus_data[gpu_key]["memory_percent"].append(g.get("memory_percent"))
+            gpus_data[gpu_key]["temperature"].append(g.get("temperature"))
             gpus_data[gpu_key]["power_w"].append(g.get("power_w"))
 
     return {"timestamps": timestamps, "gpus": gpus_data}
@@ -543,9 +570,9 @@ async def poll_gpu_history() -> None:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "gpus": {
                         str(g.index): {
-                            "utilization": g.utilization_percent,
-                            "memory_percent": g.memory_percent,
-                            "temperature": g.temperature_c,
+                            "utilization": g.utilization_percent if g.utilization_available else None,
+                            "memory_percent": g.memory_percent if g.memory_usage_available else None,
+                            "temperature": g.temperature_c if g.temperature_available else None,
                             "power_w": g.power_w,
                         }
                         for g in gpus

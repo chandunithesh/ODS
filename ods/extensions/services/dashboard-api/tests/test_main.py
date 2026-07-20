@@ -1152,3 +1152,29 @@ class TestBuildApiStatusTiers:
         assert result["bootstrap"]["active"] is True
         assert result["bootstrap"]["model"] == "Qwen-32B"
         assert result["bootstrap"]["percent"] == 50.0
+
+
+def test_serialize_gpu_preserves_unavailable_sensor_state(monkeypatch):
+    import main
+    from models import GPUInfo
+
+    monkeypatch.setenv("GPU_COUNT", "1")
+    gpu = GPUInfo(
+        name="AMD Radeon RX 9070 XT",
+        memory_used_mb=0,
+        memory_total_mb=16368,
+        memory_percent=0,
+        utilization_percent=0,
+        temperature_c=0,
+        gpu_backend="amd",
+        memory_usage_available=False,
+        utilization_available=False,
+        temperature_available=False,
+    )
+
+    payload = main._serialize_gpu(gpu)
+
+    assert payload["vramTotal"] == 16.0
+    assert payload["vramUsed"] is None
+    assert payload["utilization"] is None
+    assert payload["temperature"] is None
