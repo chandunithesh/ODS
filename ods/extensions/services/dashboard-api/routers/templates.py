@@ -127,7 +127,7 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
         _get_missing_deps_transitive, _read_direct_deps, _validate_service_id,
         _install_from_library, _is_installable,
         _call_agent_invalidate_compose_cache,
-        _has_error_progress, _write_error_progress,
+        _has_error_progress, _sync_extension_config, _write_error_progress,
     )
 
     # Blocking sections run in the thread pool so the event loop stays
@@ -234,6 +234,13 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
                 try:
                     await asyncio.to_thread(_install_with_lock, svc_id)
                     library_installed.append(svc_id)
+                    config_synced = await asyncio.to_thread(_sync_extension_config, svc_id)
+                    if not config_synced:
+                        message = "extension config sync failed; retry template apply after restoring the host agent"
+                        await asyncio.to_thread(_write_error_progress, svc_id, message)
+                        results[svc_id] = f"skipped: {message}"
+                        warnings.append(f"{svc_id}: {message}")
+                        continue
                     post_install_ok = await asyncio.to_thread(
                         _call_agent_hook, svc_id, "post_install",
                     )
