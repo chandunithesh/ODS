@@ -382,6 +382,23 @@ async def apply_template(template_id: str, api_key: str = Depends(verify_api_key
             )
             continue
 
+        if svc_id not in library_installed:
+            # Built-ins declaring a setup/post_install hook (e.g. langfuse's
+            # data-dir chown) have never run it when they were disabled at
+            # install time; starting them without it reproduces the hook's
+            # documented first-start failure. Hooks are no-ops when
+            # undeclared and idempotent by lifecycle contract.
+            post_install_ok = await asyncio.to_thread(
+                _call_agent_hook, svc_id, "post_install",
+            )
+            if not post_install_ok:
+                results[svc_id] = "enabled_but_post_install_failed"
+                failed_services.append(svc_id)
+                warnings.append(
+                    f"{svc_id}: post_install hook failed; service was not started",
+                )
+                continue
+
         pre_start_ok = await asyncio.to_thread(_call_agent_hook, svc_id, "pre_start")
         if not pre_start_ok:
             results[svc_id] = "enabled_but_pre_start_failed"
