@@ -406,7 +406,31 @@ def _parse_huggingface_resolve_url(url: object) -> tuple[str, str, str] | None:
     return repo_id, revision, filename
 
 
-def _download_huggingface_artifact(part_url: str, part_tmp: Path, cancel_event: threading.Event) -> tuple[bool, str]:
+def _positive_int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return minimum
+    if maximum is not None and value > maximum:
+        return maximum
+    return value
+
+
+def _download_huggingface_artifact(
+    part_url: str,
+    part_tmp: Path,
+    cancel_event: threading.Event,
+    *,
+    status_path: Path | None = None,
+    status_label: str = "",
+    part_total: int = 0,
+    status_error: str = "",
+) -> tuple[bool, str]:
     """Download a Hugging Face artifact with huggingface_hub for Xet-backed files."""
     global _model_download_proc
     parsed = _parse_huggingface_resolve_url(part_url)
@@ -415,6 +439,24 @@ def _download_huggingface_artifact(part_url: str, part_tmp: Path, cancel_event: 
 
     repo_id, revision, filename = parsed
     cache_dir = INSTALL_DIR / "data" / "hf-cache"
+    fallback_timeout = _positive_int_env(
+        "ODS_HF_HUB_FALLBACK_TIMEOUT_SECONDS",
+        2700,
+        minimum=30,
+        maximum=14400,
+    )
+    heartbeat_seconds = _positive_int_env(
+        "ODS_HF_HUB_FALLBACK_STATUS_SECONDS",
+        10,
+        minimum=2,
+        maximum=120,
+    )
+    response_timeout = _positive_int_env(
+        "ODS_HF_HUB_RESPONSE_TIMEOUT_SECONDS",
+        30,
+        minimum=10,
+        maximum=300,
+    )
     code = r'''
 import shutil
 import sys
@@ -453,30 +495,83 @@ shutil.copyfile(path, dest_path)
         str(cache_dir),
     ]
     try:
+        child_env = os.environ.copy()
+        child_env.setdefault("HF_HUB_ETAG_TIMEOUT", str(response_timeout))
+        child_env.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(response_timeout))
+        logger.info(
+            "Model download falling back to Hugging Face Hub for %s from %s",
+            filename,
+            repo_id,
+        )
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=child_env,
         )
         _model_download_proc = proc
+        stop_status = threading.Event()
+        heartbeat_thread = None
+
+        if status_path is not None:
+            label = status_label or Path(filename).name
+            status_message = (
+                f"{status_error}; Hugging Face Hub fallback active"
+                if status_error
+                else "Hugging Face Hub fallback active"
+            )
+
+            def _heartbeat_status() -> None:
+                while not stop_status.is_set():
+                    if cancel_event.is_set():
+                        try:
+                            proc.kill()
+                        except (OSError, AttributeError):
+                            pass
+                    try:
+                        current = part_tmp.stat().st_size if part_tmp.exists() else 0
+                    except OSError:
+                        current = 0
+                    _write_model_status(
+                        status_path,
+                        "downloading",
+                        label,
+                        current,
+                        part_total,
+                        status_message,
+                    )
+                    stop_status.wait(heartbeat_seconds)
+
+            heartbeat_thread = threading.Thread(target=_heartbeat_status, daemon=True)
+            heartbeat_thread.start()
+        timed_out = False
         try:
-            stdout_text, stderr_text = proc.communicate(timeout=14400)
+            stdout_text, stderr_text = proc.communicate(timeout=fallback_timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             proc.kill()
+            timeout_error = f"Hugging Face Hub fallback timed out after {fallback_timeout}s"
             try:
                 stdout_text, stderr_text = proc.communicate(timeout=5)
+                stderr_text = stderr_text or timeout_error
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
-                stdout_text, stderr_text = "", "Hugging Face Hub download timed out"
+                stdout_text, stderr_text = "", timeout_error
         finally:
+            stop_status.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1)
             _model_download_proc = None
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"Hugging Face Hub fallback could not start: {exc}"
 
     if cancel_event.is_set():
         return False, "Download cancelled by user"
+    if timed_out:
+        logger.warning("Model download Hugging Face Hub fallback timed out for %s", filename)
+        return False, stderr_text or f"Hugging Face Hub fallback timed out after {fallback_timeout}s"
     if proc.returncode == 0 and _model_file_ready(part_tmp):
         return True, ""
     details = stderr_text or stdout_text
@@ -4624,6 +4719,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                                             part_url,
                                             part_tmp,
                                             _model_download_cancel,
+                                            status_path=status_path,
+                                            status_label=part_label,
+                                            part_total=part_total,
+                                            status_error=f"Retry {attempt}/3: {curl_error}",
                                         )
                                         downloaded = hub_ok
                                         if not hub_ok:
