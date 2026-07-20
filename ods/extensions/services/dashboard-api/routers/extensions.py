@@ -56,6 +56,12 @@ _extension_digest_cache: dict[str, tuple[tuple, str]] = {}
 _extension_digest_cache_lock = threading.Lock()
 
 
+def _invalidate_extension_digest_cache(*roots: Path) -> None:
+    with _extension_digest_cache_lock:
+        for root in roots:
+            _extension_digest_cache.pop(str(root.resolve(strict=False)), None)
+
+
 def _extension_tree_digest(root: Path) -> str:
     """Return a deterministic digest for extension definitions under root."""
     entries: list[tuple] = []
@@ -68,11 +74,15 @@ def _extension_tree_digest(root: Path) -> str:
         if path.is_symlink():
             entries.append(("L", canonical, os.readlink(path)))
         elif path.is_dir():
-            entries.append(("D", canonical, path.stat().st_mtime_ns))
+            stat_result = path.stat()
+            entries.append((
+                "D", canonical, stat_result.st_mtime_ns, stat_result.st_ctime_ns,
+            ))
         elif path.is_file():
             stat_result = path.stat()
             entries.append((
                 "F", canonical, stat_result.st_size, stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
                 bool(stat_result.st_mode & 0o111),
             ))
     signature = tuple(entries)
@@ -1357,8 +1367,11 @@ def _staged_library_extension(service_id: str, dest: Path):
         raise HTTPException(status_code=409, detail="Extension temporary path is a symlink")
     tmp_parent.mkdir(parents=True, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix=f".{service_id}-", dir=str(tmp_parent))
+    staged: Path | None = None
     try:
         staged = Path(tmpdir) / service_id
+        _invalidate_extension_digest_cache(source)
+        source_digest_before = _extension_tree_digest(source)
         _copytree_safe(source, staged)
         # Security scan the staged copy (prevents TOCTOU)
         staged_compose = staged / "compose.yaml"
@@ -1370,8 +1383,17 @@ def _staged_library_extension(service_id: str, dest: Path):
             # (INSTALL_DIR), not the extension dir, so "context: ." would
             # look for the Dockerfile in INSTALL_DIR/Dockerfile and fail.
             _rewrite_build_context(staged_compose, dest.resolve())
-        yield staged, _extension_tree_digest(source)
+        _invalidate_extension_digest_cache(source)
+        source_digest_after = _extension_tree_digest(source)
+        if source_digest_before != source_digest_after:
+            raise HTTPException(
+                status_code=409,
+                detail="Extension library changed while the update was being staged; retry",
+            )
+        yield staged, source_digest_after
     finally:
+        if staged is not None:
+            _invalidate_extension_digest_cache(staged)
         if Path(tmpdir).exists():
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1408,6 +1430,7 @@ def _install_from_library(service_id: str) -> None:
             installed_digest=installed_digest,
         )
         os.rename(str(staged), str(dest))
+        _invalidate_extension_digest_cache(dest)
 
 
 def _rewrite_build_context(compose_path: Path, final_dir: Path) -> None:
@@ -1590,6 +1613,7 @@ def _restore_extension_backup(service_id: str) -> bool:
             raise
         backup.parent.mkdir(parents=True, exist_ok=True)
         os.replace(current, backup)
+        _invalidate_extension_digest_cache(dest, backup, current)
         return True
     finally:
         shutil.rmtree(swap_root, ignore_errors=True)
@@ -1663,6 +1687,7 @@ def update_extension(
             except OSError:
                 os.replace(backup, dest)
                 raise
+            _invalidate_extension_digest_cache(dest, backup, staged)
             _call_agent_invalidate_compose_cache()
 
     if not _sync_extension_config(service_id, preserve_existing=True):
@@ -2161,6 +2186,7 @@ def uninstall_extension(service_id: str, include_data_info: bool = Query(True), 
             backup.unlink(missing_ok=True)
         elif backup.is_dir():
             shutil.rmtree(backup)
+        _invalidate_extension_digest_cache(ext_dir, backup)
 
         progress_file = Path(DATA_DIR) / "extension-progress" / f"{service_id}.json"
         progress_file.unlink(missing_ok=True)

@@ -3450,6 +3450,29 @@ class TestUpdateExtension:
         assert receipt["installed_digest"] == ext_mod._extension_tree_digest(installed)
         assert ext_mod._library_update_state("my-ext")["update_status"] == "current"
 
+    def test_staging_rejects_library_change_during_copy(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        original = (installed / "manifest.yaml").read_text()
+        source_manifest = lib_dir / "my-ext" / "manifest.yaml"
+        source_manifest.write_text("release: two\n")
+        real_copy = ext_mod._copytree_safe
+
+        def copy_then_change(source, staged):
+            real_copy(source, staged)
+            source_manifest.write_text("release: changed-during-copy\n")
+
+        monkeypatch.setattr(ext_mod, "_copytree_safe", copy_then_change)
+
+        response = test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 409
+        assert "changed while" in response.json()["detail"]
+        assert (installed / "manifest.yaml").read_text() == original
+
     def test_update_replaces_definition_and_keeps_backup(
         self, test_client, monkeypatch, tmp_path,
     ):
