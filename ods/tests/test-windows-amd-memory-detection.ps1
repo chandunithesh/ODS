@@ -21,6 +21,21 @@ $hybridAdapters = @(
 )
 Assert-Equal (Select-WindowsAmdPrimaryGpu -Gpus $hybridAdapters).Name `
     "AMD Radeon RX 9070 XT" "Hybrid adapter selection"
+Assert-Equal (Get-WindowsAmdComputeGpuCount -Gpus $hybridAdapters) 1 `
+    "Hybrid iGPU must not trigger multi-GPU"
+
+$dualDiscreteWithIgpu = @(
+    [pscustomobject]@{ Name = "AMD Radeon(TM) Graphics" },
+    [pscustomobject]@{ Name = "AMD Radeon RX 9070 XT" },
+    [pscustomobject]@{ Name = "AMD Radeon PRO W7900" }
+)
+Assert-Equal (Get-WindowsAmdComputeGpuCount -Gpus $dualDiscreteWithIgpu) 2 `
+    "Dual discrete AMD count"
+
+Assert-Equal (ConvertTo-WindowsAmdAdapterRamBytes -Value ([int]-1048576)) `
+    ([uint64]4293918720) "Signed WMI AdapterRAM reinterpretation"
+Assert-Equal (ConvertTo-WindowsAmdAdapterRamBytes -Value "invalid") `
+    ([uint64]0) "Invalid WMI AdapterRAM fallback"
 
 Assert-Equal (Test-WindowsAmdUnifiedMemory `
     -GpuName "AMD Radeon RX 9070 XT" -ProcessorNames "AMD Ryzen 9 9950X" `

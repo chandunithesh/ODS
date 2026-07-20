@@ -29,6 +29,29 @@ function Select-WindowsAmdPrimaryGpu {
     return $Gpus[0]
 }
 
+function Get-WindowsAmdComputeGpuCount {
+    param([object[]]$Gpus)
+
+    if (-not $Gpus -or $Gpus.Count -eq 0) { return 0 }
+    $discreteCount = @($Gpus | Where-Object {
+        Test-WindowsAmdDiscreteGpuName -GpuName ([string]$_.Name)
+    }).Count
+    # A laptop iGPU is display hardware, not a second peer for ODS's
+    # multi-GPU topology. Count discrete adapters when any are present.
+    return $(if ($discreteCount -gt 0) { $discreteCount } else { $Gpus.Count })
+}
+
+function ConvertTo-WindowsAmdAdapterRamBytes {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return [uint64]0 }
+    if ($Value -is [int] -and $Value -lt 0) {
+        # Some CIM/WMI bridges surface the uint32 AdapterRAM field as Int32.
+        return [uint64][BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Value), 0)
+    }
+    try { return [uint64]$Value } catch { return [uint64]0 }
+}
+
 function Get-WindowsAmdDedicatedVramMB {
     <#
     .SYNOPSIS
@@ -36,10 +59,10 @@ function Get-WindowsAmdDedicatedVramMB {
     #>
     param(
         [string]$GpuName,
-        [uint64]$AdapterRamBytes = 0
+        [object]$AdapterRamBytes = 0
     )
 
-    $bestBytes = $AdapterRamBytes
+    $bestBytes = ConvertTo-WindowsAmdAdapterRamBytes -Value $AdapterRamBytes
     $videoClass = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
     try {
         foreach ($key in @(Get-ChildItem -LiteralPath $videoClass -ErrorAction SilentlyContinue)) {
@@ -155,7 +178,7 @@ function Get-GpuInfo {
 
             # WMI AdapterRAM is a 32-bit field (maxes at 4 GB for discrete GPUs)
             # For APUs with unified memory, this is typically small (512MB–2GB)
-            $adapterRamBytes = $(if ($primary.AdapterRAM) { [uint64]$primary.AdapterRAM } else { [uint64]0 })
+            $adapterRamBytes = ConvertTo-WindowsAmdAdapterRamBytes -Value $primary.AdapterRAM
             $adapterRamMB = Get-WindowsAmdDedicatedVramMB `
                 -GpuName ([string]$gpuName) `
                 -AdapterRamBytes $adapterRamBytes
@@ -200,7 +223,7 @@ function Get-GpuInfo {
                 Backend       = "amd"
                 Name          = $gpuName
                 VramMB        = $effectiveVramMB
-                Count         = $gpuList.Count
+                Count         = Get-WindowsAmdComputeGpuCount -Gpus $gpuList
                 MemoryType    = $(if ($isUnified) { "unified" } else { "discrete" })
                 DeviceId      = $deviceId
                 DriverVersion = $driverVer
