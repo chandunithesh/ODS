@@ -149,12 +149,23 @@ export default function FirstBoot({ onComplete }) {
         }
 
         const applyResult = await applyResp.json()
+        if (
+          (applyResult.failed_services !== undefined && !Array.isArray(applyResult.failed_services)) ||
+          (applyResult.skipped_services !== undefined && !Array.isArray(applyResult.skipped_services))
+        ) {
+          throw new Error(`${selectedStack.title} returned an invalid apply result. Retry Finish after updating ODS.`)
+        }
         const failed = applyResult.failed_services || []
         const skipped = applyResult.skipped_services || []
-        if (failed.length > 0 || skipped.length > 0) {
+        const enabledCount = Number(applyResult.enabled_count)
+        const startedCount = Number(applyResult.started_count)
+        const incompleteStart = Number.isInteger(enabledCount) && enabledCount >= 0 &&
+          Number.isInteger(startedCount) && startedCount >= 0 && startedCount < enabledCount
+        if (failed.length > 0 || skipped.length > 0 || incompleteStart) {
           const details = [
             failed.length > 0 ? `failed to start: ${failed.join(', ')}` : null,
             skipped.length > 0 ? `not compatible or unavailable: ${skipped.join(', ')}` : null,
+            incompleteStart ? `started ${startedCount} of ${enabledCount} enabled services` : null,
           ].filter(Boolean).join('; ')
           const recovery = applyResult.restart_required
             ? ' Run ods restart, then retry Finish.'

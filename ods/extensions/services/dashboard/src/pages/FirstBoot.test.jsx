@@ -157,6 +157,57 @@ describe('FirstBoot', () => {
     expect(screen.queryByRole('heading', { name: /you're set/i })).not.toBeInTheDocument()
   })
 
+  test('keeps first-run active when apply counts report an unlisted start failure', async () => {
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/auth/magic-link/owner-card/status') {
+        return response(ownerCardReady)
+      }
+      if (url === '/api/templates/onboarding-agents/apply' && options.method === 'POST') {
+        return response({
+          enabled_count: 4,
+          started_count: 3,
+          failed_services: [],
+          skipped_services: [],
+          warnings: [],
+          restart_required: true,
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<FirstBoot onComplete={vi.fn()} />)
+    await finishWizard('Chat \\+ Agents')
+
+    expect(await screen.findByText(/started 3 of 4 enabled services/i)).toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/setup/complete', expect.anything())
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/auth/magic-link/generate', expect.anything())
+  })
+
+  test('rejects malformed template apply failure lists', async () => {
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (url === '/api/auth/magic-link/owner-card/status') {
+        return response(ownerCardReady)
+      }
+      if (url === '/api/templates/onboarding-agents/apply' && options.method === 'POST') {
+        return response({
+          enabled_count: 4,
+          started_count: 4,
+          failed_services: 'none',
+          skipped_services: [],
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<FirstBoot onComplete={vi.fn()} />)
+    await finishWizard('Chat \\+ Agents')
+
+    expect(await screen.findByText(/invalid apply result/i)).toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/setup/complete', expect.anything())
+  })
+
   test('does not show success when setup completion fails', async () => {
     const fetchMock = vi.fn(async (url, options = {}) => {
       if (url === '/api/auth/magic-link/owner-card/status') {
