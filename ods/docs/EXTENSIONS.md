@@ -139,6 +139,30 @@ ods disable my-service   # Stops container, renames compose.yaml → compose.yam
 ods list                 # Shows all services with status
 ```
 
+## Portal Updates and Rollback
+
+Extensions installed from the bundled library receive a content receipt. The
+Dashboard Extensions page compares that receipt with both the current library
+definition and the installed definition:
+
+- `current`: installed files still match the receipt and the library
+- `available`: ODS ships a newer library definition
+- `modified`: installed definition files changed locally after installation
+- `untracked`: legacy install created before content receipts were introduced
+
+An update is staged and security-scanned on the same filesystem before the
+installed directory is atomically replaced. Enabled services are reconciled
+through the host agent; disabled and one-shot CLI extensions remain disabled.
+Existing service configuration is preserved, while new default config files
+may be added when they do not already exist. Those newly added defaults are
+also preserved if the definition is rolled back.
+
+Local definition changes are never overwritten without an explicit
+confirmation. The previous definition is retained as a single rollback backup,
+and the portal exposes **Rollback** after a successful update. Update and
+rollback replace extension definitions only: service data, Docker volumes,
+secrets, and existing configuration remain in place.
+
 ## Audit Extensions Before You Ship
 
 ODS now includes an extension audit workflow so new services can be

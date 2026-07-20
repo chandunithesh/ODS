@@ -1332,7 +1332,7 @@ class TestSyncExtensionConfigWire:
             thread.join(timeout=2)
 
     @staticmethod
-    def _post(port, sid, *, key="wire-test-secret"):
+    def _post(port, sid, *, key="wire-test-secret", preserve_existing=False):
         """Direct HTTP POST to /v1/extension/sync_config so callers can
         assert on the raw status code (the dashboard-api helper masks
         4xx as a generic False, which is too coarse for these tests)."""
@@ -1342,7 +1342,10 @@ class TestSyncExtensionConfigWire:
         url = f"http://127.0.0.1:{port}/v1/extension/sync_config"
         req = urllib.request.Request(
             url,
-            data=_json.dumps({"service_id": sid}).encode(),
+            data=_json.dumps({
+                "service_id": sid,
+                "preserve_existing": preserve_existing,
+            }).encode(),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {key}",
@@ -1358,6 +1361,80 @@ class TestSyncExtensionConfigWire:
             except ValueError:
                 body = {}
             return exc.code, body
+
+    def test_preserve_existing_only_adds_missing_config(
+        self, tmp_path, monkeypatch,
+    ):
+        import threading
+        from http.server import HTTPServer
+
+        install_dir = tmp_path / "install"
+        user_root = install_dir / "data" / "user-extensions"
+        install_dir.mkdir()
+        user_root.mkdir(parents=True)
+        self._make_extension(user_root, "fakesvc")
+        source = user_root / "fakesvc" / "config" / "fakesvc"
+        (source / "new.yaml").write_text("new: default\n", encoding="utf-8")
+        target = install_dir / "config" / "fakesvc"
+        target.mkdir(parents=True)
+        (target / "settings.yaml").write_text("server: customized\n", encoding="utf-8")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", user_root)
+        monkeypatch.setattr(_mod, "EXTENSIONS_DIR", tmp_path / "builtin-empty")
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "wire-test-secret")
+
+        server = HTTPServer(("127.0.0.1", 0), _mod.AgentHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, _body = self._post(port, "fakesvc", preserve_existing=True)
+            assert status == 200
+            assert _body.get("preserve_existing") is True
+            assert (target / "settings.yaml").read_text(encoding="utf-8") == "server: customized\n"
+            assert (target / "new.yaml").read_text(encoding="utf-8") == "new: default\n"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_rejects_existing_symlink_in_config_target(
+        self, tmp_path, monkeypatch,
+    ):
+        if os.name == "nt" and not can_create_symlinks(tmp_path):
+            pytest.skip("Windows symlink creation requires Developer Mode or administrator privileges")
+        import threading
+        from http.server import HTTPServer
+
+        install_dir = tmp_path / "install"
+        user_root = install_dir / "data" / "user-extensions"
+        install_dir.mkdir()
+        user_root.mkdir(parents=True)
+        self._make_extension(user_root, "fakesvc")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = install_dir / "config" / "fakesvc"
+        target.mkdir(parents=True)
+        (target / "linked").symlink_to(outside, target_is_directory=True)
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", user_root)
+        monkeypatch.setattr(_mod, "EXTENSIONS_DIR", tmp_path / "builtin-empty")
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "wire-test-secret")
+
+        server = HTTPServer(("127.0.0.1", 0), _mod.AgentHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, body = self._post(port, "fakesvc", preserve_existing=True)
+            assert status == 400
+            assert "target symlink" in body.get("error", "")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_rejects_symlink_in_config_tree(self, tmp_path, monkeypatch):
         """Symlinks (file or directory, top-level or nested) must be rejected
@@ -2873,6 +2950,11 @@ class TestModelActivationLemonadePersistence:
         )
         monkeypatch.setattr(
             _mod, "_capture_perplexica_config", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_capture_container_state",
+            lambda _name: {"exists": False, "running": False},
         )
         handler = _FakeHandler(b"")
 

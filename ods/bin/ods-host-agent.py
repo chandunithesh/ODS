@@ -3340,7 +3340,6 @@ class AgentHandler(BaseHTTPRequestHandler):
         if not isinstance(sid, str) or not SERVICE_ID_RE.match(sid):
             json_response(self, 400, {"error": "Invalid service_id"})
             return
-
         ext_dir = _find_ext_dir(sid)
         if ext_dir is None:
             json_response(self, 404, {"error": f"Extension not found: {sid}"})
@@ -3404,6 +3403,10 @@ class AgentHandler(BaseHTTPRequestHandler):
         sid = body.get("service_id", "")
         if not isinstance(sid, str) or not SERVICE_ID_RE.match(sid):
             json_response(self, 400, {"error": "Invalid service_id"})
+            return
+        preserve_existing = body.get("preserve_existing", False)
+        if not isinstance(preserve_existing, bool):
+            json_response(self, 400, {"error": "preserve_existing must be a boolean"})
             return
 
         # Only user-installed extensions ship a config/ subdir for sync
@@ -3496,7 +3499,13 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 500, {"error": f"Failed to prepare config dir: {exc}"})
             return
 
-        target = (install_config / sid).resolve()
+        target_candidate = install_config / sid
+        if target_candidate.is_symlink():
+            json_response(self, 400, {
+                "error": f"config sync refused: target is a symlink for {sid}",
+            })
+            return
+        target = target_candidate.resolve()
         # Path-traversal guard: target must stay under install_config. Always true
         # because sid is validated against SERVICE_ID_RE above (no slashes / dots),
         # but kept as defense-in-depth in case the regex ever loosens.
@@ -3506,6 +3515,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if target.is_dir():
+            for root, dirs, files in os.walk(str(target), followlinks=False):
+                for name in dirs + files:
+                    if (Path(root) / name).is_symlink():
+                        json_response(self, 400, {
+                            "error": (
+                                f"config sync refused: existing target symlink {name} "
+                                f"for {sid}"
+                            ),
+                        })
+                        return
+
         synced: list[str] = []
         lock = _service_locks[sid]
         if not lock.acquire(blocking=False):
@@ -3513,10 +3534,20 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         try:
             try:
-                shutil.copytree(
-                    str(src_svc), str(target),
-                    dirs_exist_ok=True, symlinks=False,
-                )
+                if preserve_existing:
+                    for source_path in sorted(src_svc.rglob("*")):
+                        relative = source_path.relative_to(src_svc)
+                        target_path = target / relative
+                        if source_path.is_dir():
+                            target_path.mkdir(parents=True, exist_ok=True)
+                        elif source_path.is_file() and not target_path.exists():
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(source_path, target_path)
+                else:
+                    shutil.copytree(
+                        str(src_svc), str(target),
+                        dirs_exist_ok=True, symlinks=False,
+                    )
                 synced.append(sid)
             except OSError as exc:
                 json_response(self, 500, {
@@ -3547,6 +3578,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             "service_id": sid,
             "synced": synced,
             "skipped": out_of_scope,
+            # Echo the honored mode so callers can detect an agent that
+            # predates preserve_existing instead of silently full-copying
+            # over user config during update/rollback.
+            "preserve_existing": bool(preserve_existing),
         })
 
     def _handle_logs(self):
