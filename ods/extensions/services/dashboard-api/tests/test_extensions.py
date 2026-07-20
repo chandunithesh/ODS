@@ -3515,6 +3515,27 @@ class TestUpdateExtension:
         ext_mod, lib_dir, user_dir, installed = self._prepare(monkeypatch, tmp_path)
         original = (installed / "manifest.yaml").read_text()
         (lib_dir / "my-ext" / "manifest.yaml").write_text("release: broken\n")
+        start_results = iter([False, True])
+        monkeypatch.setattr(
+            ext_mod, "_call_agent",
+            lambda action, _sid: next(start_results) if action == "start" else True,
+        )
+
+        response = test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 502
+        assert "previous definition restored" in response.json()["detail"]
+        assert (installed / "manifest.yaml").read_text() == original
+        assert (user_dir / ".backups" / "my-ext" / "manifest.yaml").read_text() == "release: broken\n"
+
+    def test_update_start_failure_reports_incomplete_runtime_recovery(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        original = (installed / "manifest.yaml").read_text()
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: broken\n")
         monkeypatch.setattr(
             ext_mod, "_call_agent",
             lambda action, _sid: False if action == "start" else True,
@@ -3524,9 +3545,10 @@ class TestUpdateExtension:
             "/api/extensions/my-ext/update", headers=test_client.auth_headers,
         )
 
-        assert response.status_code == 502
+        assert response.status_code == 500
+        assert "recovery incomplete" in response.json()["detail"]
+        assert "restored runtime restart failed" in response.json()["detail"]
         assert (installed / "manifest.yaml").read_text() == original
-        assert (user_dir / ".backups" / "my-ext" / "manifest.yaml").read_text() == "release: broken\n"
 
     def test_update_config_failure_restores_previous_definition(
         self, test_client, monkeypatch, tmp_path,
@@ -3534,9 +3556,10 @@ class TestUpdateExtension:
         ext_mod, lib_dir, user_dir, installed = self._prepare(monkeypatch, tmp_path)
         original = (installed / "manifest.yaml").read_text()
         (lib_dir / "my-ext" / "manifest.yaml").write_text("release: broken\n")
+        sync_results = iter([False, True])
         monkeypatch.setattr(
             ext_mod, "_sync_extension_config",
-            lambda _sid, *, preserve_existing=False: False,
+            lambda _sid, *, preserve_existing=False: next(sync_results),
         )
 
         response = test_client.post(
@@ -3544,8 +3567,49 @@ class TestUpdateExtension:
         )
 
         assert response.status_code == 502
+        assert "previous definition restored" in response.json()["detail"]
         assert (installed / "manifest.yaml").read_text() == original
         assert (user_dir / ".backups" / "my-ext" / "manifest.yaml").read_text() == "release: broken\n"
+
+    def test_update_config_failure_reports_incomplete_config_recovery(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        original = (installed / "manifest.yaml").read_text()
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: broken\n")
+        monkeypatch.setattr(
+            ext_mod,
+            "_sync_extension_config",
+            lambda _sid, *, preserve_existing=False: False,
+        )
+
+        response = test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 500
+        assert "recovery incomplete" in response.json()["detail"]
+        assert "config sync failed" in response.json()["detail"]
+        assert (installed / "manifest.yaml").read_text() == original
+
+    def test_update_reports_definition_restore_failure(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, _installed = self._prepare(monkeypatch, tmp_path)
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: broken\n")
+        start_results = iter([False])
+        monkeypatch.setattr(
+            ext_mod, "_call_agent",
+            lambda action, _sid: next(start_results) if action == "start" else True,
+        )
+        monkeypatch.setattr(ext_mod, "_restore_extension_backup", lambda _sid: False)
+
+        response = test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 500
+        assert "definition restore failed" in response.json()["detail"]
 
     def test_update_rejects_concurrent_extension_operation(
         self, test_client, monkeypatch, tmp_path,
@@ -3601,6 +3665,59 @@ class TestUpdateExtension:
         assert (installed / "compose.yaml.disabled").is_file()
         assert not (installed / "compose.yaml").exists()
         assert starts == []
+
+    def test_update_rejects_ambiguous_compose_state(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        _ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: two\n")
+        (installed / "compose.yaml.disabled").write_text(
+            (installed / "compose.yaml").read_text(),
+        )
+
+        response = test_client.post(
+            "/api/extensions/my-ext/update?force=true",
+            headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 409
+        assert "invalid compose state" in response.json()["detail"]
+
+    def test_update_holds_service_operation_lock_through_runtime_proof(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, _installed = self._prepare(monkeypatch, tmp_path)
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: two\n")
+        lock_state = {"active": False}
+
+        @contextlib.contextmanager
+        def tracked_lock(service_id):
+            assert service_id == "my-ext"
+            assert lock_state["active"] is False
+            lock_state["active"] = True
+            try:
+                yield
+            finally:
+                lock_state["active"] = False
+
+        def assert_locked_sync(_sid, *, preserve_existing=False):
+            assert lock_state["active"] is True
+            return True
+
+        def assert_locked_agent(_action, _sid):
+            assert lock_state["active"] is True
+            return True
+
+        monkeypatch.setattr(ext_mod, "_extension_operation_lock", tracked_lock)
+        monkeypatch.setattr(ext_mod, "_sync_extension_config", assert_locked_sync)
+        monkeypatch.setattr(ext_mod, "_call_agent", assert_locked_agent)
+
+        response = test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 200
+        assert lock_state["active"] is False
 
     def test_rollback_restores_previous_definition(
         self, test_client, monkeypatch, tmp_path,
@@ -3660,6 +3777,29 @@ class TestUpdateExtension:
         assert test_client.post(
             "/api/extensions/my-ext/update", headers=test_client.auth_headers,
         ).status_code == 200
+        start_results = iter([False, True])
+        monkeypatch.setattr(
+            ext_mod, "_call_agent",
+            lambda action, _sid: next(start_results) if action == "start" else True,
+        )
+
+        response = test_client.post(
+            "/api/extensions/my-ext/rollback", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 502
+        assert "updated definition restored" in response.json()["detail"]
+        assert (installed / "manifest.yaml").read_text() == "release: two\n"
+        assert (user_dir / ".backups" / "my-ext" / "manifest.yaml").read_text() == original
+
+    def test_rollback_start_failure_reports_incomplete_runtime_recovery(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: two\n")
+        assert test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        ).status_code == 200
         monkeypatch.setattr(
             ext_mod, "_call_agent",
             lambda action, _sid: False if action == "start" else True,
@@ -3669,9 +3809,56 @@ class TestUpdateExtension:
             "/api/extensions/my-ext/rollback", headers=test_client.auth_headers,
         )
 
-        assert response.status_code == 502
+        assert response.status_code == 500
+        assert "recovery incomplete" in response.json()["detail"]
+        assert "restored runtime restart failed" in response.json()["detail"]
         assert (installed / "manifest.yaml").read_text() == "release: two\n"
-        assert (user_dir / ".backups" / "my-ext" / "manifest.yaml").read_text() == original
+
+    def test_rollback_config_failure_restores_updated_definition(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: two\n")
+        assert test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        ).status_code == 200
+        sync_results = iter([False, True])
+        monkeypatch.setattr(
+            ext_mod,
+            "_sync_extension_config",
+            lambda _sid, *, preserve_existing=False: next(sync_results),
+        )
+
+        response = test_client.post(
+            "/api/extensions/my-ext/rollback", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 502
+        assert "updated definition restored" in response.json()["detail"]
+        assert (installed / "manifest.yaml").read_text() == "release: two\n"
+
+    def test_rollback_config_failure_reports_incomplete_recovery(
+        self, test_client, monkeypatch, tmp_path,
+    ):
+        ext_mod, lib_dir, _user, installed = self._prepare(monkeypatch, tmp_path)
+        (lib_dir / "my-ext" / "manifest.yaml").write_text("release: two\n")
+        assert test_client.post(
+            "/api/extensions/my-ext/update", headers=test_client.auth_headers,
+        ).status_code == 200
+        monkeypatch.setattr(
+            ext_mod,
+            "_sync_extension_config",
+            lambda _sid, *, preserve_existing=False: False,
+        )
+
+        response = test_client.post(
+            "/api/extensions/my-ext/rollback", headers=test_client.auth_headers,
+        )
+
+        assert response.status_code == 500
+        assert "recovery incomplete" in response.json()["detail"]
+        assert "config sync failed" in response.json()["detail"]
+        assert (installed / "manifest.yaml").read_text() == "release: two\n"
 
     def test_uninstall_removes_definition_backup(
         self, test_client, monkeypatch, tmp_path,

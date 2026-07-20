@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -777,7 +778,7 @@ def _get_service_data_info(service_id: str) -> dict | None:
 
 # --- Host Agent Helpers ---
 
-_AGENT_TIMEOUT = 300  # seconds — image pulls can take several minutes on first install
+_AGENT_TIMEOUT = 660  # seconds — exceed the host agent's 600s start allowance
 _AGENT_LOG_TIMEOUT = 30  # seconds — log fetches should be fast
 
 
@@ -961,9 +962,8 @@ def _check_agent_health() -> bool:
 
 
 @contextlib.contextmanager
-def _extensions_lock():
-    """Acquire an exclusive file lock for extension mutations."""
-    lock_path = _extensions_lock_path()
+def _exclusive_file_lock(lock_path: Path):
+    """Acquire a cross-process exclusive lock for one lock file."""
     lockfile = open(lock_path, "a+b")
     try:
         if fcntl is not None:
@@ -985,6 +985,38 @@ def _extensions_lock():
                 msvcrt.locking(lockfile.fileno(), msvcrt.LK_UNLCK, 1)
         finally:
             lockfile.close()
+
+
+@contextlib.contextmanager
+def _extensions_lock():
+    """Acquire the global lock for short extension filesystem mutations."""
+    with _exclusive_file_lock(_extensions_lock_path()):
+        yield
+
+
+@contextlib.contextmanager
+def _extension_operation_lock(service_id: str):
+    """Serialize the complete lifecycle transaction for one extension."""
+    lock_parent = _extensions_lock_path().parent.resolve()
+    lock_dir = lock_parent / ".extension-operation-locks"
+    if lock_dir.is_symlink():
+        raise OSError("Extension operation lock directory is a symlink")
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    if not lock_dir.resolve().is_relative_to(lock_parent):
+        raise OSError("Invalid extension operation lock directory")
+    lock_name = hashlib.sha256(service_id.encode("utf-8")).hexdigest() + ".lock"
+    with _exclusive_file_lock(lock_dir / lock_name):
+        yield
+
+
+def _serialize_extension_operation(func):
+    """Keep same-service portal mutations serialized through runtime proof."""
+    @wraps(func)
+    def wrapped(service_id: str, *args, **kwargs):
+        with _extension_operation_lock(service_id):
+            return func(service_id, *args, **kwargs)
+
+    return wrapped
 
 
 def _extensions_lock_candidates() -> list[Path]:
@@ -1520,6 +1552,7 @@ def _rewrite_build_context(compose_path: Path, final_dir: Path) -> None:
 
 
 @router.post("/api/extensions/{service_id}/install")
+@_serialize_extension_operation
 def install_extension(service_id: str, api_key: str = Depends(verify_api_key)):
     """Install an extension from the library."""
     _validate_service_id(service_id)
@@ -1637,7 +1670,79 @@ def _restore_extension_backup(service_id: str) -> bool:
         shutil.rmtree(swap_root, ignore_errors=True)
 
 
+def _start_extension_lifecycle(service_id: str) -> tuple[bool, list[str]]:
+    """Start an extension through its lifecycle hooks and return warnings."""
+    if not _call_agent_hook(service_id, "pre_start"):
+        return False, []
+    if not _call_agent("start", service_id):
+        return False, []
+    warnings: list[str] = []
+    if not _call_agent_hook(service_id, "post_start"):
+        warnings.append("post_start hook failed; review extension logs")
+    return True, warnings
+
+
+def _recover_extension_swap(
+    service_id: str,
+    *,
+    enabled: bool,
+    one_shot: bool,
+) -> list[str]:
+    """Swap back to the prior definition and prove its config/runtime state."""
+    failures: list[str] = []
+    try:
+        with _extensions_lock():
+            restored = _restore_extension_backup(service_id)
+            if restored:
+                _call_agent_invalidate_compose_cache()
+    except (OSError, HTTPException) as exc:
+        logger.error("Extension definition recovery failed for %s: %s", service_id, exc)
+        restored = False
+    if not restored:
+        return ["definition restore failed"]
+
+    try:
+        config_ok = _sync_extension_config(service_id, preserve_existing=True)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        logger.error("Extension config recovery failed for %s: %s", service_id, exc)
+        config_ok = False
+    if not config_ok:
+        failures.append("config sync failed")
+        return failures
+
+    if enabled and not one_shot:
+        try:
+            start_ok, hook_warnings = _start_extension_lifecycle(service_id)
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            logger.error("Extension runtime recovery failed for %s: %s", service_id, exc)
+            start_ok, hook_warnings = False, []
+        for warning in hook_warnings:
+            logger.warning("Recovered %s with warning: %s", service_id, warning)
+        if not start_ok:
+            failures.append("restored runtime restart failed")
+    return failures
+
+
+def _transaction_failure(
+    message: str,
+    recovery_failures: list[str],
+    *,
+    recovered_label: str,
+) -> HTTPException:
+    """Build an error that does not overstate an unproven recovery."""
+    if recovery_failures:
+        return HTTPException(
+            status_code=500,
+            detail=(
+                f"{message}; recovery incomplete: "
+                + ", ".join(recovery_failures)
+            ),
+        )
+    return HTTPException(status_code=502, detail=f"{message}; {recovered_label}")
+
+
 @router.post("/api/extensions/{service_id}/update")
+@_serialize_extension_operation
 def update_extension(
     service_id: str,
     force: bool = Query(False),
@@ -1681,13 +1786,19 @@ def update_extension(
             )
 
         enabled = (dest / "compose.yaml").is_file()
-        disabled = (dest / "compose.yaml.disabled").is_file()
-        if not enabled and not disabled:
-            raise HTTPException(status_code=409, detail="Installed extension has no compose definition")
+        if not _set_extension_compose_state(dest, enabled=enabled):
+            raise HTTPException(
+                status_code=409,
+                detail="Installed extension has an invalid compose state",
+            )
+        disabled = not enabled
 
         with _staged_library_extension(service_id, dest) as (staged, source_digest):
-            if disabled:
-                os.replace(staged / "compose.yaml", staged / "compose.yaml.disabled")
+            if not _set_extension_compose_state(staged, enabled=enabled):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Library extension has an invalid compose state",
+                )
             installed_digest = _extension_tree_digest(staged)
             _write_library_receipt(
                 staged,
@@ -1696,6 +1807,8 @@ def update_extension(
             )
             if backup.parent.is_symlink() or backup.is_symlink():
                 raise HTTPException(status_code=409, detail="Extension backup path is a symlink")
+            if backup.exists() and not backup.is_dir():
+                raise HTTPException(status_code=409, detail="Extension backup path is not a directory")
             if backup.exists():
                 shutil.rmtree(backup)
             backup.parent.mkdir(parents=True, exist_ok=True)
@@ -1708,31 +1821,31 @@ def update_extension(
             _invalidate_extension_digest_cache(dest, backup, staged)
             _call_agent_invalidate_compose_cache()
 
-    if not _sync_extension_config(service_id, preserve_existing=True):
-        with _extensions_lock():
-            _restore_extension_backup(service_id)
-            _call_agent_invalidate_compose_cache()
-        raise HTTPException(
-            status_code=502,
-            detail="Extension update rolled back because config sync failed",
-        )
-
     ext = next((entry for entry in EXTENSION_CATALOG if entry.get("id") == service_id), {})
     one_shot = _is_one_shot_extension(ext)
+    if not _sync_extension_config(service_id, preserve_existing=True):
+        recovery_failures = _recover_extension_swap(
+            service_id, enabled=enabled, one_shot=one_shot,
+        )
+        raise _transaction_failure(
+            "Extension update config sync failed",
+            recovery_failures,
+            recovered_label="previous definition restored",
+        )
+
     warnings: list[str] = []
     if enabled and not one_shot:
-        if not _call_agent_hook(service_id, "pre_start") or not _call_agent("start", service_id):
-            with _extensions_lock():
-                _restore_extension_backup(service_id)
-                _call_agent_invalidate_compose_cache()
-            _sync_extension_config(service_id, preserve_existing=True)
-            _call_agent("start", service_id)
-            raise HTTPException(
-                status_code=502,
-                detail="Extension update failed to start and was rolled back",
+        start_ok, start_warnings = _start_extension_lifecycle(service_id)
+        if not start_ok:
+            recovery_failures = _recover_extension_swap(
+                service_id, enabled=enabled, one_shot=one_shot,
             )
-        if not _call_agent_hook(service_id, "post_start"):
-            warnings.append("post_start hook failed; review extension logs")
+            raise _transaction_failure(
+                "Extension update failed to start",
+                recovery_failures,
+                recovered_label="previous definition restored",
+            )
+        warnings.extend(start_warnings)
 
     _clear_progress(service_id)
     logger.info("Updated extension from library: %s", service_id)
@@ -1753,6 +1866,7 @@ def update_extension(
 
 
 @router.post("/api/extensions/{service_id}/rollback")
+@_serialize_extension_operation
 def rollback_extension_update(
     service_id: str,
     api_key: str = Depends(verify_api_key),
@@ -1760,19 +1874,17 @@ def rollback_extension_update(
     """Restore the immediately previous library definition."""
     _validate_service_id(service_id)
     _assert_not_core(service_id)
-    progress = _read_progress(service_id)
-    if progress and progress.get("status") in {"pulling", "setup_hook", "starting"}:
-        raise HTTPException(status_code=409, detail="Extension operation is still in progress")
-
     dest = USER_EXTENSIONS_DIR / service_id
     backup = _extension_backup_dir(service_id)
-    if (not dest.is_dir() or dest.is_symlink()
-            or not backup.is_dir() or backup.is_symlink()):
-        raise HTTPException(status_code=404, detail="No extension update backup is available")
     with _extensions_lock():
+        progress = _read_progress(service_id)
+        if progress and progress.get("status") in {"pulling", "setup_hook", "starting"}:
+            raise HTTPException(status_code=409, detail="Extension operation is still in progress")
+        if (not dest.is_dir() or dest.is_symlink()
+                or not backup.is_dir() or backup.is_symlink()):
+            raise HTTPException(status_code=404, detail="No extension update backup is available")
         enabled = (dest / "compose.yaml").is_file()
-        disabled = (dest / "compose.yaml.disabled").is_file()
-        if enabled == disabled:
+        if not _set_extension_compose_state(dest, enabled=enabled):
             raise HTTPException(
                 status_code=409,
                 detail="Installed extension has an invalid compose state",
@@ -1789,21 +1901,31 @@ def rollback_extension_update(
             raise HTTPException(status_code=500, detail="Could not restore extension backup")
         _call_agent_invalidate_compose_cache()
 
-    if not _sync_extension_config(service_id, preserve_existing=True):
-        with _extensions_lock():
-            _restore_extension_backup(service_id)
-            _call_agent_invalidate_compose_cache()
-        raise HTTPException(status_code=502, detail="Rollback config sync failed; current definition restored")
-
     ext = next((entry for entry in EXTENSION_CATALOG if entry.get("id") == service_id), {})
     one_shot = _is_one_shot_extension(ext)
+    if not _sync_extension_config(service_id, preserve_existing=True):
+        recovery_failures = _recover_extension_swap(
+            service_id, enabled=enabled, one_shot=one_shot,
+        )
+        raise _transaction_failure(
+            "Rollback config sync failed",
+            recovery_failures,
+            recovered_label="updated definition restored",
+        )
+
+    warnings: list[str] = []
     if enabled and not one_shot:
-        if not _call_agent("start", service_id):
-            with _extensions_lock():
-                _restore_extension_backup(service_id)
-                _call_agent_invalidate_compose_cache()
-            _call_agent("start", service_id)
-            raise HTTPException(status_code=502, detail="Rollback failed to start; updated definition restored")
+        start_ok, start_warnings = _start_extension_lifecycle(service_id)
+        if not start_ok:
+            recovery_failures = _recover_extension_swap(
+                service_id, enabled=enabled, one_shot=one_shot,
+            )
+            raise _transaction_failure(
+                "Rollback failed to start",
+                recovery_failures,
+                recovered_label="updated definition restored",
+            )
+        warnings.extend(start_warnings)
 
     _clear_progress(service_id)
     logger.info("Rolled back extension update: %s", service_id)
@@ -1812,6 +1934,7 @@ def rollback_extension_update(
         "action": "rolled_back",
         "rollback_available": True,
         "restart_required": False,
+        "warnings": warnings,
         "message": "Previous extension definition restored.",
     }
 
@@ -1953,6 +2076,7 @@ def _activate_service(service_id: str) -> dict:
 
 
 @router.post("/api/extensions/{service_id}/enable")
+@_serialize_extension_operation
 def enable_extension(
     service_id: str,
     auto_enable_deps: bool = Query(False),
@@ -2081,6 +2205,7 @@ def enable_extension(
 
 
 @router.post("/api/extensions/{service_id}/disable")
+@_serialize_extension_operation
 def disable_extension(service_id: str, include_data_info: bool = Query(True), api_key: str = Depends(verify_api_key)):
     """Disable an enabled extension."""
     _validate_service_id(service_id)
@@ -2170,6 +2295,7 @@ def disable_extension(service_id: str, include_data_info: bool = Query(True), ap
 
 
 @router.delete("/api/extensions/{service_id}")
+@_serialize_extension_operation
 def uninstall_extension(service_id: str, include_data_info: bool = Query(True), api_key: str = Depends(verify_api_key)):
     """Uninstall a disabled extension."""
     _validate_service_id(service_id)
@@ -2237,6 +2363,7 @@ class PurgeRequest(BaseModel):
 
 
 @router.delete("/api/extensions/{service_id}/data")
+@_serialize_extension_operation
 def purge_extension_data(
     service_id: str,
     body: PurgeRequest,

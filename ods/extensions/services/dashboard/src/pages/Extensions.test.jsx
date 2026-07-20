@@ -308,6 +308,7 @@ describe('Extensions page — unhealthy + install derivations', () => {
   })
 
   it('confirms a modified library update with the force contract', async () => {
+    const timeoutSpy = vi.spyOn(globalThis.AbortSignal, 'timeout').mockReturnValue(new AbortController().signal)
     const catalog = {
       extensions: [{
         id: 'tracked-ext',
@@ -350,6 +351,7 @@ describe('Extensions page — unhealthy + install derivations', () => {
         expect.objectContaining({ method: 'POST' }),
       )
     })
+    expect(timeoutSpy).toHaveBeenCalledWith(30 * 60 * 1000)
   })
 
   it('shows rollback when a previous extension definition is available', async () => {

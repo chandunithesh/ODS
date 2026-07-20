@@ -247,7 +247,7 @@ export default function Extensions() {
       }
       const opts = {
         method: action === 'uninstall' || action === 'purge' ? 'DELETE' : 'POST',
-        signal: AbortSignal.timeout(action === 'update' || action === 'rollback' ? 360000 : 300000),
+        signal: AbortSignal.timeout(action === 'update' || action === 'rollback' ? 30 * 60 * 1000 : 300000),
       }
       if (action === 'purge') {
         opts.headers = { 'Content-Type': 'application/json' }
