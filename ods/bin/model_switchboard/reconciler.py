@@ -18,6 +18,29 @@ from typing import Any
 from .adapters import RuntimeAdapter, result
 
 PHASES = ("stage", "verify_identity", "verify_completion")
+_CAPABILITY_KEYS = {"chat", "tools", "vision", "agentViable"}
+
+
+def _verification_error(outcome: dict[str, Any]) -> str:
+    identity = outcome.get("identity")
+    if not isinstance(identity, str) or not identity.strip():
+        return "verification returned no concrete identity"
+    context_length = outcome.get("contextLength")
+    if (
+        not isinstance(context_length, int)
+        or isinstance(context_length, bool)
+        or context_length < 0
+    ):
+        return "verification returned no valid context length"
+    capabilities = outcome.get("capabilities")
+    if not isinstance(capabilities, dict) or set(capabilities) != _CAPABILITY_KEYS:
+        return "verification returned no complete capability record"
+    if any(not isinstance(capabilities[key], bool) for key in _CAPABILITY_KEYS):
+        return "verification returned invalid capability values"
+    verified_at = outcome.get("verifiedAt")
+    if not isinstance(verified_at, str) or not verified_at.strip():
+        return "verification returned no proof timestamp"
+    return ""
 
 
 def run_runtime_activation(
@@ -26,12 +49,16 @@ def run_runtime_activation(
 ) -> dict[str, Any]:
     """Drive the runtime phases; first failure wins.
 
-    Returns ``{"ok": bool, "phase": str, "detail": str, "identity": str|None}``.
-    ``phase`` is the last phase attempted. Health-style success without an
-    identity cannot satisfy verification: a verify_identity result that omits
-    ``identity`` is treated as a failed boundary even when ``ok`` is true.
+    Successful runs carry the runtime identity, context length, capabilities,
+    and proof timestamp. ``phase`` is the last phase attempted. Health-style
+    success without the complete proof contract cannot satisfy verification.
     """
-    identity: str | None = None
+    proof: dict[str, Any] = {
+        "identity": None,
+        "contextLength": None,
+        "capabilities": None,
+        "verifiedAt": None,
+    }
     for phase in PHASES:
         try:
             outcome = getattr(adapter, phase)(env)
@@ -40,33 +67,51 @@ def run_runtime_activation(
                 "ok": False,
                 "phase": phase,
                 "detail": f"adapter raised: {exc}",
-                "identity": identity,
+                **proof,
             }
         if not isinstance(outcome, dict) or "ok" not in outcome:
             return {
                 "ok": False,
                 "phase": phase,
                 "detail": "adapter returned a non-contract result",
-                "identity": identity,
+                **proof,
             }
-        if phase == "verify_identity" and outcome.get("ok") and not outcome.get("identity"):
-            return {
-                "ok": False,
-                "phase": phase,
-                "detail": "identity verification returned no concrete identity",
-                "identity": identity,
+        if phase.startswith("verify_") and outcome.get("ok"):
+            contract_error = _verification_error(outcome)
+            if contract_error:
+                return {
+                    "ok": False,
+                    "phase": phase,
+                    "detail": contract_error,
+                    **proof,
+                }
+            outcome_identity = str(outcome["identity"]).strip()
+            if phase == "verify_completion" and proof["identity"] != outcome_identity:
+                return {
+                    "ok": False,
+                    "phase": phase,
+                    "detail": "completion proof identity does not match identity proof",
+                    **proof,
+                }
+            proof = {
+                "identity": outcome_identity,
+                "contextLength": int(outcome["contextLength"]),
+                "capabilities": dict(outcome["capabilities"]),
+                "verifiedAt": str(outcome["verifiedAt"]),
             }
-        if outcome.get("identity"):
-            identity = str(outcome["identity"])
         if not outcome.get("ok"):
             return {
                 "ok": False,
                 "phase": phase,
                 "detail": str(outcome.get("detail") or f"{phase} failed"),
-                "identity": identity,
+                **proof,
             }
-    return {"ok": True, "phase": PHASES[-1], "detail": "runtime activation proven",
-            "identity": identity}
+    return {
+        "ok": True,
+        "phase": PHASES[-1],
+        "detail": "runtime activation proven",
+        **proof,
+    }
 
 
 __all__ = ["PHASES", "run_runtime_activation", "result"]

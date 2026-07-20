@@ -5402,6 +5402,13 @@ class AgentHandler(BaseHTTPRequestHandler):
             # llama paths stage+verify through one reconciler sequence. All
             # other strategies keep their inline flow until PR 2B/2C.
             switchboard_adapter = None
+            switchboard_run = None
+            switchboard_capabilities = {
+                "chat": True,
+                "tools": bool(model.get("tools")),
+                "vision": bool(model.get("vision")),
+                "agentViable": int(context_length) >= 65536,
+            }
 
             def _sb_wait_ready(_env, _gguf, _ctx, lemonade_model_id=""):
                 return _wait_for_model_readiness(
@@ -5410,6 +5417,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                     gguf_file=_gguf,
                     llm_model_name=llm_model_name,
                     lemonade_model_id=lemonade_model_id,
+                    return_identity=True,
                 )
 
             # Restart llama-server with the new model.
@@ -5441,6 +5449,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                         wait_ready=_sb_wait_ready,
                         expected_gguf=gguf_file,
                         context_length=int(context_length),
+                        capabilities=switchboard_capabilities,
                     )
                 else:
                     _restart_windows_native_llama_server(env_path, env)
@@ -5461,6 +5470,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                         wait_ready=_sb_wait_ready,
                         expected_gguf=gguf_file,
                         context_length=int(context_length),
+                        capabilities=switchboard_capabilities,
                     )
                 else:
                     _restart_macos_native_llama_server(
@@ -5489,6 +5499,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                         wait_ready=_sb_wait_ready,
                         expected_gguf=gguf_file,
                         context_length=int(context_length),
+                        capabilities=switchboard_capabilities,
                     )
                 else:
                     _recreate_llama_server(env, override_image=override_image)
@@ -5500,6 +5511,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                         wait_ready=_sb_wait_ready,
                         expected_gguf=gguf_file,
                         context_length=int(context_length),
+                        capabilities=switchboard_capabilities,
                     )
                 else:
                     _compose_restart_llama_server(env)
@@ -5544,6 +5556,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                         switchboard_run.get("phase"),
                         switchboard_run.get("detail"),
                     )
+                    if switchboard_run.get("phase") == "stage":
+                        raise RuntimeError(
+                            str(switchboard_run.get("detail") or "runtime stage failed")
+                        )
             else:
                 healthy = _wait_for_model_readiness(
                     env,
@@ -5666,12 +5682,24 @@ class AgentHandler(BaseHTTPRequestHandler):
                     # transaction committed. Failures are logged, never fatal,
                     # and never alter activation behavior.
                     try:
+                        verified_runtime_identity = str(
+                            (switchboard_run or {}).get("identity")
+                            or lemonade_model_id
+                            or gguf_file
+                            or llm_model_name
+                        )
+                        verified_context_length = int(
+                            (switchboard_run or {}).get("contextLength")
+                            or context_length
+                        )
+                        verified_capabilities = (
+                            (switchboard_run or {}).get("capabilities")
+                            or switchboard_capabilities
+                        )
                         _switchboard_state.record_verified_route(
                             INSTALL_DIR / "data" / "model-state.json",
                             catalog_id=str(model_id),
-                            runtime_model_id=str(
-                                lemonade_model_id or gguf_file or llm_model_name
-                            ),
+                            runtime_model_id=verified_runtime_identity,
                             backend_kind=(
                                 "lemonade" if lemonade_model_id else "llama-server"
                             ),
@@ -5681,16 +5709,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                                 else "llama-server-default"
                             ),
                             native_route=(lemonade_model_id or None),
-                            context_length=int(context_length),
-                            capabilities={
-                                "chat": True,
-                                "tools": bool(model.get("tools")),
-                                "vision": bool(model.get("vision")),
-                                "agentViable": int(context_length) >= 65536,
-                            },
-                            proof_identity=str(
-                                lemonade_model_id or gguf_file or llm_model_name
-                            ),
+                            context_length=verified_context_length,
+                            capabilities=verified_capabilities,
+                            proof_identity=verified_runtime_identity,
                         )
                     except Exception as exc:
                         logger.warning("switchboard state record failed: %s", exc)
@@ -6065,13 +6086,31 @@ def _check_llama_model_identity(
     llm_model_name: str,
 ) -> bool:
     """Return True only when llama.cpp reports the requested model loaded."""
+    return bool(
+        _llama_loaded_model_identity(
+            body,
+            model_id=model_id,
+            gguf_file=gguf_file,
+            llm_model_name=llm_model_name,
+        )
+    )
+
+
+def _llama_loaded_model_identity(
+    body: str,
+    *,
+    model_id: str,
+    gguf_file: str,
+    llm_model_name: str,
+) -> str:
+    """Return the concrete identity carried by llama.cpp's loaded-model row."""
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, TypeError):
-        return False
+        return ""
     models = data.get("data") if isinstance(data, dict) else None
     if not isinstance(models, list):
-        return False
+        return ""
     for model in models:
         if not isinstance(model, dict):
             continue
@@ -6086,8 +6125,8 @@ def _check_llama_model_identity(
             gguf_file=gguf_file,
             llm_model_name=llm_model_name,
         ):
-            return True
-    return False
+            return str(model["id"]).strip()
+    return ""
 
 
 def _live_runtime_has_model(env: dict, gguf_file: str) -> bool | None:
@@ -6160,27 +6199,46 @@ def _check_lemonade_health(
     requires a non-empty string identity; false and empty values are never
     treated as a loaded model.
     """
+    return bool(
+        _lemonade_loaded_model_identity(
+            body,
+            expected_gguf_file=expected_gguf_file,
+            expected_model_id=expected_model_id,
+            expected_context=expected_context,
+        )
+    )
+
+
+def _lemonade_loaded_model_identity(
+    body: str,
+    expected_gguf_file: str | None = None,
+    expected_model_id: str = "",
+    expected_context: int | None = None,
+) -> str:
+    """Return the concrete identity carried by a valid Lemonade health row."""
     try:
         data = json.loads(body)
         if expected_gguf_file is not None or expected_model_id:
             if not isinstance(data, dict) or str(data.get("status") or "").casefold() != "ok":
-                return False
+                return ""
             if not _runtime_model_identity_matches(
                 data.get("model_loaded"),
                 model_id=expected_model_id,
                 gguf_file=expected_gguf_file or "",
             ):
-                return False
-            return _lemonade_loaded_context_is_sufficient(
+                return ""
+            if not _lemonade_loaded_context_is_sufficient(
                 data,
                 expected_gguf_file=expected_gguf_file or "",
                 expected_model_id=expected_model_id,
                 expected_context=expected_context,
-            )
+            ):
+                return ""
+            return str(data.get("model_loaded") or "").strip()
         loaded = data.get("model_loaded")
-        return isinstance(loaded, str) and bool(loaded.strip())
+        return loaded.strip() if isinstance(loaded, str) else ""
     except (AttributeError, json.JSONDecodeError, TypeError):
-        return False
+        return ""
 
 
 def _positive_int(value: object) -> int | None:
@@ -6308,8 +6366,12 @@ def _chat_completion_ready(
     model_name: str,
     api_prefix: str = "/v1",
     api_key: str = "",
+    *,
+    expected_model_id: str = "",
+    expected_gguf_file: str = "",
+    expected_llm_model_name: str = "",
 ) -> bool:
-    """Require one bounded deterministic, meaningful chat completion."""
+    """Require a meaningful completion and, when requested, its model identity."""
     prefix = "/" + api_prefix.strip("/")
     url = f"http://{host}:{port}{prefix}/chat/completions"
     payload = json.dumps({
@@ -6338,7 +6400,18 @@ def _chat_completion_ready(
         )
         if result.returncode != 0:
             return False
-        return _meaningful_completion(json.loads(result.stdout or "{}"))
+        response = json.loads(result.stdout or "{}")
+        if not _meaningful_completion(response):
+            return False
+        if expected_model_id or expected_gguf_file or expected_llm_model_name:
+            if not isinstance(response, dict) or not _runtime_model_identity_matches(
+                response.get("model"),
+                model_id=expected_model_id,
+                gguf_file=expected_gguf_file,
+                llm_model_name=expected_llm_model_name,
+            ):
+                return False
+        return True
     except (json.JSONDecodeError, subprocess.TimeoutExpired, OSError):
         return False
 
@@ -6525,8 +6598,13 @@ def _wait_for_model_readiness(
     attempts: int = 60,
     initial_delay: float = 5,
     interval: float = 5,
-) -> bool:
-    """Prove exact runtime identity and one meaningful completion."""
+    return_identity: bool = False,
+) -> bool | str:
+    """Prove exact runtime identity and one matching meaningful completion.
+
+    Legacy callers receive a boolean. Runtime adapters request the concrete
+    identity carried by the runtime response so state never echoes config.
+    """
     gpu_backend = str(env.get("GPU_BACKEND") or "nvidia").lower()
     windows_native_llama = _is_windows_host_llama_server(env)
     is_lemonade = gpu_backend == "amd" and not windows_native_llama
@@ -6565,7 +6643,7 @@ def _wait_for_model_readiness(
     if initial_delay > 0:
         time.sleep(initial_delay)
     for attempt in range(max(1, attempts)):
-        identity_ready = False
+        runtime_identity = ""
         try:
             result = subprocess.run(
                 ["curl", "-s", "--max-time", "5", identity_url],
@@ -6575,13 +6653,13 @@ def _wait_for_model_readiness(
             )
             body = result.stdout.strip()
             if is_lemonade:
-                identity_ready = _check_lemonade_health(
+                runtime_identity = _lemonade_loaded_model_identity(
                     body,
                     gguf_file,
                     lemonade_model_id,
                     expected_context,
                 )
-                if not identity_ready and body and (not warmup_sent or attempt % 3 == 0):
+                if not runtime_identity and body and (not warmup_sent or attempt % 3 == 0):
                     warmup_sent = _send_lemonade_warmup(
                         host,
                         port,
@@ -6589,33 +6667,36 @@ def _wait_for_model_readiness(
                         attempt,
                     )
             else:
-                identity_ready = _check_llama_model_identity(
+                runtime_identity = _llama_loaded_model_identity(
                     body,
                     model_id=model_id,
                     gguf_file=gguf_file,
                     llm_model_name=llm_model_name,
                 )
-            if identity_ready and _chat_completion_ready(
+            if runtime_identity and _chat_completion_ready(
                 host,
                 port,
                 str(completion_model),
                 completion_prefix,
+                expected_model_id=str(runtime_identity),
+                expected_gguf_file=gguf_file,
+                expected_llm_model_name=llm_model_name,
             ):
                 logger.info("Model %s ready after %d attempts", gguf_file, attempt + 1)
-                return True
+                return runtime_identity if return_identity else True
             if attempt % 6 == 0:
                 logger.info(
                     "Model %s readiness incomplete (attempt %d, identity=%s)",
                     gguf_file,
                     attempt + 1,
-                    identity_ready,
+                    bool(runtime_identity),
                 )
         except subprocess.TimeoutExpired:
             if attempt % 6 == 0:
                 logger.info("Model readiness attempt %d timed out", attempt + 1)
         if attempt + 1 < attempts and interval > 0:
             time.sleep(interval)
-    return False
+    return "" if return_identity else False
 
 
 def _is_windows_host_lemonade(env: dict) -> bool:
