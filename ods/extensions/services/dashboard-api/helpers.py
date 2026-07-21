@@ -427,29 +427,48 @@ async def get_llama_metrics(model_hint: Optional[str] = None) -> dict:
         params = {"model": model_name} if model_name else {}
         client = await _get_httpx_client()
         resp = await client.get(url, params=params)
+        resp.raise_for_status()
 
         metrics = {}
         for line in resp.text.split("\n"):
-            if line.startswith("#"):
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            if "tokens_predicted_total" in line:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            metric_name = parts[0].split("{", 1)[0]
+            if metric_name.endswith("tokens_predicted_total"):
                 try:
-                    metrics["tokens_predicted_total"] = float(line.split()[-1])
-                except (ValueError, IndexError):
+                    metrics["tokens_predicted_total"] = float(parts[-1])
+                except ValueError:
                     pass
-            if "tokens_predicted_seconds_total" in line:
+            if metric_name.endswith("tokens_predicted_seconds_total"):
                 try:
-                    metrics["tokens_predicted_seconds_total"] = float(line.split()[-1])
-                except (ValueError, IndexError):
+                    metrics["tokens_predicted_seconds_total"] = float(parts[-1])
+                except ValueError:
                     pass
 
+        # A successful HTTP response is not sufficient proof that this is the
+        # llama.cpp Prometheus endpoint. Treat HTML, proxy error pages, and
+        # incomplete metric payloads as unavailable so they cannot reset the
+        # persistent server counter and double-count tokens after recovery.
+        if "tokens_predicted_total" not in metrics:
+            raise ValueError("llama-server metrics response has no token counter")
+
         now = time.time()
-        curr = metrics.get("tokens_predicted_total", 0)
-        gen_secs = metrics.get("tokens_predicted_seconds_total", 0)
+        curr = _non_negative_number(metrics["tokens_predicted_total"])
+        gen_secs = _non_negative_number(metrics.get("tokens_predicted_seconds_total"))
         if _prev_tokens["time"] > 0 and curr > _prev_tokens["count"]:
             delta_secs = gen_secs - _prev_tokens.get("gen_secs", 0)
             if delta_secs > 0:
                 _prev_tokens["tps"] = round((curr - _prev_tokens["count"]) / delta_secs, 1)
+            else:
+                _prev_tokens["tps"] = 0.0
+        else:
+            # The server is idle, has restarted, or reset its counters. A
+            # previous request's throughput is not live throughput.
+            _prev_tokens["tps"] = 0.0
         _prev_tokens["count"] = curr
         _prev_tokens["time"] = now
         _prev_tokens["gen_secs"] = gen_secs

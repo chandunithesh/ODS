@@ -610,6 +610,39 @@ class TestGetLlamaMetrics:
         result = await get_llama_metrics(model_hint="test-model")
         assert result["tokens_per_second"] == 0
 
+    @pytest.mark.asyncio
+    async def test_invalid_success_payload_does_not_reset_persistent_counter(
+        self, monkeypatch, tmp_path,
+    ):
+        import helpers
+
+        monkeypatch.setattr(
+            "helpers.SERVICES",
+            {"llama-server": {"host": "localhost", "port": 8080}},
+        )
+        monkeypatch.setattr(helpers, "_TOKEN_FILE", tmp_path / "token_counter.json")
+        helpers._prev_tokens.update(
+            {"count": 100, "time": helpers.time.time() - 1, "tps": 20.0, "gen_secs": 5.0},
+        )
+        assert helpers._update_lifetime_tokens(100) == 100
+
+        mock_response = MagicMock()
+        mock_response.text = "<html>proxy is starting</html>"
+        mock_response.raise_for_status.return_value = None
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        monkeypatch.setattr("helpers._get_httpx_client", AsyncMock(return_value=mock_client))
+
+        result = await get_llama_metrics(model_hint="test-model")
+
+        assert result == {
+            "tokens_per_second": 0,
+            "lifetime_tokens": 100,
+            "token_count_mode": "cumulative",
+        }
+        assert helpers._get_lifetime_tokens() == 100
+        assert json.loads(helpers._TOKEN_FILE.read_text())["last_server_counter"] == 100
+
 
 # --- get_loaded_model ---
 
@@ -1079,6 +1112,45 @@ class TestGetLlamaMetricsTPS:
         result = await get_llama_metrics(model_hint="test")
         # 100 tokens / 5 seconds = 20.0 tps
         assert result["tokens_per_second"] == 20.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("previous_count", "current_count"),
+        [(200, 200), (200, 25)],
+        ids=["idle", "server-counter-reset"],
+    )
+    async def test_idle_or_reset_counter_clears_stale_throughput(
+        self, monkeypatch, tmp_path, previous_count, current_count,
+    ):
+        import helpers
+
+        monkeypatch.setattr(
+            "helpers.SERVICES",
+            {"llama-server": {"host": "localhost", "port": 8080}},
+        )
+        monkeypatch.setattr(helpers, "_TOKEN_FILE", tmp_path / "token_counter.json")
+        helpers._prev_tokens.update(
+            {
+                "count": previous_count,
+                "time": helpers.time.time() - 1,
+                "tps": 42.0,
+                "gen_secs": 10.0,
+            },
+        )
+
+        mock_response = MagicMock()
+        mock_response.text = (
+            f"llamacpp_tokens_predicted_total {current_count}\n"
+            "llamacpp_tokens_predicted_seconds_total 10.0\n"
+        )
+        mock_response.raise_for_status.return_value = None
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        monkeypatch.setattr("helpers._get_httpx_client", AsyncMock(return_value=mock_client))
+
+        result = await get_llama_metrics(model_hint="test")
+
+        assert result["tokens_per_second"] == 0.0
 
 
 class TestLemonadeMetrics:
