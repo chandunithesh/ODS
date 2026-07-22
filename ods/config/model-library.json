@@ -290,13 +290,13 @@
         "perplexica": {
           "status": "unsupported_until_revalidated",
           "label": "Perplexica revalidation required",
-          "reason": "Fleet model-UI run 2026-07-19T03:40Z on windows-laptop loaded this model and ODS Talk passed, but the Perplexica app probe answered with a search-style failure instead of the requested verification phrase; keep it out of all-app release coverage until Perplexica compatibility is revalidated.",
-          "evidence": "fleet-test/runs/2026-07-19T03-40-01Z-release-product-54b2f703190f-harness-2a6a4e6a55b8-hosts-windows-laptop/model-ui/cycle-003/windows-laptop",
-          "recordedAt": "2026-07-19T03:40:01Z",
-          "productSha": "54b2f703190f",
-          "harnessSha": "2a6a4e6a55b8",
-          "hostScope": ["windows-laptop"],
-          "revalidateAgainstSha": "63949ab0ff5be385dde9977528c199b6c081c9ca"
+          "reason": "Fleet model-UI runs on windows-laptop and strixy loaded this model and ODS Talk passed, but the Perplexica app probe failed instead of returning the requested verification phrase; keep it out of all-app release coverage on those hosts until Perplexica compatibility is revalidated.",
+          "evidence": "fleet-test/runs/2026-07-19T03-40-01Z-release-product-54b2f703190f-harness-2a6a4e6a55b8-hosts-windows-laptop/model-ui/cycle-003/windows-laptop; fleet-test/runs/2026-07-22T09-42-12Z-release-product-b5bb39f2c0f2-harness-cc7b6148eb2c-hosts-windows-laptop-strixy-m5-mbp/model-ui/cycle-003/strixy",
+          "recordedAt": "2026-07-22T10:26:21Z",
+          "productSha": "b5bb39f2c0f2a7a3dfa5f98547e469b6eaf0acfd",
+          "harnessSha": "cc7b6148eb2cd6e667e6a9dd3d36dff6f8928052",
+          "hostScope": ["windows-laptop", "strixy"],
+          "expiresAt": "2026-08-22T00:00:00Z"
         }
       },
       "install_recommendation": false
