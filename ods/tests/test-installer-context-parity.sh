@@ -127,6 +127,20 @@ assert_grep "installers/macos/install-macos.sh" '_opencode_switchboard_mode=.*OD
     "macOS OpenCode config reads switchboard mode"
 assert_grep "installers/macos/install-macos.sh" '_opencode_model="ods/current"' \
     "macOS OpenCode config uses stable switchboard alias"
+assert_grep "installers/macos/lib/env-generator.sh" 'ODS_MODEL_SWITCHBOARD=\$\{switchboard_mode\}' \
+    "macOS .env generation persists switchboard mode"
+assert_grep "installers/macos/lib/env-generator.sh" 'OPEN_WEBUI_LLM_BASE_URL=\$\{open_webui_llm_base_url\}' \
+    "macOS .env generation carries the Open WebUI switchboard route"
+assert_grep "installers/macos/docker-compose.macos.yml" 'OPENAI_API_BASE_URL: "\$\{OPEN_WEBUI_LLM_BASE_URL:-http://\$\{ODS_MACOS_HOST_GATEWAY:-host\.docker\.internal\}:8080/v1\}"' \
+    "macOS Open WebUI compose route honors switchboard override"
+assert_grep "installers/macos/docker-compose.macos.yml" 'OPENAI_API_KEY: "\$\{OPEN_WEBUI_LLM_API_KEY:-\}"' \
+    "macOS Open WebUI compose route carries switchboard API key"
+assert_grep "installers/macos/install-macos.sh" 'render-runtime-configs\.py' \
+    "macOS installer renders model-router runtime configs"
+assert_grep "installers/macos/install-macos.sh" 'PERPLEXICA_MODEL="ods/current"' \
+    "macOS Perplexica config uses stable switchboard alias"
+assert_grep "installers/macos/install-macos.sh" 'PERPLEXICA_BASE_URL="http://litellm:4000"' \
+    "macOS Perplexica config routes switchboard mode through LiteLLM"
 assert_not_grep "installers/macos/install-macos.sh" '\$LOG_FILE' \
     "macOS installer uses ODS_LOG_FILE, not undefined LOG_FILE"
 assert_grep "installers/windows/install-windows.ps1" 'Update-HermesConfigFile.*ContextLength \(\[int\]\$tierConfig\.MaxContext\)' \
